@@ -74,6 +74,8 @@ func (c *Client) Publish(ctx context.Context, revoked cid.Cid, path []ucan.Deleg
 		c.Issuer.DID(),
 		&ucancmd.RevokeArguments{Revoke: revoked, Path: links},
 		invocation.WithAudience(c.ServiceID),
+		invocation.WithNoNonce(),
+		invocation.WithNoExpiration(),
 	)
 	if err != nil {
 		return fmt.Errorf("creating revoke invocation: %w", err)
