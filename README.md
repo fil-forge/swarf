@@ -13,6 +13,49 @@ By default, Swarf uses PostgreSQL. Configure it with `--postgres-dsn`, a
 `identity`, `server`, `log`, and `storage`; environment variable names use the
 `SWARF_` prefix, for example `SWARF_SERVER_PORT`.
 
+## CLI
+
+### `swarf revoke <revoke-cid> <witness-path-container>`
+
+Publish a revocation with an issuer PEM key, the CID to revoke, and a UCAN
+container containing the delegation witnesses:
+
+```sh
+swarf revoke \
+  --issuer-key-file issuer.pem \
+  <revoke-cid> \
+  <witness-path-container>
+```
+
+`witness-path-container` can be a file path or an encoded UCAN container
+string. Swarf builds the witness chain from the revoked delegation CID. The
+service defaults to `did:web:swarf.forgery.network` at
+`https://swarf.forgery.network`; override these with `--service-id` and
+`--service-url`.
+
+### `swarf get <revoke-cid>`
+
+Retrieve a revocation’s DAG-JSON record with:
+
+```sh
+swarf get <revoke-cid>
+```
+
+The command prints the service response and exits silently if the revocation is
+not found. Override the service endpoint with `--service-url`.
+
+### `swarf stream <since>`
+
+Stream revocation DAG-JSON records as they arrive with:
+
+```sh
+swarf stream 0
+```
+
+Pass `0` to stream all records or an RFC3339/RFC3339Nano timestamp to start
+after that time. Press Ctrl+C to stop streaming. Override the service endpoint
+with `--service-url`.
+
 ## API
 
 ### `POST /`

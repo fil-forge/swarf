@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/fil-forge/swarf/pkg/config"
 	appfx "github.com/fil-forge/swarf/pkg/fx"
@@ -39,7 +42,12 @@ func main() {
 	serve.Flags().Bool("skip-migrations", false, "skip Postgres migrations on startup")
 	root.PersistentFlags().StringVarP(&configFile, "config", "c", "", "configuration file path")
 	root.AddCommand(serve)
-	if err := root.Execute(); err != nil {
+	root.AddCommand(newRevokeCommand())
+	root.AddCommand(newGetCommand())
+	root.AddCommand(newStreamCommand())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := root.ExecuteContext(ctx); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
