@@ -16,20 +16,45 @@ By default, Swarf uses PostgreSQL. Configure it with `--postgres-dsn`, a
 ## API
 
 `POST /` is the UCAN RPC endpoint. It supports `/ucan/revoke`; the invocation
-arguments identify the revoked delegation and its path, whose witness blocks
-must be included in the invocation metadata.
+arguments identify the revoked delegation and its delegation
+[path witness](https://github.com/ucan-wg/revocation#path-witness). These
+delegations must be included in the invocation metadata. For example:
+
+```ipldsch
+type RevokeArguments struct {
+  revoke Link
+  path [Link]
+}
+```
 
 `GET /revocation/:cid` retrieves the most recent revocation for a delegation.
 It returns a DAG-JSON record containing `revoke` (the delegation CID), `cause`
 (the CBOR-encoded revocation invocation), and CBOR-encoded witness delegation
-blocks, or `404` when no revocation exists.
+blocks, or `404` when no revocation exists. For example:
+
+```json
+{
+  "revoke": {"/": "bafybeigdyrzt5kq3x63q4k4n3yn3y3g6l5ihd7z6f3foj7a7uhqyg4s6um"},
+  "cause": {"/": {"bytes": "omF2AWNjYXBnL3VjYW4vcmV2b2tl"}},
+  "path": [
+    {"/": {"bytes": "omF2AWNjYXBsL3Rlc3QvaW52b2tl"}}
+  ],
+  "created_at": "2026-07-17T09:00:00Z"
+}
+```
 
 `GET /revocations/:since` is a Server-Sent Events stream of compact DAG-JSON
 records. Each event has `revoke` (the revoked delegation CID), `path` (the
 witness delegation CIDs), `cause` (the revocation invocation CID), and
 `created_at` (the record creation time). Use `0` to stream all stored records,
 or provide an RFC3339/RFC3339Nano timestamp cursor to stream records created
-after it.
+after it. For example:
+
+```js
+id: bafybeif6jwv7e4r6sk3otkq4n3xigygamqajvwjvnc4irhwmkhlpvj3a6m
+event: revocation
+data: {"revoke":{"/":"bafybeigdyrzt5kq3x63q4k4n3yn3y3g6l5ihd7z6f3foj7a7uhqyg4s6um"},"path":[{"/":"bafybeigdyrzt5kq3x63q4k4n3yn3y3g6l5ihd7z6f3foj7a7uhqyg4s6um"}],"cause":{"/":"bafybeif6jwv7e4r6sk3otkq4n3xigygamqajvwjvnc4irhwmkhlpvj3a6m"},"created_at":"2026-07-17T09:00:00Z"}
+```
 
 ## Client library
 
