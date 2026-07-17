@@ -15,9 +15,9 @@ import (
 	jsg "github.com/alanshaw/dag-json-gen"
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
 	"github.com/fil-forge/libforge/identity"
+	"github.com/fil-forge/swarf/pkg/api"
 	"github.com/fil-forge/swarf/pkg/build"
 	"github.com/fil-forge/swarf/pkg/config"
-	"github.com/fil-forge/swarf/pkg/firehose"
 	"github.com/fil-forge/swarf/pkg/store"
 	memstore "github.com/fil-forge/swarf/pkg/store/memory"
 	pgstore "github.com/fil-forge/swarf/pkg/store/postgres"
@@ -290,7 +290,7 @@ func revocationHandler(revocations store.RevocationStore) echo.HandlerFunc {
 		if err != nil {
 			return fmt.Errorf("getting revocation: %w", err)
 		}
-		data, err := encodeFirehoseRecord(record)
+		data, err := encodeRevocationRecord(record)
 		if err != nil {
 			return fmt.Errorf("encoding revocation: %w", err)
 		}
@@ -310,21 +310,30 @@ func parseSince(value string) (time.Time, error) {
 }
 
 func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord) error {
-	data, err := encodeFirehoseRecord(record)
+	path := make([]cid.Cid, len(record.Path))
+	for i, delegation := range record.Path {
+		path[i] = delegation.Link()
+	}
+	data, err := encodeFirehoseEvent(api.FirehoseRevocation{
+		Revoke:    record.Revoke,
+		Path:      path,
+		Cause:     record.Cause.Link(),
+		CreatedAt: jsg.DagJsonTime(record.CreatedAt),
+	})
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(response, "id: %s\nevent: revocation\ndata: %s\n\n", record.Revocation.Link(), data); err != nil {
+	if _, err := fmt.Fprintf(response, "id: %s\nevent: revocation\ndata: %s\n\n", record.Cause.Link(), data); err != nil {
 		return fmt.Errorf("writing revocation event: %w", err)
 	}
 	response.Flush()
 	return nil
 }
 
-func encodeFirehoseRecord(record store.RevocationRecord) ([]byte, error) {
-	revocation, err := invocation.Encode(record.Revocation)
+func encodeRevocationRecord(record store.RevocationRecord) ([]byte, error) {
+	cause, err := invocation.Encode(record.Cause)
 	if err != nil {
-		return nil, fmt.Errorf("encoding revocation: %w", err)
+		return nil, fmt.Errorf("encoding revocation cause: %w", err)
 	}
 	path := make([][]byte, len(record.Path))
 	for i, dlg := range record.Path {
@@ -333,15 +342,24 @@ func encodeFirehoseRecord(record store.RevocationRecord) ([]byte, error) {
 			return nil, fmt.Errorf("encoding delegation at path index %d: %w", i, err)
 		}
 	}
-	value := firehose.Record{
-		Revocation: revocation,
-		Path:       path,
-		CreatedAt:  jsg.DagJsonTime(record.CreatedAt),
+	value := api.Revocation{
+		Revoke:    record.Revoke,
+		Cause:     cause,
+		Path:      path,
+		CreatedAt: jsg.DagJsonTime(record.CreatedAt),
 	}
 	var data bytes.Buffer
 	err = value.MarshalDagJSON(&data)
 	if err != nil {
 		return nil, fmt.Errorf("encoding revocation record as DAG-JSON: %w", err)
+	}
+	return data.Bytes(), nil
+}
+
+func encodeFirehoseEvent(event api.FirehoseRevocation) ([]byte, error) {
+	var data bytes.Buffer
+	if err := event.MarshalDagJSON(&data); err != nil {
+		return nil, fmt.Errorf("encoding firehose record as DAG-JSON: %w", err)
 	}
 	return data.Bytes(), nil
 }

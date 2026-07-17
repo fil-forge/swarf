@@ -96,7 +96,8 @@ func TestRevocationHappyPath(t *testing.T) {
 	require.NoError(t, client.Publish(ctx, first[len(first)-1].Link(), first))
 	record, err := client.Get(ctx, first[len(first)-1].Link())
 	require.NoError(t, err)
-	require.NotNil(t, record.Revocation)
+	require.NotNil(t, record.Cause)
+	require.Equal(t, first[len(first)-1].Link(), record.Revoke)
 	require.Equal(t, first[len(first)-1].Link(), record.Path[len(record.Path)-1].Link())
 
 	second := revocationPath(t, alice, bob, carol)
@@ -110,7 +111,7 @@ func TestRevocationHappyPath(t *testing.T) {
 				records <- err
 				return
 			}
-			if record.Path[len(record.Path)-1].Link() != expected {
+			if record.Revoke != expected {
 				records <- errors.New("stream returned an unexpected revocation")
 				return
 			}

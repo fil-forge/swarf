@@ -5,10 +5,12 @@ import (
 	"iter"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/fil-forge/libforge/identity"
+	"github.com/fil-forge/swarf/pkg/api"
 	"github.com/fil-forge/swarf/pkg/store"
 	"github.com/fil-forge/swarf/pkg/store/memory"
 	"github.com/fil-forge/ucantone/did"
@@ -65,9 +67,11 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	require.NoError(t, err)
 	revocation, err := invocation.Invoke(id, did.Undef, command, nil)
 	require.NoError(t, err)
+	witness, err := delegation.Delegate(id, did.Undef, id.DID(), command)
+	require.NoError(t, err)
 	createdAt := time.Now().UTC().Round(0)
 	source := &firehoseTestStore{
-		record: store.RevocationRecord{Revocation: revocation, CreatedAt: createdAt},
+		record: store.RevocationRecord{Revoke: witness.Link(), Cause: revocation, Path: []ucan.Delegation{witness}, CreatedAt: createdAt},
 	}
 	e := newEchoServer(id, server.NewHTTP(id), source)
 	request := httptest.NewRequest(http.MethodGet, "/revocations/"+createdAt.Format(time.RFC3339Nano), nil)
@@ -78,6 +82,14 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	require.Equal(t, "text/event-stream", response.Header().Get(echo.HeaderContentType))
 	require.Contains(t, response.Body.String(), "event: revocation")
 	require.Equal(t, createdAt, source.since)
+	data := strings.TrimSuffix(strings.TrimPrefix(response.Body.String(), "id: "+revocation.Link().String()+"\nevent: revocation\ndata: "), "\n\n")
+	var event api.FirehoseRevocation
+	require.NoError(t, event.UnmarshalDagJSON(strings.NewReader(data)))
+	require.Equal(t, witness.Link(), event.Revoke)
+	require.Equal(t, []cid.Cid{witness.Link()}, event.Path)
+	require.Equal(t, revocation.Link(), event.Cause)
+	require.True(t, event.CreatedAt.Time().Equal(createdAt))
+	require.NotContains(t, response.Body.String(), `"revocation"`)
 }
 
 func TestRevocationRouteReturnsDAGJSON(t *testing.T) {
@@ -87,7 +99,7 @@ func TestRevocationRouteReturnsDAGJSON(t *testing.T) {
 	require.NoError(t, err)
 	revocation, err := invocation.Invoke(id, did.Undef, command, nil)
 	require.NoError(t, err)
-	source := &firehoseTestStore{record: store.RevocationRecord{Revocation: revocation}}
+	source := &firehoseTestStore{record: store.RevocationRecord{Revoke: revocation.Link(), Cause: revocation}}
 	e := newEchoServer(id, server.NewHTTP(id), source)
 	request := httptest.NewRequest(http.MethodGet, "/revocation/"+revocation.Link().String(), nil)
 	response := httptest.NewRecorder()
@@ -95,7 +107,8 @@ func TestRevocationRouteReturnsDAGJSON(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, response.Code)
 	require.Equal(t, "application/vnd.ipld.dag-json", response.Header().Get(echo.HeaderContentType))
-	require.Contains(t, response.Body.String(), `"revocation"`)
+	require.Contains(t, response.Body.String(), `"revoke"`)
+	require.Contains(t, response.Body.String(), `"cause"`)
 }
 
 func TestValidateRevocationPath(t *testing.T) {

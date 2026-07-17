@@ -14,7 +14,7 @@ import (
 
 	jsg "github.com/alanshaw/dag-json-gen"
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
-	"github.com/fil-forge/swarf/pkg/firehose"
+	"github.com/fil-forge/swarf/pkg/api"
 	"github.com/fil-forge/swarf/pkg/store"
 	"github.com/fil-forge/ucantone/client"
 	"github.com/fil-forge/ucantone/did"
@@ -105,38 +105,38 @@ func (c *Client) Get(ctx context.Context, delegationCID cid.Cid) (store.Revocati
 	if response.StatusCode != http.StatusOK {
 		return store.RevocationRecord{}, fmt.Errorf("getting revocation: unexpected status %s", response.Status)
 	}
-	var record firehose.Record
+	var record api.Revocation
 	if err := record.UnmarshalDagJSON(response.Body); err != nil {
 		return store.RevocationRecord{}, fmt.Errorf("decoding revocation record: %w", err)
 	}
 	return decodeRecord(record)
 }
 
-// Stream yields revocation records created after since until ctx is canceled.
-func (c *Client) Stream(ctx context.Context, since time.Time) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
+// Stream yields firehose revocations created after since until ctx is canceled.
+func (c *Client) Stream(ctx context.Context, since time.Time) iter.Seq2[api.FirehoseRevocation, error] {
+	return func(yield func(api.FirehoseRevocation, error) bool) {
 		cursor := "0"
 		if !since.IsZero() {
 			cursor = since.Format(time.RFC3339Nano)
 		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("revocations", cursor), nil)
 		if err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("creating revocation stream request: %w", err))
+			yield(api.FirehoseRevocation{}, fmt.Errorf("creating revocation stream request: %w", err))
 			return
 		}
 		request.Header.Set("Accept", "text/event-stream")
 		response, err := c.httpClient.Do(request)
 		if err != nil {
 			if ctx.Err() != nil {
-				yield(store.RevocationRecord{}, ctx.Err())
+				yield(api.FirehoseRevocation{}, ctx.Err())
 			} else {
-				yield(store.RevocationRecord{}, fmt.Errorf("opening revocation stream: %w", err))
+				yield(api.FirehoseRevocation{}, fmt.Errorf("opening revocation stream: %w", err))
 			}
 			return
 		}
 		defer response.Body.Close()
 		if response.StatusCode != http.StatusOK {
-			yield(store.RevocationRecord{}, fmt.Errorf("opening revocation stream: unexpected status %s", response.Status))
+			yield(api.FirehoseRevocation{}, fmt.Errorf("opening revocation stream: unexpected status %s", response.Status))
 			return
 		}
 
@@ -147,17 +147,12 @@ func (c *Client) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Re
 			line := scanner.Text()
 			if line == "" {
 				if event == "revocation" && len(data) > 0 {
-					var value firehose.Record
+					var value api.FirehoseRevocation
 					if err := value.UnmarshalDagJSON(strings.NewReader(strings.Join(data, "\n"))); err != nil {
-						yield(store.RevocationRecord{}, fmt.Errorf("decoding streamed revocation: %w", err))
+						yield(api.FirehoseRevocation{}, fmt.Errorf("decoding streamed revocation: %w", err))
 						return
 					}
-					record, err := decodeRecord(value)
-					if err != nil {
-						yield(store.RevocationRecord{}, err)
-						return
-					}
-					if !yield(record, nil) {
+					if !yield(value, nil) {
 						return
 					}
 				}
@@ -174,9 +169,9 @@ func (c *Client) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Re
 		}
 		if err := scanner.Err(); err != nil {
 			if ctx.Err() != nil {
-				yield(store.RevocationRecord{}, ctx.Err())
+				yield(api.FirehoseRevocation{}, ctx.Err())
 			} else {
-				yield(store.RevocationRecord{}, fmt.Errorf("reading revocation stream: %w", err))
+				yield(api.FirehoseRevocation{}, fmt.Errorf("reading revocation stream: %w", err))
 			}
 		}
 	}
@@ -191,10 +186,10 @@ func (c *Client) endpoint(parts ...string) string {
 	return base + "/" + strings.Join(escaped, "/")
 }
 
-func decodeRecord(value firehose.Record) (store.RevocationRecord, error) {
-	revocation, err := invocation.Decode(value.Revocation)
+func decodeRecord(value api.Revocation) (store.RevocationRecord, error) {
+	cause, err := invocation.Decode(value.Cause)
 	if err != nil {
-		return store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err)
+		return store.RevocationRecord{}, fmt.Errorf("decoding revocation cause: %w", err)
 	}
 	path := make([]ucan.Delegation, len(value.Path))
 	for i, bytes := range value.Path {
@@ -204,9 +199,10 @@ func decodeRecord(value firehose.Record) (store.RevocationRecord, error) {
 		}
 	}
 	return store.RevocationRecord{
-		Revocation: revocation,
-		Path:       path,
-		CreatedAt:  jsg.DagJsonTime(value.CreatedAt).Time(),
+		Revoke:    value.Revoke,
+		Cause:     cause,
+		Path:      path,
+		CreatedAt: jsg.DagJsonTime(value.CreatedAt).Time(),
 	}, nil
 }
 

@@ -48,9 +48,10 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 	}
 
 	record := store.RevocationRecord{
-		Revocation: revocation,
-		Path:       append([]ucan.Delegation(nil), path...),
-		CreatedAt:  time.Now(),
+		Revoke:    path[len(path)-1].Link(),
+		Cause:     revocation,
+		Path:      append([]ucan.Delegation(nil), path...),
+		CreatedAt: time.Now(),
 	}
 
 	s.mu.Lock()

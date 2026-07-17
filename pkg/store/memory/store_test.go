@@ -25,7 +25,8 @@ func TestMemoryRevocationStoreGet(t *testing.T) {
 
 	record, err := store.Get(context.Background(), path[len(path)-1].Link())
 	require.NoError(t, err)
-	require.Equal(t, revocation.Link(), record.Revocation.Link())
+	require.Equal(t, path[len(path)-1].Link(), record.Revoke)
+	require.Equal(t, revocation.Link(), record.Cause.Link())
 	require.Len(t, record.Path, len(path))
 	require.Equal(t, path[0].Link(), record.Path[0].Link())
 	require.False(t, record.CreatedAt.IsZero())
@@ -56,19 +57,19 @@ func TestMemoryRevocationStoreStream(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	records, done := collectStream(s.Stream(ctx, time.Time{}))
-	require.Equal(t, firstRevocation.Link(), (<-records).Revocation.Link())
-	require.Equal(t, secondRevocation.Link(), (<-records).Revocation.Link())
+	require.Equal(t, firstRevocation.Link(), (<-records).Cause.Link())
+	require.Equal(t, secondRevocation.Link(), (<-records).Cause.Link())
 
 	thirdRevocation, thirdPath := revocationPath(t)
 	add(t, s, thirdRevocation, thirdPath)
-	require.Equal(t, thirdRevocation.Link(), (<-records).Revocation.Link())
+	require.Equal(t, thirdRevocation.Link(), (<-records).Cause.Link())
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 
 	filteredCtx, filteredCancel := context.WithCancel(context.Background())
 	filtered, filteredDone := collectStream(s.Stream(filteredCtx, first.CreatedAt))
-	require.Equal(t, secondRevocation.Link(), (<-filtered).Revocation.Link())
-	require.Equal(t, thirdRevocation.Link(), (<-filtered).Revocation.Link())
+	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause.Link())
+	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause.Link())
 	filteredCancel()
 	require.ErrorIs(t, <-filteredDone, context.Canceled)
 }
@@ -87,8 +88,8 @@ func TestMemoryRevocationStoreStreamBroadcasts(t *testing.T) {
 
 	revocation, path := revocationPath(t)
 	add(t, s, revocation, path)
-	require.Equal(t, revocation.Link(), (<-firstRecords).Revocation.Link())
-	require.Equal(t, revocation.Link(), (<-secondRecords).Revocation.Link())
+	require.Equal(t, revocation.Link(), (<-firstRecords).Cause.Link())
+	require.Equal(t, revocation.Link(), (<-secondRecords).Cause.Link())
 
 	firstCancel()
 	secondCancel()

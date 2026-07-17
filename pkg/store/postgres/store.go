@@ -54,7 +54,7 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 
 	_, err = s.pool.Exec(
 		ctx,
-		`INSERT INTO revocation (id, revocation, revoked_delegation, path_witness)
+		`INSERT INTO revocation (id, cause, revoked_delegation, path_witness)
 		 VALUES ($1, $2, $3, $4)
 		 ON CONFLICT (id) DO NOTHING`,
 		revocation.Link().String(),
@@ -72,7 +72,7 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 func (s *Store) Get(ctx context.Context, delegationCID cid.Cid) (store.RevocationRecord, error) {
 	row := s.pool.QueryRow(
 		ctx,
-		`SELECT revocation, path_witness, created_at
+		`SELECT cause, revoked_delegation, path_witness, created_at
 		 FROM revocation
 		 WHERE revoked_delegation = $1
 		 ORDER BY created_at DESC, id DESC
@@ -129,7 +129,7 @@ func (s *Store) recordsSince(ctx context.Context, since time.Time) iter.Seq2[sto
 		}
 		rows, err := s.pool.Query(
 			ctx,
-			`SELECT revocation, path_witness, created_at
+			`SELECT cause, revoked_delegation, path_witness, created_at
 			 FROM revocation
 			 WHERE ($1::timestamptz IS NULL OR created_at > $1)
 			 ORDER BY created_at, id`,
@@ -158,16 +158,21 @@ func (s *Store) recordsSince(ctx context.Context, since time.Time) iter.Seq2[sto
 }
 
 func ScanRecord(row pgx.Row) (store.RevocationRecord, error) {
-	var revocationBytes []byte
+	var causeBytes []byte
+	var revoke string
 	var pathWitness [][]byte
 	var createdAt time.Time
-	if err := row.Scan(&revocationBytes, &pathWitness, &createdAt); err != nil {
+	if err := row.Scan(&causeBytes, &revoke, &pathWitness, &createdAt); err != nil {
 		return store.RevocationRecord{}, err
 	}
 
-	revocation, err := invocation.Decode(revocationBytes)
+	cause, err := invocation.Decode(causeBytes)
 	if err != nil {
-		return store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err)
+		return store.RevocationRecord{}, fmt.Errorf("decoding revocation cause: %w", err)
+	}
+	revokeCID, err := cid.Decode(revoke)
+	if err != nil {
+		return store.RevocationRecord{}, fmt.Errorf("decoding revoked delegation CID: %w", err)
 	}
 	path := make([]ucan.Delegation, len(pathWitness))
 	for i, witness := range pathWitness {
@@ -177,8 +182,9 @@ func ScanRecord(row pgx.Row) (store.RevocationRecord, error) {
 		}
 	}
 	return store.RevocationRecord{
-		Revocation: revocation,
-		Path:       path,
-		CreatedAt:  createdAt,
+		Revoke:    revokeCID,
+		Cause:     cause,
+		Path:      path,
+		CreatedAt: createdAt,
 	}, nil
 }

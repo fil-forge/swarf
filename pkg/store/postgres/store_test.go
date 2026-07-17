@@ -31,19 +31,21 @@ func TestScanRecord(t *testing.T) {
 	createdAt := time.Now().UTC().Round(0)
 
 	record, err := postgres.ScanRecord(recordRow{
-		revocation:  revocationBytes,
+		cause:       revocationBytes,
+		revoke:      path.Link().String(),
 		pathWitness: [][]byte{pathBytes},
 		createdAt:   createdAt,
 	})
 	require.NoError(t, err)
-	require.Equal(t, revocation.Link(), record.Revocation.Link())
+	require.Equal(t, path.Link(), record.Revoke)
+	require.Equal(t, revocation.Link(), record.Cause.Link())
 	require.Len(t, record.Path, 1)
 	require.Equal(t, path.Link(), record.Path[0].Link())
 	require.Equal(t, createdAt, record.CreatedAt)
 }
 
 func TestScanRecordReturnsDecodeError(t *testing.T) {
-	_, err := postgres.ScanRecord(recordRow{revocation: []byte("invalid")})
+	_, err := postgres.ScanRecord(recordRow{cause: []byte("invalid")})
 	require.Error(t, err)
 }
 
@@ -59,7 +61,8 @@ func TestStreamCanceled(t *testing.T) {
 }
 
 type recordRow struct {
-	revocation  []byte
+	cause       []byte
+	revoke      string
 	pathWitness [][]byte
 	createdAt   time.Time
 	err         error
@@ -69,11 +72,12 @@ func (r recordRow) Scan(dest ...any) error {
 	if r.err != nil {
 		return r.err
 	}
-	if len(dest) != 3 {
+	if len(dest) != 4 {
 		return errors.New("unexpected destination count")
 	}
-	*dest[0].(*[]byte) = r.revocation
-	*dest[1].(*[][]byte) = r.pathWitness
-	*dest[2].(*time.Time) = r.createdAt
+	*dest[0].(*[]byte) = r.cause
+	*dest[1].(*string) = r.revoke
+	*dest[2].(*[][]byte) = r.pathWitness
+	*dest[3].(*time.Time) = r.createdAt
 	return nil
 }

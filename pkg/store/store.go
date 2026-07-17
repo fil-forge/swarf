@@ -15,11 +15,13 @@ const NotFoundErrorName = "NotFound"
 var ErrNotFound = errors.New(NotFoundErrorName, "not found")
 
 type RevocationRecord struct {
-	// Revocation is the invocation that revoked the delegation.
-	Revocation ucan.Invocation
+	// Revoke is the CID of the revoked delegation.
+	Revoke cid.Cid
 	// Path is the delegation chain from the root delegation to the
 	// revoked delegation.
 	Path []ucan.Delegation
+	// Cause is the invocation that revoked the delegation.
+	Cause ucan.Invocation
 	// CreatedAt is the time when the revocation record was created. Note this
 	// is not necessarily the time when the revocation was issued.
 	CreatedAt time.Time

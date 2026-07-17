@@ -6,14 +6,14 @@ import (
 	"os"
 
 	jsg "github.com/alanshaw/dag-json-gen"
-	"github.com/fil-forge/swarf/pkg/firehose"
+	"github.com/fil-forge/swarf/pkg/api"
 )
 
 const buildTag = "//go:build !codegen\n\n"
 
 func main() {
 	const output = "../json_gen.go"
-	if err := jsg.WriteMapEncodersToFile(output, "firehose", firehose.Record{}); err != nil {
+	if err := jsg.WriteMapEncodersToFile(output, "api", api.Revocation{}, api.FirehoseRevocation{}); err != nil {
 		panic(err)
 	}
 	data, err := os.ReadFile(output)
