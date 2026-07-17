@@ -38,7 +38,7 @@ when no revocation exists. For example:
 
 ```json
 {
-  "revoke": {"/": "bafybeigdyrzt5kq3x63q4k4n3yn3y3g6l5ihd7z6f3foj7a7uhqyg4s6um"},
+  "revoke": {"/": "bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"},
   "cause": {"/": {"bytes": "omF2AWNjYXBnL3VjYW4vcmV2b2tl"}},
   "path": [
     {"/": {"bytes": "omF2AWNjYXBsL3Rlc3QvaW52b2tl"}}
@@ -56,9 +56,9 @@ to stream all stored records, or provide an RFC3339/RFC3339Nano timestamp cursor
 to stream records created after it. For example:
 
 ```js
-id: bafybeif6jwv7e4r6sk3otkq4n3xigygamqajvwjvnc4irhwmkhlpvj3a6m
+id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm
 event: revocation
-data: {"revoke":{"/":"bafybeigdyrzt5kq3x63q4k4n3yn3y3g6l5ihd7z6f3foj7a7uhqyg4s6um"},"path":[{"/":"bafybeigdyrzt5kq3x63q4k4n3yn3y3g6l5ihd7z6f3foj7a7uhqyg4s6um"}],"cause":{"/":"bafybeif6jwv7e4r6sk3otkq4n3xigygamqajvwjvnc4irhwmkhlpvj3a6m"},"created_at":"2026-07-17T09:00:00Z"}
+data: {"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"},"path":[{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}],"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"created_at":"2026-07-17T09:00:00Z"}
 ```
 
 ## Client library
