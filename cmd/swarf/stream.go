@@ -14,12 +14,15 @@ import (
 
 func newStreamCommand() *cobra.Command {
 	var serviceURL string
+	var since string
 	command := &cobra.Command{
-		Use:   "stream <since>",
+		Use:   "stream",
 		Short: "Stream revocations",
-		Args:  cobra.ExactArgs(1),
-		RunE: func(cmd *cobra.Command, args []string) error {
-			since := args[0]
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if since == "" {
+				since = time.Now().UTC().Format(time.RFC3339Nano)
+			}
 			if err := validateSince(since); err != nil {
 				return err
 			}
@@ -57,6 +60,7 @@ func newStreamCommand() *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&serviceURL, "service-url", defaultServiceURL, "Swarf service URL")
+	command.Flags().StringVar(&since, "since", "", "stream revocations created after this time: 0, RFC3339, or RFC3339Nano (default: now)")
 	return command
 }
 

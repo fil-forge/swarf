@@ -49,12 +49,12 @@ not found. Override the service endpoint with `--service-url`.
 Stream revocation DAG-JSON records as they arrive with:
 
 ```sh
-swarf stream 0
+swarf stream
 ```
 
-Pass `0` to stream all records or an RFC3339/RFC3339Nano timestamp to start
-after that time. Press Ctrl+C to stop streaming. Override the service endpoint
-with `--service-url`.
+By default, it starts from the current time. Pass `--since 0` to stream all
+records or `--since <RFC3339 timestamp>` to start after that time. Press Ctrl+C
+to stop streaming. Override the service endpoint with `--service-url`.
 
 ## API
 
