@@ -107,6 +107,7 @@ func TestRevocationRouteReturnsDAGJSON(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, response.Code)
 	require.Equal(t, "application/vnd.ipld.dag-json", response.Header().Get(echo.HeaderContentType))
+	require.Equal(t, "public, max-age=31536000, immutable", response.Header().Get(echo.HeaderCacheControl))
 	require.Contains(t, response.Body.String(), `"revoke"`)
 	require.Contains(t, response.Body.String(), `"cause"`)
 }

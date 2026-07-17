@@ -35,6 +35,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
 	"go.uber.org/fx"
 	"go.uber.org/zap"
 )
@@ -205,6 +206,11 @@ func validateRevocationPath(ctx context.Context, path []ucan.Delegation, didReso
 func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocations store.RevocationStore) *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
+	e.Use(middleware.CORSWithConfig(middleware.CORSConfig{
+		AllowOrigins: []string{"*"},
+		AllowMethods: []string{echo.GET, echo.POST, echo.OPTIONS},
+		MaxAge:       86400,
+	}))
 	e.GET("/", serverInfoHandler(id))
 	e.GET("/.well-known/did.json", didDocumentHandler(id))
 	e.GET("/revocation/:cid", revocationHandler(revocations))
@@ -294,6 +300,7 @@ func revocationHandler(revocations store.RevocationStore) echo.HandlerFunc {
 		if err != nil {
 			return fmt.Errorf("encoding revocation: %w", err)
 		}
+		c.Response().Header().Set(echo.HeaderCacheControl, "public, max-age=31536000, immutable")
 		return c.Blob(http.StatusOK, "application/vnd.ipld.dag-json", data)
 	}
 }
