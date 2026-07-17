@@ -8,10 +8,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 
 	"github.com/fil-forge/libforge/identity"
+	"github.com/fil-forge/swarf/internal/testutil"
 	swarfclient "github.com/fil-forge/swarf/pkg/client"
 	"github.com/fil-forge/swarf/pkg/config"
 	appfx "github.com/fil-forge/swarf/pkg/fx"
@@ -31,6 +33,14 @@ import (
 func TestRevocationHappyPath(t *testing.T) {
 	if testing.Short() {
 		t.Skip("integration test requires Docker")
+	}
+	if testutil.IsRunningInCI(t) && runtime.GOOS == "linux" {
+		if !testutil.IsDockerAvailable(t) {
+			t.Fatalf("docker is expected in CI linux testing environments, but wasn't found")
+		}
+	}
+	if !testutil.IsDockerAvailable(t) {
+		t.SkipNow()
 	}
 	ctx := t.Context()
 	container, err := tcpostgres.Run(ctx,
