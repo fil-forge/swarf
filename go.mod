@@ -5,7 +5,7 @@ go 1.26.4
 require (
 	github.com/alanshaw/dag-json-gen v0.0.8
 	github.com/docker/docker v28.5.2+incompatible
-	github.com/fil-forge/libforge v0.0.0-20260716130443-53b519c15c55
+	github.com/fil-forge/libforge v0.0.0-20260720101433-aba2bd29c23f
 	github.com/fil-forge/ucantone v0.0.0-20260706102443-79141c5cc52e
 	github.com/ipfs/go-cid v0.6.1
 	github.com/jackc/pgx/v5 v5.10.0
