@@ -48,10 +48,10 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 	}
 
 	record := store.RevocationRecord{
-		Revoke:    path[len(path)-1].Link(),
-		Cause:     revocation,
-		Path:      append([]ucan.Delegation(nil), path...),
-		CreatedAt: time.Now(),
+		Revoke:     path[len(path)-1].Link(),
+		Cause:      revocation,
+		Path:       append([]ucan.Delegation(nil), path...),
+		RecordedAt: time.Now(),
 	}
 
 	s.mu.Lock()
@@ -141,15 +141,15 @@ func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Rev
 func (s *Store) recordsSinceLocked(sequence uint64, since time.Time) ([]memoryRecord, uint64) {
 	entries := make([]memoryRecord, 0, len(s.records))
 	for _, entry := range s.records {
-		if entry.seq > sequence && (since.IsZero() || entry.record.CreatedAt.After(since)) {
+		if entry.seq > sequence && (since.IsZero() || entry.record.RecordedAt.After(since)) {
 			entries = append(entries, entry)
 		}
 	}
 	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].record.CreatedAt.Equal(entries[j].record.CreatedAt) {
+		if entries[i].record.RecordedAt.Equal(entries[j].record.RecordedAt) {
 			return entries[i].seq < entries[j].seq
 		}
-		return entries[i].record.CreatedAt.Before(entries[j].record.CreatedAt)
+		return entries[i].record.RecordedAt.Before(entries[j].record.RecordedAt)
 	})
 	return entries, s.nextSeq
 }

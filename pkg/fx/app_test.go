@@ -69,26 +69,26 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	require.NoError(t, err)
 	witness, err := delegation.Delegate(id, did.Undef, id.DID(), command)
 	require.NoError(t, err)
-	createdAt := time.Now().UTC().Round(0)
+	recordedAt := time.Now().UTC().Round(0)
 	source := &firehoseTestStore{
-		record: store.RevocationRecord{Revoke: witness.Link(), Cause: revocation, Path: []ucan.Delegation{witness}, CreatedAt: createdAt},
+		record: store.RevocationRecord{Revoke: witness.Link(), Cause: revocation, Path: []ucan.Delegation{witness}, RecordedAt: recordedAt},
 	}
 	e := newEchoServer(id, server.NewHTTP(id), source)
-	request := httptest.NewRequest(http.MethodGet, "/revocations/"+createdAt.Format(time.RFC3339Nano), nil)
+	request := httptest.NewRequest(http.MethodGet, "/revocations/"+recordedAt.Format(time.RFC3339Nano), nil)
 	response := httptest.NewRecorder()
 	e.ServeHTTP(response, request)
 
 	require.Equal(t, http.StatusOK, response.Code)
 	require.Equal(t, "text/event-stream", response.Header().Get(echo.HeaderContentType))
 	require.Contains(t, response.Body.String(), "event: revocation")
-	require.Equal(t, createdAt, source.since)
+	require.Equal(t, recordedAt, source.since)
 	data := strings.TrimSuffix(strings.TrimPrefix(response.Body.String(), "id: "+revocation.Link().String()+"\nevent: revocation\ndata: "), "\n\n")
 	var event api.FirehoseRevocation
 	require.NoError(t, event.UnmarshalDagJSON(strings.NewReader(data)))
 	require.Equal(t, witness.Link(), event.Revoke)
 	require.Equal(t, []cid.Cid{witness.Link()}, event.Path)
 	require.Equal(t, revocation.Link(), event.Cause)
-	require.True(t, event.CreatedAt.Time().Equal(createdAt))
+	require.True(t, event.RecordedAt.Time().Equal(recordedAt))
 	require.NotContains(t, response.Body.String(), `"revocation"`)
 }
 

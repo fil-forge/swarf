@@ -22,9 +22,9 @@ type RevocationRecord struct {
 	Path []ucan.Delegation
 	// Cause is the invocation that revoked the delegation.
 	Cause ucan.Invocation
-	// CreatedAt is the time when the revocation record was created. Note this
+	// RecordedAt is the time when the revocation record was recorded. Note this
 	// is not necessarily the time when the revocation was issued.
-	CreatedAt time.Time
+	RecordedAt time.Time
 }
 
 type RevocationStore interface {

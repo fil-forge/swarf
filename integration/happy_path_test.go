@@ -106,7 +106,7 @@ func TestRevocationHappyPath(t *testing.T) {
 	defer cancelStream()
 	records := make(chan error, 1)
 	go func() {
-		for record, err := range client.Stream(streamCtx, record.CreatedAt) {
+		for record, err := range client.Stream(streamCtx, record.RecordedAt) {
 			if err != nil {
 				records <- err
 				return

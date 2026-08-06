@@ -201,10 +201,10 @@ func decodeRecord(value api.Revocation) (store.RevocationRecord, error) {
 		}
 	}
 	return store.RevocationRecord{
-		Revoke:    value.Revoke,
-		Cause:     cause,
-		Path:      path,
-		CreatedAt: jsg.DagJsonTime(value.CreatedAt).Time(),
+		Revoke:     value.Revoke,
+		Cause:      cause,
+		Path:       path,
+		RecordedAt: jsg.DagJsonTime(value.RecordedAt).Time(),
 	}, nil
 }
 

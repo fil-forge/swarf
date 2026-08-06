@@ -322,10 +322,10 @@ func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord)
 		path[i] = delegation.Link()
 	}
 	data, err := encodeFirehoseEvent(api.FirehoseRevocation{
-		Revoke:    record.Revoke,
-		Path:      path,
-		Cause:     record.Cause.Link(),
-		CreatedAt: jsg.DagJsonTime(record.CreatedAt),
+		Revoke:     record.Revoke,
+		Path:       path,
+		Cause:      record.Cause.Link(),
+		RecordedAt: jsg.DagJsonTime(record.RecordedAt),
 	})
 	if err != nil {
 		return err
@@ -350,10 +350,10 @@ func encodeRevocationRecord(record store.RevocationRecord) ([]byte, error) {
 		}
 	}
 	value := api.Revocation{
-		Revoke:    record.Revoke,
-		Cause:     cause,
-		Path:      path,
-		CreatedAt: jsg.DagJsonTime(record.CreatedAt),
+		Revoke:     record.Revoke,
+		Cause:      cause,
+		Path:       path,
+		RecordedAt: jsg.DagJsonTime(record.RecordedAt),
 	}
 	var data bytes.Buffer
 	err = value.MarshalDagJSON(&data)

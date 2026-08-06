@@ -86,7 +86,7 @@ when no revocation exists. For example:
   "path": [
     {"/": {"bytes": "omF2AWNjYXBsL3Rlc3QvaW52b2tl"}}
   ],
-  "created_at": "2026-07-17T09:00:00Z"
+  "recorded_at": "2026-07-17T09:00:00Z"
 }
 ```
 
@@ -94,14 +94,14 @@ when no revocation exists. For example:
 
 A Server-Sent Events stream of compact DAG-JSON records. Each event has `revoke`
 (the revoked delegation CID), `path` (the witness delegation CIDs), `cause` (the
-revocation invocation CID), and `created_at` (the record creation time). Use `0`
+revocation invocation CID), and `recorded_at` (the time the record was recorded). Use `0`
 to stream all stored records, or provide an RFC3339/RFC3339Nano timestamp cursor
 to stream records created after it. For example:
 
 ```js
 id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm
 event: revocation
-data: {"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"},"path":[{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}],"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"created_at":"2026-07-17T09:00:00Z"}
+data: {"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"},"path":[{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}],"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"recorded_at":"2026-07-17T09:00:00Z"}
 ```
 
 ## Client library
@@ -119,7 +119,7 @@ err := client.Publish(ctx, path[len(path)-1].Link(), path)
 record, err := client.Get(ctx, delegationCID)
 
 for event, err := range client.Stream(ctx, time.Time{}) {
-    // event.Revoke, event.Path, and event.Cause are CIDs; event.CreatedAt is a time.
+    // event.Revoke, event.Path, and event.Cause are CIDs; event.RecordedAt is a time.
 }
 ```
 

@@ -28,20 +28,20 @@ func TestScanRecord(t *testing.T) {
 	require.NoError(t, err)
 	pathBytes, err := delegation.Encode(path)
 	require.NoError(t, err)
-	createdAt := time.Now().UTC().Round(0)
+	recordedAt := time.Now().UTC().Round(0)
 
 	record, err := postgres.ScanRecord(recordRow{
 		cause:       revocationBytes,
 		revoke:      path.Link().String(),
 		pathWitness: [][]byte{pathBytes},
-		createdAt:   createdAt,
+		recordedAt:  recordedAt,
 	})
 	require.NoError(t, err)
 	require.Equal(t, path.Link(), record.Revoke)
 	require.Equal(t, revocation.Link(), record.Cause.Link())
 	require.Len(t, record.Path, 1)
 	require.Equal(t, path.Link(), record.Path[0].Link())
-	require.Equal(t, createdAt, record.CreatedAt)
+	require.Equal(t, recordedAt, record.RecordedAt)
 }
 
 func TestScanRecordReturnsDecodeError(t *testing.T) {
@@ -64,7 +64,7 @@ type recordRow struct {
 	cause       []byte
 	revoke      string
 	pathWitness [][]byte
-	createdAt   time.Time
+	recordedAt  time.Time
 	err         error
 }
 
@@ -78,6 +78,6 @@ func (r recordRow) Scan(dest ...any) error {
 	*dest[0].(*[]byte) = r.cause
 	*dest[1].(*string) = r.revoke
 	*dest[2].(*[][]byte) = r.pathWitness
-	*dest[3].(*time.Time) = r.createdAt
+	*dest[3].(*time.Time) = r.recordedAt
 	return nil
 }

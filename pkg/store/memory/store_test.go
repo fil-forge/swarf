@@ -29,7 +29,7 @@ func TestMemoryRevocationStoreGet(t *testing.T) {
 	require.Equal(t, revocation.Link(), record.Cause.Link())
 	require.Len(t, record.Path, len(path))
 	require.Equal(t, path[0].Link(), record.Path[0].Link())
-	require.False(t, record.CreatedAt.IsZero())
+	require.False(t, record.RecordedAt.IsZero())
 
 	record.Path[0] = nil
 	again, err := store.Get(context.Background(), path[len(path)-1].Link())
@@ -67,7 +67,7 @@ func TestMemoryRevocationStoreStream(t *testing.T) {
 	require.ErrorIs(t, <-done, context.Canceled)
 
 	filteredCtx, filteredCancel := context.WithCancel(context.Background())
-	filtered, filteredDone := collectStream(s.Stream(filteredCtx, first.CreatedAt))
+	filtered, filteredDone := collectStream(s.Stream(filteredCtx, first.RecordedAt))
 	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause.Link())
 	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause.Link())
 	filteredCancel()

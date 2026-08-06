@@ -29,19 +29,19 @@ func TestGetAndStream(t *testing.T) {
 	require.NoError(t, err)
 	encoded, err := invocation.Encode(revocation)
 	require.NoError(t, err)
-	createdAt := time.Now().UTC().Round(0)
+	recordedAt := time.Now().UTC().Round(0)
 	lookupValue := api.Revocation{
-		Revoke:    revocation.Link(),
-		Cause:     encoded,
-		CreatedAt: jsg.DagJsonTime(createdAt),
+		Revoke:     revocation.Link(),
+		Cause:      encoded,
+		RecordedAt: jsg.DagJsonTime(recordedAt),
 	}
 	var lookupPayload bytes.Buffer
 	require.NoError(t, lookupValue.MarshalDagJSON(&lookupPayload))
 	streamValue := api.FirehoseRevocation{
-		Revoke:    revocation.Link(),
-		Path:      []cid.Cid{revocation.Link()},
-		Cause:     revocation.Link(),
-		CreatedAt: jsg.DagJsonTime(createdAt),
+		Revoke:     revocation.Link(),
+		Path:       []cid.Cid{revocation.Link()},
+		Cause:      revocation.Link(),
+		RecordedAt: jsg.DagJsonTime(recordedAt),
 	}
 	var streamPayload bytes.Buffer
 	require.NoError(t, streamValue.MarshalDagJSON(&streamPayload))
@@ -67,7 +67,7 @@ func TestGetAndStream(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, revocation.Link(), record.Revoke)
 	require.Equal(t, revocation.Link(), record.Cause.Link())
-	require.True(t, record.CreatedAt.Equal(createdAt))
+	require.True(t, record.RecordedAt.Equal(recordedAt))
 
 	var streamed int
 	for record, err := range client.Stream(context.Background(), time.Time{}) {
@@ -75,7 +75,7 @@ func TestGetAndStream(t *testing.T) {
 		require.Equal(t, revocation.Link(), record.Revoke)
 		require.Equal(t, []cid.Cid{revocation.Link()}, record.Path)
 		require.Equal(t, revocation.Link(), record.Cause)
-		require.True(t, record.CreatedAt.Time().Equal(createdAt))
+		require.True(t, record.RecordedAt.Time().Equal(recordedAt))
 		streamed++
 	}
 	require.Equal(t, 1, streamed)

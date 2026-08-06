@@ -72,10 +72,10 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 func (s *Store) Get(ctx context.Context, delegationCID cid.Cid) (store.RevocationRecord, error) {
 	row := s.pool.QueryRow(
 		ctx,
-		`SELECT cause, revoked_delegation, path_witness, created_at
+		`SELECT cause, revoked_delegation, path_witness, recorded_at
 		 FROM revocation
 		 WHERE revoked_delegation = $1
-		 ORDER BY created_at DESC, id DESC
+		 ORDER BY recorded_at DESC, id DESC
 		 LIMIT 1`,
 		delegationCID.String(),
 	)
@@ -108,7 +108,7 @@ func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Rev
 				if !yield(record, nil) {
 					return
 				}
-				since = record.CreatedAt
+				since = record.RecordedAt
 			}
 
 			select {
@@ -129,10 +129,10 @@ func (s *Store) recordsSince(ctx context.Context, since time.Time) iter.Seq2[sto
 		}
 		rows, err := s.pool.Query(
 			ctx,
-			`SELECT cause, revoked_delegation, path_witness, created_at
+			`SELECT cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
-			 WHERE ($1::timestamptz IS NULL OR created_at > $1)
-			 ORDER BY created_at, id`,
+			 WHERE ($1::timestamptz IS NULL OR recorded_at > $1)
+			 ORDER BY recorded_at, id`,
 			sinceArg,
 		)
 		if err != nil {
@@ -161,8 +161,8 @@ func ScanRecord(row pgx.Row) (store.RevocationRecord, error) {
 	var causeBytes []byte
 	var revoke string
 	var pathWitness [][]byte
-	var createdAt time.Time
-	if err := row.Scan(&causeBytes, &revoke, &pathWitness, &createdAt); err != nil {
+	var recordedAt time.Time
+	if err := row.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
 		return store.RevocationRecord{}, err
 	}
 
@@ -182,9 +182,9 @@ func ScanRecord(row pgx.Row) (store.RevocationRecord, error) {
 		}
 	}
 	return store.RevocationRecord{
-		Revoke:    revokeCID,
-		Cause:     cause,
-		Path:      path,
-		CreatedAt: createdAt,
+		Revoke:     revokeCID,
+		Cause:      cause,
+		Path:       path,
+		RecordedAt: recordedAt,
 	}, nil
 }

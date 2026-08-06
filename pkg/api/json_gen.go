@@ -56,26 +56,6 @@ func (t *Revocation) MarshalDagJSON(w io.Writer) error {
 		}
 	}
 
-	// t.CreatedAt (typegen.DagJsonTime) (struct)
-	if len("created_at") > 8192 {
-		return fmt.Errorf("string in field \"created_at\" was too long")
-	}
-	if err := jw.WriteString(string("created_at")); err != nil {
-		return fmt.Errorf("writing string for field \"created_at\": %w", err)
-	}
-	if err := jw.WriteObjectColon(); err != nil {
-		return err
-	}
-	if err := t.CreatedAt.MarshalDagJSON(jw); err != nil {
-		return fmt.Errorf("marshaling field t.CreatedAt: %w", err)
-	}
-	written++
-	if written > 0 {
-		if err := jw.WriteComma(); err != nil {
-			return err
-		}
-	}
-
 	// t.Path ([][]uint8) (slice)
 	if len("path") > 8192 {
 		return fmt.Errorf("string in field \"path\" was too long")
@@ -112,6 +92,26 @@ func (t *Revocation) MarshalDagJSON(w io.Writer) error {
 		return fmt.Errorf("writing array close for field t.Path: %w", err)
 	}
 
+	written++
+	if written > 0 {
+		if err := jw.WriteComma(); err != nil {
+			return err
+		}
+	}
+
+	// t.RecordedAt (typegen.DagJsonTime) (struct)
+	if len("recorded_at") > 8192 {
+		return fmt.Errorf("string in field \"recorded_at\" was too long")
+	}
+	if err := jw.WriteString(string("recorded_at")); err != nil {
+		return fmt.Errorf("writing string for field \"recorded_at\": %w", err)
+	}
+	if err := jw.WriteObjectColon(); err != nil {
+		return err
+	}
+	if err := t.RecordedAt.MarshalDagJSON(jw); err != nil {
+		return fmt.Errorf("marshaling field t.RecordedAt: %w", err)
+	}
 	written++
 	if written > 0 {
 		if err := jw.WriteComma(); err != nil {
@@ -190,13 +190,6 @@ func (t *Revocation) UnmarshalDagJSON(r io.Reader) (err error) {
 					}
 				}
 
-				// t.CreatedAt (typegen.DagJsonTime) (struct)
-			case "created_at":
-
-				if err := t.CreatedAt.UnmarshalDagJSON(jr); err != nil {
-					return fmt.Errorf("unmarshaling t.CreatedAt: %w", err)
-				}
-
 				// t.Path ([][]uint8) (slice)
 			case "path":
 				{
@@ -246,6 +239,13 @@ func (t *Revocation) UnmarshalDagJSON(r io.Reader) (err error) {
 						}
 					}
 
+				}
+
+				// t.RecordedAt (typegen.DagJsonTime) (struct)
+			case "recorded_at":
+
+				if err := t.RecordedAt.UnmarshalDagJSON(jr); err != nil {
+					return fmt.Errorf("unmarshaling t.RecordedAt: %w", err)
 				}
 
 				// t.Revoke (cid.Cid) (struct)
@@ -314,26 +314,6 @@ func (t *FirehoseRevocation) MarshalDagJSON(w io.Writer) error {
 		}
 	}
 
-	// t.CreatedAt (typegen.DagJsonTime) (struct)
-	if len("created_at") > 8192 {
-		return fmt.Errorf("string in field \"created_at\" was too long")
-	}
-	if err := jw.WriteString(string("created_at")); err != nil {
-		return fmt.Errorf("writing string for field \"created_at\": %w", err)
-	}
-	if err := jw.WriteObjectColon(); err != nil {
-		return err
-	}
-	if err := t.CreatedAt.MarshalDagJSON(jw); err != nil {
-		return fmt.Errorf("marshaling field t.CreatedAt: %w", err)
-	}
-	written++
-	if written > 0 {
-		if err := jw.WriteComma(); err != nil {
-			return err
-		}
-	}
-
 	// t.Path ([]cid.Cid) (slice)
 	if len("path") > 8192 {
 		return fmt.Errorf("string in field \"path\" was too long")
@@ -367,6 +347,26 @@ func (t *FirehoseRevocation) MarshalDagJSON(w io.Writer) error {
 		return fmt.Errorf("writing array close for field t.Path: %w", err)
 	}
 
+	written++
+	if written > 0 {
+		if err := jw.WriteComma(); err != nil {
+			return err
+		}
+	}
+
+	// t.RecordedAt (typegen.DagJsonTime) (struct)
+	if len("recorded_at") > 8192 {
+		return fmt.Errorf("string in field \"recorded_at\" was too long")
+	}
+	if err := jw.WriteString(string("recorded_at")); err != nil {
+		return fmt.Errorf("writing string for field \"recorded_at\": %w", err)
+	}
+	if err := jw.WriteObjectColon(); err != nil {
+		return err
+	}
+	if err := t.RecordedAt.MarshalDagJSON(jw); err != nil {
+		return fmt.Errorf("marshaling field t.RecordedAt: %w", err)
+	}
 	written++
 	if written > 0 {
 		if err := jw.WriteComma(); err != nil {
@@ -441,13 +441,6 @@ func (t *FirehoseRevocation) UnmarshalDagJSON(r io.Reader) (err error) {
 
 				}
 
-				// t.CreatedAt (typegen.DagJsonTime) (struct)
-			case "created_at":
-
-				if err := t.CreatedAt.UnmarshalDagJSON(jr); err != nil {
-					return fmt.Errorf("unmarshaling t.CreatedAt: %w", err)
-				}
-
 				// t.Path ([]cid.Cid) (slice)
 			case "path":
 				{
@@ -492,6 +485,13 @@ func (t *FirehoseRevocation) UnmarshalDagJSON(r io.Reader) (err error) {
 						}
 					}
 
+				}
+
+				// t.RecordedAt (typegen.DagJsonTime) (struct)
+			case "recorded_at":
+
+				if err := t.RecordedAt.UnmarshalDagJSON(jr); err != nil {
+					return fmt.Errorf("unmarshaling t.RecordedAt: %w", err)
 				}
 
 				// t.Revoke (cid.Cid) (struct)

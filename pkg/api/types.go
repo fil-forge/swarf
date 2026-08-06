@@ -9,17 +9,17 @@ import (
 // Revocation is the serialized representation returned by revocation lookup
 // requests.
 type Revocation struct {
-	Revoke    cid.Cid         `dagjsongen:"revoke"`
-	Path      [][]byte        `dagjsongen:"path"`
-	Cause     []byte          `dagjsongen:"cause"`
-	CreatedAt jsg.DagJsonTime `dagjsongen:"created_at"`
+	Revoke     cid.Cid         `dagjsongen:"revoke"`
+	Path       [][]byte        `dagjsongen:"path"`
+	Cause      []byte          `dagjsongen:"cause"`
+	RecordedAt jsg.DagJsonTime `dagjsongen:"recorded_at"`
 }
 
 // FirehoseRevocation is the compact representation emitted by the revocation
 // firehose.
 type FirehoseRevocation struct {
-	Revoke    cid.Cid         `dagjsongen:"revoke"`
-	Path      []cid.Cid       `dagjsongen:"path"`
-	Cause     cid.Cid         `dagjsongen:"cause"`
-	CreatedAt jsg.DagJsonTime `dagjsongen:"created_at"`
+	Revoke     cid.Cid         `dagjsongen:"revoke"`
+	Path       []cid.Cid       `dagjsongen:"path"`
+	Cause      cid.Cid         `dagjsongen:"cause"`
+	RecordedAt jsg.DagJsonTime `dagjsongen:"recorded_at"`
 }
