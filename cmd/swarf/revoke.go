@@ -71,11 +71,11 @@ func newRevokeCommand() *cobra.Command {
 			if !endpoint.IsAbs() || endpoint.Host == "" {
 				return fmt.Errorf("service URL must be absolute: %q", serviceURL)
 			}
-			client, err := swarfclient.New(serviceDID, *endpoint, issuer)
+			client, err := swarfclient.New(serviceDID, *endpoint)
 			if err != nil {
 				return fmt.Errorf("creating Swarf client: %w", err)
 			}
-			if err := client.Publish(cmd.Context(), revoke, path); err != nil {
+			if err := client.Publish(cmd.Context(), issuer, revoke, path); err != nil {
 				return err
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "published revocation for %s\n", revoke)

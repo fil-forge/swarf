@@ -28,17 +28,13 @@ import (
 // Client publishes and retrieves revocation records from a Swarf service.
 type Client struct {
 	ServiceID  did.DID
-	Issuer     ucan.Issuer
 	serviceURL url.URL
 	executor   execution.Executor
 	httpClient *http.Client
 }
 
 // New creates a client for the Swarf service at serviceURL.
-func New(serviceID did.DID, serviceURL url.URL, issuer ucan.Issuer, options ...Option) (*Client, error) {
-	if issuer == nil {
-		return nil, errors.New("issuer is required")
-	}
+func New(serviceID did.DID, serviceURL url.URL, options ...Option) (*Client, error) {
 	cfg := clientConfig{httpClient: http.DefaultClient}
 	for _, option := range options {
 		option(&cfg)
@@ -49,16 +45,19 @@ func New(serviceID did.DID, serviceURL url.URL, issuer ucan.Issuer, options ...O
 	}
 	return &Client{
 		ServiceID:  serviceID,
-		Issuer:     issuer,
 		serviceURL: serviceURL,
 		executor:   executor,
 		httpClient: cfg.httpClient,
 	}, nil
 }
 
-// Publish submits a self-signed /ucan/revoke invocation for revoked using path
-// as its delegation witness.
-func (c *Client) Publish(ctx context.Context, revoked cid.Cid, path []ucan.Delegation) error {
+// Publish submits a /ucan/revoke invocation self-signed by revoker for revoked,
+// using path as its delegation witness. The revoker must be an issuer of one of
+// the delegations in path.
+func (c *Client) Publish(ctx context.Context, revoker ucan.Issuer, revoked cid.Cid, path []ucan.Delegation) error {
+	if revoker == nil {
+		return errors.New("revoker is required")
+	}
 	if len(path) == 0 {
 		return errors.New("revocation path must contain the revoked delegation")
 	}
@@ -70,8 +69,8 @@ func (c *Client) Publish(ctx context.Context, revoked cid.Cid, path []ucan.Deleg
 		links[i] = delegation.Link()
 	}
 	invocation, err := ucancmd.Revoke.Invoke(
-		c.Issuer,
-		c.Issuer.DID(),
+		revoker,
+		revoker.DID(),
 		&ucancmd.RevokeArguments{Revoke: revoked, Path: links},
 		invocation.WithAudience(c.ServiceID),
 		invocation.WithNoNonce(),
