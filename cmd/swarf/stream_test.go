@@ -23,14 +23,14 @@ func TestStreamCommand(t *testing.T) {
 	command := newStreamCommand()
 	output := bytes.NewBuffer(nil)
 	command.SetOut(output)
-	command.SetArgs([]string{"--service-url", server.URL, "--since", "0"})
+	command.SetArgs([]string{"--service-url", server.URL, "--from", "0"})
 	require.NoError(t, command.Execute())
 	require.Equal(t, "{\"revoke\":\"one\"}\n{\"revoke\":\"two\"}\n", output.String())
 }
 
-func TestStreamCommandRejectsInvalidSince(t *testing.T) {
+func TestStreamCommandRejectsInvalidFrom(t *testing.T) {
 	command := newStreamCommand()
-	command.SetArgs([]string{"--since", "not-a-timestamp"})
+	command.SetArgs([]string{"--from", "not-a-timestamp"})
 	require.Error(t, command.Execute())
 }
 
@@ -43,7 +43,7 @@ func TestStreamCommandCancellation(t *testing.T) {
 	defer server.Close()
 
 	command := newStreamCommand()
-	command.SetArgs([]string{"--service-url", server.URL, "--since", "0"})
+	command.SetArgs([]string{"--service-url", server.URL, "--from", "0"})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)
@@ -59,7 +59,7 @@ func TestStreamCommandCancellation(t *testing.T) {
 	require.NoError(t, <-result)
 }
 
-func TestStreamCommandDefaultsSinceToNow(t *testing.T) {
+func TestStreamCommandDefaultsFromToNow(t *testing.T) {
 	requestURL := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		requestURL <- request.URL.Path
@@ -70,9 +70,9 @@ func TestStreamCommandDefaultsSinceToNow(t *testing.T) {
 	command.SetArgs([]string{"--service-url", server.URL})
 	require.NoError(t, command.Execute())
 
-	since := requestURLValue(t, requestURL)
-	require.NotEqual(t, "/revocations/0", since)
-	_, err := time.Parse(time.RFC3339Nano, since[len("/revocations/"):])
+	from := requestURLValue(t, requestURL)
+	require.NotEqual(t, "/revocations/0", from)
+	_, err := time.Parse(time.RFC3339Nano, from[len("/revocations/"):])
 	require.NoError(t, err)
 }
 

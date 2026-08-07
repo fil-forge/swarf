@@ -91,7 +91,7 @@ func (s *Store) Get(ctx context.Context, delegation cid.Cid) (store.RevocationRe
 }
 
 // Stream returns matching revocation records and remains open until ctx is canceled.
-func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.RevocationRecord, error] {
+func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
 	return func(yield func(store.RevocationRecord, error) bool) {
 		if err := ctx.Err(); err != nil {
 			yield(store.RevocationRecord{}, err)
@@ -99,7 +99,7 @@ func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Rev
 		}
 
 		s.mu.Lock()
-		entries, sequence := s.recordsSinceLocked(0, since)
+		entries, sequence := s.recordsFromLocked(0, from)
 		s.nextSubscriber++
 		subscriber := s.nextSubscriber
 		notification := make(chan struct{}, 1)
@@ -131,17 +131,17 @@ func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Rev
 				return
 			case <-notification:
 				s.mu.RLock()
-				entries, sequence = s.recordsSinceLocked(sequence, since)
+				entries, sequence = s.recordsFromLocked(sequence, from)
 				s.mu.RUnlock()
 			}
 		}
 	}
 }
 
-func (s *Store) recordsSinceLocked(sequence uint64, since time.Time) ([]memoryRecord, uint64) {
+func (s *Store) recordsFromLocked(sequence uint64, from time.Time) ([]memoryRecord, uint64) {
 	entries := make([]memoryRecord, 0, len(s.records))
 	for _, entry := range s.records {
-		if entry.seq > sequence && (since.IsZero() || entry.record.RecordedAt.After(since)) {
+		if entry.seq > sequence && (from.IsZero() || !entry.record.RecordedAt.Before(from)) {
 			entries = append(entries, entry)
 		}
 	}

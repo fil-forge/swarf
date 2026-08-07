@@ -2,7 +2,6 @@ package integration
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -23,6 +22,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/stretchr/testify/require"
+	"github.com/ipfs/go-cid"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -106,17 +106,24 @@ func TestRevocationHappyPath(t *testing.T) {
 	defer cancelStream()
 	records := make(chan error, 1)
 	go func() {
-		for record, err := range client.Stream(streamCtx, record.RecordedAt) {
+		// The from cursor is inclusive, so the stream re-delivers the first
+		// revocation (recorded at exactly from) before the second, and must
+		// not deliver anything else.
+		expecting := []cid.Cid{record.Revoke, expected}
+		for streamed, err := range client.Stream(streamCtx, record.RecordedAt) {
 			if err != nil {
 				records <- err
 				return
 			}
-			if record.Revoke != expected {
-				records <- errors.New("stream returned an unexpected revocation")
+			if streamed.Revoke != expecting[0] {
+				records <- fmt.Errorf("stream returned an unexpected revocation: %s", streamed.Revoke)
 				return
 			}
-			records <- nil
-			return
+			expecting = expecting[1:]
+			if len(expecting) == 0 {
+				records <- nil
+				return
+			}
 		}
 	}()
 	require.NoError(t, client.Publish(ctx, bob, expected, second))

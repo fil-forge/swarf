@@ -113,12 +113,15 @@ func (c *Client) Get(ctx context.Context, delegationCID cid.Cid) (store.Revocati
 	return decodeRecord(record)
 }
 
-// Stream yields firehose revocations created after since until ctx is canceled.
-func (c *Client) Stream(ctx context.Context, since time.Time) iter.Seq2[api.FirehoseRevocation, error] {
+// Stream yields firehose revocations recorded on or after from until ctx is
+// canceled. Records recorded at exactly from are re-delivered so consumers
+// resuming from the timestamp of the last record they received do not miss
+// records that share it; dedupe by cause CID.
+func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error] {
 	return func(yield func(api.FirehoseRevocation, error) bool) {
 		cursor := "0"
-		if !since.IsZero() {
-			cursor = since.Format(time.RFC3339Nano)
+		if !from.IsZero() {
+			cursor = from.Format(time.RFC3339Nano)
 		}
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("revocations", cursor), nil)
 		if err != nil {

@@ -52,11 +52,11 @@ func TestEchoPublicRoutes(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code)
 }
 
-func TestParseSince(t *testing.T) {
-	since, err := parseSince("0")
+func TestParseFrom(t *testing.T) {
+	from, err := parseFrom("0")
 	require.NoError(t, err)
-	require.True(t, since.IsZero())
-	_, err = parseSince("not-a-timestamp")
+	require.True(t, from.IsZero())
+	_, err = parseFrom("not-a-timestamp")
 	require.Error(t, err)
 }
 
@@ -81,7 +81,7 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code)
 	require.Equal(t, "text/event-stream", response.Header().Get(echo.HeaderContentType))
 	require.Contains(t, response.Body.String(), "event: revocation")
-	require.Equal(t, recordedAt, source.since)
+	require.Equal(t, recordedAt, source.from)
 	data := strings.TrimSuffix(strings.TrimPrefix(response.Body.String(), "id: "+revocation.Link().String()+"\nevent: revocation\ndata: "), "\n\n")
 	var event api.FirehoseRevocation
 	require.NoError(t, event.UnmarshalDagJSON(strings.NewReader(data)))
@@ -154,7 +154,7 @@ func TestValidateRevocationPath(t *testing.T) {
 
 type firehoseTestStore struct {
 	record store.RevocationRecord
-	since  time.Time
+	from  time.Time
 }
 
 func (s *firehoseTestStore) Add(context.Context, ucan.Invocation, []ucan.Delegation) error {
@@ -165,8 +165,8 @@ func (s *firehoseTestStore) Get(context.Context, cid.Cid) (store.RevocationRecor
 	return s.record, nil
 }
 
-func (s *firehoseTestStore) Stream(_ context.Context, since time.Time) iter.Seq2[store.RevocationRecord, error] {
-	s.since = since
+func (s *firehoseTestStore) Stream(_ context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
+	s.from = from
 	return func(yield func(store.RevocationRecord, error) bool) {
 		yield(s.record, nil)
 	}

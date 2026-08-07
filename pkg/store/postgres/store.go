@@ -90,17 +90,21 @@ func (s *Store) Get(ctx context.Context, delegationCID cid.Cid) (store.Revocatio
 }
 
 // Stream returns matching revocation records and remains open until ctx is canceled.
-func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.RevocationRecord, error] {
+func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
 	return func(yield func(store.RevocationRecord, error) bool) {
 		ticker := time.NewTicker(streamPollInterval)
 		defer ticker.Stop()
 
+		// lastID is the id of the most recently yielded record, so polling
+		// resumes strictly after it rather than re-yielding records that share
+		// its recorded_at timestamp.
+		var lastID string
 		for {
 			if err := ctx.Err(); err != nil {
 				yield(store.RevocationRecord{}, err)
 				return
 			}
-			for record, err := range s.recordsSince(ctx, since) {
+			for record, err := range s.recordsFrom(ctx, from, lastID) {
 				if err != nil {
 					yield(store.RevocationRecord{}, err)
 					return
@@ -108,7 +112,8 @@ func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Rev
 				if !yield(record, nil) {
 					return
 				}
-				since = record.RecordedAt
+				from = record.RecordedAt
+				lastID = record.Cause.Link().String()
 			}
 
 			select {
@@ -121,19 +126,29 @@ func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Rev
 	}
 }
 
-func (s *Store) recordsSince(ctx context.Context, since time.Time) iter.Seq2[store.RevocationRecord, error] {
+func (s *Store) recordsFrom(ctx context.Context, from time.Time, lastID string) iter.Seq2[store.RevocationRecord, error] {
 	return func(yield func(store.RevocationRecord, error) bool) {
-		var sinceArg any
-		if !since.IsZero() {
-			sinceArg = since
+		var fromArg, lastIDArg any
+		if !from.IsZero() {
+			fromArg = from
 		}
+		if lastID != "" {
+			lastIDArg = lastID
+		}
+		// The from filter is inclusive so consumers resuming from the
+		// timestamp of the last record they received do not miss records that
+		// share it. Once a record has been yielded, the (recorded_at, id)
+		// cursor resumes strictly after it.
 		rows, err := s.pool.Query(
 			ctx,
 			`SELECT cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
-			 WHERE ($1::timestamptz IS NULL OR recorded_at > $1)
+			 WHERE ($1::timestamptz IS NULL)
+			    OR ($2::text IS NULL AND recorded_at >= $1)
+			    OR (recorded_at > $1 OR (recorded_at = $1 AND id > $2))
 			 ORDER BY recorded_at, id`,
-			sinceArg,
+			fromArg,
+			lastIDArg,
 		)
 		if err != nil {
 			yield(store.RevocationRecord{}, fmt.Errorf("querying revocations: %w", err))

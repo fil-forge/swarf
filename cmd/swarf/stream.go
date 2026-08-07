@@ -14,16 +14,16 @@ import (
 
 func newStreamCommand() *cobra.Command {
 	var serviceURL string
-	var since string
+	var from string
 	command := &cobra.Command{
 		Use:   "stream",
 		Short: "Stream revocations",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if since == "" {
-				since = time.Now().UTC().Format(time.RFC3339Nano)
+			if from == "" {
+				from = time.Now().UTC().Format(time.RFC3339Nano)
 			}
-			if err := validateSince(since); err != nil {
+			if err := validateFrom(from); err != nil {
 				return err
 			}
 			endpoint, err := url.Parse(serviceURL)
@@ -33,7 +33,7 @@ func newStreamCommand() *cobra.Command {
 			if !endpoint.IsAbs() || endpoint.Host == "" {
 				return fmt.Errorf("service URL must be absolute: %q", serviceURL)
 			}
-			requestURL := strings.TrimRight(endpoint.String(), "/") + "/revocations/" + url.PathEscape(since)
+			requestURL := strings.TrimRight(endpoint.String(), "/") + "/revocations/" + url.PathEscape(from)
 			request, err := http.NewRequestWithContext(cmd.Context(), http.MethodGet, requestURL, nil)
 			if err != nil {
 				return fmt.Errorf("creating revocation stream request: %w", err)
@@ -60,16 +60,16 @@ func newStreamCommand() *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&serviceURL, "service-url", defaultServiceURL, "Swarf service URL")
-	command.Flags().StringVar(&since, "since", "", "stream revocations created after this time: 0, RFC3339, or RFC3339Nano (default: now)")
+	command.Flags().StringVar(&from, "from", "", "stream revocations recorded on or after this time: 0, RFC3339, or RFC3339Nano (default: now)")
 	return command
 }
 
-func validateSince(value string) error {
+func validateFrom(value string) error {
 	if value == "0" {
 		return nil
 	}
 	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
-		return fmt.Errorf("invalid since timestamp: %w", err)
+		return fmt.Errorf("invalid from timestamp: %w", err)
 	}
 	return nil
 }
