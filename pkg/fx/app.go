@@ -114,7 +114,7 @@ func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStor
 }
 
 func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.RevocationStore) (*server.HTTPServer, error) {
-	didResolver, err := newDIDResolver(id, cfg.Server.InsecureDIDResolution, cfg.Server.PLCDirectory)
+	didResolver, err := newDIDResolver(id, cfg.Server.InsecureDIDResolution, cfg.PLC.Directory)
 	if err != nil {
 		return nil, err
 	}

@@ -20,7 +20,7 @@ func TestLoadAppliesDefaultsAndFlags(t *testing.T) {
 	require.Equal(t, StorageTypeMemory, cfg.Storage.Type)
 	require.Equal(t, 9090, cfg.Server.Port)
 	require.Equal(t, "127.0.0.1", cfg.Server.Host)
-	require.Equal(t, DefaultPLCDirectory, cfg.Server.PLCDirectory)
+	require.Equal(t, DefaultPLCDirectory, cfg.PLC.Directory)
 }
 
 func TestLoadBindsPLCDirectoryFlag(t *testing.T) {
@@ -30,5 +30,5 @@ func TestLoadBindsPLCDirectoryFlag(t *testing.T) {
 
 	cfg, err := Load("", flags)
 	require.NoError(t, err)
-	require.Equal(t, "https://plc.example.com", cfg.Server.PLCDirectory)
+	require.Equal(t, "https://plc.example.com", cfg.PLC.Directory)
 }

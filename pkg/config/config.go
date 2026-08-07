@@ -23,6 +23,7 @@ type Config struct {
 	Server   ServerConfig   `mapstructure:"server"`
 	Log      LogConfig      `mapstructure:"log"`
 	Storage  StorageConfig  `mapstructure:"storage"`
+	PLC      PLCConfig      `mapstructure:"plc"`
 }
 
 type IdentityConfig struct {
@@ -34,7 +35,13 @@ type ServerConfig struct {
 	Host                  string `mapstructure:"host"`
 	Port                  int    `mapstructure:"port"`
 	InsecureDIDResolution bool   `mapstructure:"insecure_did_resolution"`
-	PLCDirectory          string `mapstructure:"plc_directory"`
+}
+
+// PLCConfig holds settings for the did:plc directory.
+type PLCConfig struct {
+	// Directory is the did:plc directory endpoint used to resolve did:plc
+	// DIDs, e.g. "https://plc.directory".
+	Directory string `mapstructure:"directory"`
 }
 
 type LogConfig struct {
@@ -59,7 +66,7 @@ var flagBindings = map[string]string{
 	"server.host":                      "host",
 	"server.port":                      "port",
 	"server.insecure_did_resolution":   "insecure-did-resolution",
-	"server.plc_directory":             "plc-directory",
+	"plc.directory":                    "plc-directory",
 	"log.level":                        "log-level",
 	"storage.type":                     "storage",
 	"storage.postgres.dsn":             "postgres-dsn",
@@ -70,8 +77,8 @@ func Load(configFile string, flags *pflag.FlagSet) (*Config, error) {
 	v := viper.New()
 	v.SetDefault("server.host", "127.0.0.1")
 	v.SetDefault("server.port", 8080)
-	v.SetDefault("server.plc_directory", DefaultPLCDirectory)
 	v.SetDefault("log.level", "info")
+	v.SetDefault("plc.directory", DefaultPLCDirectory)
 	v.SetDefault("storage.type", StorageTypePostgres)
 	v.SetDefault("storage.postgres.max_conns", 10)
 	v.SetDefault("storage.postgres.min_conns", 0)
