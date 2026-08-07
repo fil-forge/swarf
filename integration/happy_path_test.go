@@ -89,11 +89,11 @@ func TestRevocationHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	carol, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
-	client, err := swarfclient.New(serviceIssuer.DID(), *serviceURL, bob)
+	client, err := swarfclient.New(serviceIssuer.DID(), *serviceURL)
 	require.NoError(t, err)
 
 	first := revocationPath(t, alice, bob, carol)
-	require.NoError(t, client.Publish(ctx, first[len(first)-1].Link(), first))
+	require.NoError(t, client.Publish(ctx, bob, first[len(first)-1].Link(), first))
 	record, err := client.Get(ctx, first[len(first)-1].Link())
 	require.NoError(t, err)
 	require.NotNil(t, record.Cause)
@@ -119,7 +119,7 @@ func TestRevocationHappyPath(t *testing.T) {
 			return
 		}
 	}()
-	require.NoError(t, client.Publish(ctx, expected, second))
+	require.NoError(t, client.Publish(ctx, bob, expected, second))
 	select {
 	case err := <-records:
 		require.NoError(t, err)

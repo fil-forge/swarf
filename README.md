@@ -106,15 +106,15 @@ data: {"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc
 
 ## Client library
 
-Construct a client with the Swarf service DID, URL, and the issuer that is
-revoking a delegation:
+Construct a client with the Swarf service DID and URL, and pass the issuer
+revoking a delegation to each `Publish` call:
 
 ```go
 serviceURL, _ := url.Parse("https://swarf.example.com")
-client, _ := swarfclient.New(serviceDID, *serviceURL, issuer)
+client, _ := swarfclient.New(serviceDID, *serviceURL)
 
 // The final delegation in path is the delegation to revoke.
-err := client.Publish(ctx, path[len(path)-1].Link(), path)
+err := client.Publish(ctx, revoker, path[len(path)-1].Link(), path)
 
 record, err := client.Get(ctx, delegationCID)
 
@@ -123,6 +123,7 @@ for event, err := range client.Stream(ctx, time.Time{}) {
 }
 ```
 
-`Publish` self-signs the revocation invocation; its issuer must appear in the
-delegation path. `Get` returns a full `store.RevocationRecord`; `Stream`
-returns compact `api.FirehoseRevocation` values.
+`Publish` self-signs the revocation invocation with the passed revoker, which
+must appear as an issuer in the delegation path. `Get` returns a full
+`store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
+values.
