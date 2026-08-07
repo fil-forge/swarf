@@ -230,11 +230,19 @@ func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocati
 		MaxAge:       86400,
 	}))
 	e.GET("/", serverInfoHandler(id))
+	e.GET("/health", healthHandler)
 	e.GET("/.well-known/did.json", didDocumentHandler(id))
 	e.GET("/revocation/:cid", revocationHandler(revocations))
 	e.GET("/revocations/:since", firehoseHandler(revocations))
 	e.POST("/", echo.WrapHandler(ucanServer))
 	return e
+}
+
+// healthHandler returns health status.
+func healthHandler(c echo.Context) error {
+	return c.JSON(http.StatusOK, map[string]string{
+		"status": "healthy",
+	})
 }
 
 type serverInfo struct {
