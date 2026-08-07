@@ -15,24 +15,26 @@ By default, Swarf uses PostgreSQL. Configure it with `--postgres-dsn`, a
 
 ## CLI
 
-### `swarf revoke <revoke-cid> <witness-path-container>`
+### `swarf revoke <revoke-cid> <delegation-or-container>`
 
-Publish a revocation with an issuer PEM key, the CID to revoke, and a UCAN
-container containing the delegation witnesses:
+Publish a revocation with an issuer PEM key, the CID to revoke, and the
+delegation to revoke:
 
 ```sh
 swarf revoke \
   --issuer-key-file issuer.pem \
   <revoke-cid> \
-  <witness-path-container>
+  <delegation-or-container>
 ```
 
-`witness-path-container` can be a file path or an encoded UCAN container
-string. Swarf builds the witness chain from the revoked delegation CID. When
-the issuer key issued the revoked delegation, the container only needs the
-revoked delegation itself — no witness chain is required. The service defaults
-to `did:web:swarf.forgery.network` at `https://swarf.forgery.network`; override
-these with `--service-id` and `--service-url`.
+`delegation-or-container` can be a file path or an encoded UCAN container
+string. A file may contain either a CBOR-encoded delegation or a UCAN container
+holding the delegation to revoke. When the issuer key issued the revoked
+delegation, the delegation alone is enough; otherwise the container must also
+include the delegation witnesses, from which Swarf builds the witness chain.
+The service defaults to `did:web:swarf.forgery.network` at
+`https://swarf.forgery.network`; override these with `--service-id` and
+`--service-url`.
 
 ### `swarf get <revoke-cid>`
 

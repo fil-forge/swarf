@@ -13,6 +13,7 @@ import (
 	"github.com/fil-forge/ucantone/multikey"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/container"
+	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/ipfs/go-cid"
 	"github.com/spf13/cobra"
 )
@@ -28,7 +29,7 @@ func newRevokeCommand() *cobra.Command {
 	var serviceURL string
 
 	command := &cobra.Command{
-		Use:   "revoke <revoke-cid> <witness-path-container>",
+		Use:   "revoke <revoke-cid> <delegation-or-container>",
 		Short: "Publish a revocation",
 		Args:  cobra.ExactArgs(2),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -39,13 +40,13 @@ func newRevokeCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("decoding revoke CID: %w", err)
 			}
-			containerBytes, err := readContainer(args[1])
+			input, err := readInput(args[1])
 			if err != nil {
 				return err
 			}
-			witnesses, err := container.Decode(containerBytes)
+			witnesses, err := decodeDelegations(input)
 			if err != nil {
-				return fmt.Errorf("decoding witness path container: %w", err)
+				return err
 			}
 			key, err := os.ReadFile(issuerKeyFile)
 			if err != nil {
@@ -56,7 +57,7 @@ func newRevokeCommand() *cobra.Command {
 				return fmt.Errorf("decoding issuer key: %w", err)
 			}
 			issuer := multikey.KeyIssuer(signer)
-			path, err := witnessPath(revoke, issuer.DID(), witnesses.Delegations())
+			path, err := witnessPath(revoke, issuer.DID(), witnesses)
 			if err != nil {
 				return err
 			}
@@ -89,22 +90,37 @@ func newRevokeCommand() *cobra.Command {
 	return command
 }
 
-func readContainer(value string) ([]byte, error) {
+// readInput returns the contents of value when it is a file path, and value
+// itself otherwise.
+func readInput(value string) ([]byte, error) {
 	info, err := os.Stat(value)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ENAMETOOLONG) {
 			return []byte(value), nil
 		}
-		return nil, fmt.Errorf("stating witness path container: %w", err)
+		return nil, fmt.Errorf("stating delegation or container: %w", err)
 	}
 	if info.IsDir() {
-		return nil, fmt.Errorf("witness path container is a directory: %s", value)
+		return nil, fmt.Errorf("delegation or container is a directory: %s", value)
 	}
 	data, err := os.ReadFile(value)
 	if err != nil {
-		return nil, fmt.Errorf("reading witness path container: %w", err)
+		return nil, fmt.Errorf("reading delegation or container: %w", err)
 	}
 	return data, nil
+}
+
+// decodeDelegations decodes data as either a CBOR-encoded delegation or a UCAN
+// container of delegations.
+func decodeDelegations(data []byte) ([]ucan.Delegation, error) {
+	if dlg, err := delegation.Decode(data); err == nil {
+		return []ucan.Delegation{dlg}, nil
+	}
+	ct, err := container.Decode(data)
+	if err != nil {
+		return nil, fmt.Errorf("decoding input as UCAN container (and not a CBOR delegation): %w", err)
+	}
+	return ct.Delegations(), nil
 }
 
 func witnessPath(revoke cid.Cid, revoker did.DID, witnesses []ucan.Delegation) ([]ucan.Delegation, error) {
@@ -114,7 +130,7 @@ func witnessPath(revoke cid.Cid, revoker did.DID, witnesses []ucan.Delegation) (
 	}
 	current, found := delegations[revoke]
 	if !found {
-		return nil, errors.New("witness path container must include the revoked delegation")
+		return nil, errors.New("input must include the revoked delegation")
 	}
 	if current.Issuer() == revoker {
 		// Direct revocation: the revoker issued the revoked delegation, so no

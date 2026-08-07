@@ -41,7 +41,7 @@ func TestWitnessPath(t *testing.T) {
 	require.Error(t, err)
 }
 
-func TestReadContainer(t *testing.T) {
+func TestReadInput(t *testing.T) {
 	alice, err := ed25519.GenerateIssuer()
 	require.NoError(t, err)
 	command, err := command.Parse("/test/invoke")
@@ -51,15 +51,46 @@ func TestReadContainer(t *testing.T) {
 	encoded, err := container.Encode(container.Base64url, container.New(container.WithDelegations(delegation)))
 	require.NoError(t, err)
 
-	inline, err := readContainer(string(encoded))
+	inline, err := readInput(string(encoded))
 	require.NoError(t, err)
 	require.Equal(t, encoded, inline)
 
 	path := filepath.Join(t.TempDir(), "witness.container")
 	require.NoError(t, os.WriteFile(path, encoded, 0o600))
-	fromFile, err := readContainer(path)
+	fromFile, err := readInput(path)
 	require.NoError(t, err)
 	require.Equal(t, encoded, fromFile)
+}
+
+func TestDecodeDelegations(t *testing.T) {
+	alice, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	root, err := delegation.Delegate(alice, bob.DID(), alice.DID(), command)
+	require.NoError(t, err)
+	target, err := delegation.Delegate(bob, did.Undef, alice.DID(), command)
+	require.NoError(t, err)
+
+	// A bare CBOR-encoded delegation decodes to itself.
+	encoded, err := delegation.Encode(target)
+	require.NoError(t, err)
+	decoded, err := decodeDelegations(encoded)
+	require.NoError(t, err)
+	require.Len(t, decoded, 1)
+	require.Equal(t, target.Link(), decoded[0].Link())
+
+	// A UCAN container decodes to its delegations.
+	encoded, err = container.Encode(container.Base64url, container.New(container.WithDelegations(root, target)))
+	require.NoError(t, err)
+	decoded, err = decodeDelegations(encoded)
+	require.NoError(t, err)
+	require.Len(t, decoded, 2)
+
+	_, err = decodeDelegations([]byte("not a delegation or container"))
+	require.Error(t, err)
 }
 
 func TestRevokeCommandDefaults(t *testing.T) {
