@@ -47,10 +47,6 @@ func newRevokeCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("decoding witness path container: %w", err)
 			}
-			path, err := witnessPath(revoke, witnesses.Delegations())
-			if err != nil {
-				return err
-			}
 			key, err := os.ReadFile(issuerKeyFile)
 			if err != nil {
 				return fmt.Errorf("reading issuer key file: %w", err)
@@ -60,6 +56,10 @@ func newRevokeCommand() *cobra.Command {
 				return fmt.Errorf("decoding issuer key: %w", err)
 			}
 			issuer := multikey.KeyIssuer(signer)
+			path, err := witnessPath(revoke, issuer.DID(), witnesses.Delegations())
+			if err != nil {
+				return err
+			}
 			serviceDID, err := did.Parse(serviceID)
 			if err != nil {
 				return fmt.Errorf("parsing service DID: %w", err)
@@ -75,7 +75,8 @@ func newRevokeCommand() *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("creating Swarf client: %w", err)
 			}
-			if err := client.Publish(cmd.Context(), issuer, revoke, path); err != nil {
+			revoked := path[len(path)-1]
+			if err := client.Publish(cmd.Context(), issuer, revoked, swarfclient.WithWitnessPath(path[:len(path)-1]...)); err != nil {
 				return err
 			}
 			_, err = fmt.Fprintf(cmd.OutOrStdout(), "published revocation for %s\n", revoke)
@@ -106,7 +107,7 @@ func readContainer(value string) ([]byte, error) {
 	return data, nil
 }
 
-func witnessPath(revoke cid.Cid, witnesses []ucan.Delegation) ([]ucan.Delegation, error) {
+func witnessPath(revoke cid.Cid, revoker did.DID, witnesses []ucan.Delegation) ([]ucan.Delegation, error) {
 	delegations := make(map[cid.Cid]ucan.Delegation, len(witnesses))
 	for _, delegation := range witnesses {
 		delegations[delegation.Link()] = delegation
@@ -114,6 +115,11 @@ func witnessPath(revoke cid.Cid, witnesses []ucan.Delegation) ([]ucan.Delegation
 	current, found := delegations[revoke]
 	if !found {
 		return nil, errors.New("witness path container must include the revoked delegation")
+	}
+	if current.Issuer() == revoker {
+		// Direct revocation: the revoker issued the revoked delegation, so no
+		// witness path is needed to prove authority.
+		return []ucan.Delegation{current}, nil
 	}
 	path := []ucan.Delegation{current}
 	visited := map[cid.Cid]struct{}{current.Link(): {}}

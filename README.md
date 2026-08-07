@@ -28,10 +28,11 @@ swarf revoke \
 ```
 
 `witness-path-container` can be a file path or an encoded UCAN container
-string. Swarf builds the witness chain from the revoked delegation CID. The
-service defaults to `did:web:swarf.forgery.network` at
-`https://swarf.forgery.network`; override these with `--service-id` and
-`--service-url`.
+string. Swarf builds the witness chain from the revoked delegation CID. When
+the issuer key issued the revoked delegation, the container only needs the
+revoked delegation itself — no witness chain is required. The service defaults
+to `did:web:swarf.forgery.network` at `https://swarf.forgery.network`; override
+these with `--service-id` and `--service-url`.
 
 ### `swarf get <revoke-cid>`
 
@@ -71,6 +72,11 @@ type RevokeArguments struct {
   path [Link]
 }
 ```
+
+`path` proves the revocation issuer's authority over a delegation issued by
+someone else further down a chain the issuer is involved in, and may be empty
+when the revocation issuer issued the revoked delegation directly. The revoked
+delegation itself must always be included in the invocation metadata.
 
 ### `GET /revocation/:cid`
 
@@ -113,8 +119,12 @@ revoking a delegation to each `Publish` call:
 serviceURL, _ := url.Parse("https://swarf.example.com")
 client, _ := swarfclient.New(serviceDID, *serviceURL)
 
-// The final delegation in path is the delegation to revoke.
-err := client.Publish(ctx, revoker, path[len(path)-1].Link(), path)
+// Revoke a delegation you issued directly.
+err := client.Publish(ctx, revoker, revoked)
+
+// Provide a witness path (root first) when revoking a delegation issued by
+// someone else further down a chain you are involved in.
+err = client.Publish(ctx, revoker, revoked, swarfclient.WithWitnessPath(path...))
 
 record, err := client.Get(ctx, delegationCID)
 
@@ -124,6 +134,7 @@ for event, err := range client.Stream(ctx, time.Time{}) {
 ```
 
 `Publish` self-signs the revocation invocation with the passed revoker, which
-must appear as an issuer in the delegation path. `Get` returns a full
+must be the issuer of the revoked delegation or appear as an issuer in the
+witness path provided with `WithWitnessPath`. `Get` returns a full
 `store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
 values.

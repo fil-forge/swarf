@@ -162,32 +162,51 @@ func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMetho
 		for _, delegation := range req.Metadata().Delegations() {
 			witnesses[delegation.Link()] = delegation
 		}
-		path := make([]ucan.Delegation, len(args.Path))
-		for i, link := range args.Path {
-			delegation, ok := witnesses[link]
-			if !ok {
-				return fmt.Errorf("delegation %s at path index %d is not in request metadata", link, i)
+		revoked, ok := witnesses[args.Revoke]
+		if !ok {
+			return errors.New("the revoked delegation must be included in request metadata")
+		}
+		var path []ucan.Delegation
+		if len(args.Path) == 0 {
+			// Direct revocation: the issuer of the revoked delegation revokes it
+			// themselves. A witness path is only needed to prove authority over a
+			// delegation issued by someone else further down a chain the revoker
+			// is involved in.
+			if revoked.Issuer() != req.Invocation().Issuer() {
+				return errors.New("witness path required: revocation issuer did not issue the revoked delegation")
 			}
-			path[i] = delegation
-		}
-		if len(path) == 0 || path[len(path)-1].Link() != args.Revoke {
-			return errors.New("revocation path must end with the revoked delegation")
-		}
-		if err := validateRevocationPath(req.Context(), path, didResolver); err != nil {
-			return fmt.Errorf("validating revocation path: %w", err)
-		}
-		// TODO: support delegated revocations, where the revocation issuer is not
-		// the same as the invocation issuer.
-		// See https://github.com/ucan-wg/revocation#delegating-revocation
-		issuerFound := false
-		for _, delegation := range path {
-			if delegation.Issuer() == req.Invocation().Issuer() {
-				issuerFound = true
-				break
+			if err := validator.ValidateToken(req.Context(), revoked, validator.WithDIDResolver(didResolver)); err != nil {
+				return fmt.Errorf("validating revoked delegation: %w", err)
 			}
-		}
-		if !issuerFound {
-			return errors.New("revocation issuer is not an issuer in the delegation path")
+			path = []ucan.Delegation{revoked}
+		} else {
+			path = make([]ucan.Delegation, len(args.Path))
+			for i, link := range args.Path {
+				delegation, ok := witnesses[link]
+				if !ok {
+					return fmt.Errorf("delegation %s at path index %d is not in request metadata", link, i)
+				}
+				path[i] = delegation
+			}
+			if path[len(path)-1].Link() != args.Revoke {
+				return errors.New("revocation path must end with the revoked delegation")
+			}
+			if err := validateRevocationPath(req.Context(), path, didResolver); err != nil {
+				return fmt.Errorf("validating revocation path: %w", err)
+			}
+			// TODO: support delegated revocations, where the revocation issuer is not
+			// the same as the invocation issuer.
+			// See https://github.com/ucan-wg/revocation#delegating-revocation
+			issuerFound := false
+			for _, delegation := range path {
+				if delegation.Issuer() == req.Invocation().Issuer() {
+					issuerFound = true
+					break
+				}
+			}
+			if !issuerFound {
+				return errors.New("revocation issuer is not an issuer in the delegation path")
+			}
 		}
 		if err := revocations.Add(req.Context(), req.Invocation(), path); err != nil {
 			return fmt.Errorf("adding revocation: %w", err)

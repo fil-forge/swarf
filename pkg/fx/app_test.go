@@ -5,23 +5,28 @@ import (
 	"iter"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	ucancmd "github.com/fil-forge/libforge/commands/ucan"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/swarf/pkg/api"
 	"github.com/fil-forge/swarf/pkg/store"
 	"github.com/fil-forge/swarf/pkg/store/memory"
+	"github.com/fil-forge/ucantone/client"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/did/key"
 	"github.com/fil-forge/ucantone/did/resolver"
+	"github.com/fil-forge/ucantone/execution"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/server"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
+	"github.com/fil-forge/ucantone/validator"
 	"github.com/ipfs/go-cid"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
@@ -110,6 +115,66 @@ func TestRevocationRouteReturnsDAGJSON(t *testing.T) {
 	require.Equal(t, "public, max-age=31536000, immutable", response.Header().Get(echo.HeaderCacheControl))
 	require.Contains(t, response.Body.String(), `"revoke"`)
 	require.Contains(t, response.Body.String(), `"cause"`)
+}
+
+func TestRevokeRoute(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	alice, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	carol, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	root, err := delegation.Delegate(alice, bob.DID(), alice.DID(), command)
+	require.NoError(t, err)
+	target, err := delegation.Delegate(bob, carol.DID(), alice.DID(), command)
+	require.NoError(t, err)
+
+	revocations := memory.New()
+	didResolver := resolver.ByMethod{"key": key.Resolver}
+	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
+	route := revokeRoute(revocations, didResolver)
+	srv.Handle(route.Command, route.Handler)
+	serviceURL, err := url.Parse("http://swarf.test")
+	require.NoError(t, err)
+	executor, err := client.NewHTTP(serviceURL, client.WithHTTPClient(&http.Client{Transport: srv}))
+	require.NoError(t, err)
+
+	publish := func(revoker ucan.Issuer, revoked cid.Cid, path []cid.Cid, witnesses ...ucan.Delegation) error {
+		revocation, err := ucancmd.Revoke.Invoke(
+			revoker,
+			revoker.DID(),
+			&ucancmd.RevokeArguments{Revoke: revoked, Path: path},
+			invocation.WithAudience(service.DID()),
+			invocation.WithNoExpiration(),
+		)
+		require.NoError(t, err)
+		response, err := executor.Execute(execution.NewRequest(t.Context(), revocation, execution.WithDelegations(witnesses...)))
+		if err != nil {
+			return err
+		}
+		_, err = ucancmd.Revoke.Unpack(response.Receipt())
+		return err
+	}
+
+	// bob issued target, so bob may revoke it directly without a witness path.
+	require.NoError(t, publish(bob, target.Link(), nil, target))
+	record, err := revocations.Get(t.Context(), target.Link())
+	require.NoError(t, err)
+	require.Len(t, record.Path, 1)
+	require.Equal(t, target.Link(), record.Path[0].Link())
+
+	// carol did not issue target, so a direct revocation is rejected.
+	require.Error(t, publish(carol, target.Link(), nil, target))
+
+	// The revoked delegation must be included in request metadata.
+	require.Error(t, publish(bob, target.Link(), nil))
+
+	// A witness path proves authority over a delegation the revoker did not issue.
+	require.NoError(t, publish(alice, target.Link(), []cid.Cid{root.Link(), target.Link()}, root, target))
 }
 
 func TestValidateRevocationPath(t *testing.T) {

@@ -9,6 +9,7 @@ import (
 	"iter"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,27 +52,55 @@ func New(serviceID did.DID, serviceURL url.URL, options ...Option) (*Client, err
 	}, nil
 }
 
-// Publish submits a /ucan/revoke invocation self-signed by revoker for revoked,
-// using path as its delegation witness. The revoker must be an issuer of one of
-// the delegations in path.
-func (c *Client) Publish(ctx context.Context, revoker ucan.Issuer, revoked cid.Cid, path []ucan.Delegation) error {
+// PublishOption configures a Publish call.
+type PublishOption func(*publishConfig)
+
+type publishConfig struct {
+	witnessPath []ucan.Delegation
+}
+
+// WithWitnessPath sets the delegation witness path proving the revoker's
+// authority over the revoked delegation. The path is ordered root first and
+// leads to the revoked delegation, which does not need to be included. A
+// witness path is required when the revoker is not the issuer of the revoked
+// delegation.
+func WithWitnessPath(path ...ucan.Delegation) PublishOption {
+	return func(cfg *publishConfig) {
+		cfg.witnessPath = path
+	}
+}
+
+// Publish submits a /ucan/revoke invocation self-signed by revoker for the
+// revoked delegation. The revoker must be the issuer of the revoked
+// delegation, or an issuer of one of the delegations in the witness path
+// provided with [WithWitnessPath].
+func (c *Client) Publish(ctx context.Context, revoker ucan.Issuer, revoked ucan.Delegation, options ...PublishOption) error {
 	if revoker == nil {
 		return errors.New("revoker is required")
 	}
-	if len(path) == 0 {
-		return errors.New("revocation path must contain the revoked delegation")
+	if revoked == nil {
+		return errors.New("revoked delegation is required")
 	}
-	if path[len(path)-1].Link() != revoked {
-		return errors.New("revocation path must end with the revoked delegation")
+	cfg := publishConfig{}
+	for _, option := range options {
+		option(&cfg)
 	}
-	links := make([]cid.Cid, len(path))
-	for i, delegation := range path {
-		links[i] = delegation.Link()
+	path := cfg.witnessPath
+	if len(path) > 0 && path[len(path)-1].Link() == revoked.Link() {
+		path = path[:len(path)-1]
+	}
+	witnesses := append(slices.Clone(path), revoked)
+	args := &ucancmd.RevokeArguments{Revoke: revoked.Link()}
+	if len(path) > 0 {
+		args.Path = make([]cid.Cid, len(witnesses))
+		for i, delegation := range witnesses {
+			args.Path[i] = delegation.Link()
+		}
 	}
 	invocation, err := ucancmd.Revoke.Invoke(
 		revoker,
 		revoker.DID(),
-		&ucancmd.RevokeArguments{Revoke: revoked, Path: links},
+		args,
 		invocation.WithAudience(c.ServiceID),
 		invocation.WithNoNonce(),
 		invocation.WithNoExpiration(),
@@ -79,7 +108,7 @@ func (c *Client) Publish(ctx context.Context, revoker ucan.Issuer, revoked cid.C
 	if err != nil {
 		return fmt.Errorf("creating revoke invocation: %w", err)
 	}
-	response, err := c.executor.Execute(execution.NewRequest(ctx, invocation, execution.WithDelegations(path...)))
+	response, err := c.executor.Execute(execution.NewRequest(ctx, invocation, execution.WithDelegations(witnesses...)))
 	if err != nil {
 		return fmt.Errorf("publishing revocation: %w", err)
 	}

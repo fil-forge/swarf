@@ -18,7 +18,6 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/server"
-	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
@@ -43,7 +42,6 @@ func TestPublish(t *testing.T) {
 	require.NoError(t, err)
 	target, err := delegation.Delegate(bob, carol.DID(), alice.DID(), cmd)
 	require.NoError(t, err)
-	path := []ucan.Delegation{root, target}
 
 	var gotIssuer did.DID
 	var gotArgs *ucancmd.RevokeArguments
@@ -64,21 +62,40 @@ func TestPublish(t *testing.T) {
 	client, err := New(service.DID(), *serviceURL, WithHTTPClient(&http.Client{Transport: srv}))
 	require.NoError(t, err)
 
-	// bob is an issuer in the path, so bob may revoke the delegation it issued.
-	require.NoError(t, client.Publish(context.Background(), bob, target.Link(), path))
-	require.Equal(t, bob.DID(), gotIssuer)
+	// alice is an issuer in the witness path, so alice may revoke the
+	// delegation bob issued.
+	require.NoError(t, client.Publish(context.Background(), alice, target, WithWitnessPath(root)))
+	require.Equal(t, alice.DID(), gotIssuer)
 	require.Equal(t, target.Link(), gotArgs.Revoke)
 	require.Equal(t, []cid.Cid{root.Link(), target.Link()}, gotArgs.Path)
 	require.ElementsMatch(t, []cid.Cid{root.Link(), target.Link()}, gotWitnesses)
 
+	t.Run("omits the path without a witness path", func(t *testing.T) {
+		gotArgs = nil
+		gotWitnesses = nil
+		// bob issued target, so bob may revoke it directly without a witness path.
+		require.NoError(t, client.Publish(context.Background(), bob, target))
+		require.Equal(t, target.Link(), gotArgs.Revoke)
+		require.Empty(t, gotArgs.Path)
+		require.Equal(t, []cid.Cid{target.Link()}, gotWitnesses)
+	})
+
+	t.Run("tolerates the revoked delegation ending the witness path", func(t *testing.T) {
+		gotArgs = nil
+		gotWitnesses = nil
+		require.NoError(t, client.Publish(context.Background(), alice, target, WithWitnessPath(root, target)))
+		require.Equal(t, []cid.Cid{root.Link(), target.Link()}, gotArgs.Path)
+		require.ElementsMatch(t, []cid.Cid{root.Link(), target.Link()}, gotWitnesses)
+	})
+
 	t.Run("requires a revoker", func(t *testing.T) {
-		err := client.Publish(context.Background(), nil, target.Link(), path)
+		err := client.Publish(context.Background(), nil, target)
 		require.ErrorContains(t, err, "revoker is required")
 	})
 
-	t.Run("requires the revoked delegation last", func(t *testing.T) {
-		err := client.Publish(context.Background(), bob, root.Link(), path)
-		require.ErrorContains(t, err, "must end with the revoked delegation")
+	t.Run("requires a revoked delegation", func(t *testing.T) {
+		err := client.Publish(context.Background(), bob, nil)
+		require.ErrorContains(t, err, "revoked delegation is required")
 	})
 }
 

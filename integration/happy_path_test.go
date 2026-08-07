@@ -93,7 +93,7 @@ func TestRevocationHappyPath(t *testing.T) {
 	require.NoError(t, err)
 
 	first := revocationPath(t, alice, bob, carol)
-	require.NoError(t, client.Publish(ctx, bob, first[len(first)-1].Link(), first))
+	require.NoError(t, client.Publish(ctx, bob, first[len(first)-1], swarfclient.WithWitnessPath(first[:len(first)-1]...)))
 	record, err := client.Get(ctx, first[len(first)-1].Link())
 	require.NoError(t, err)
 	require.NotNil(t, record.Cause)
@@ -102,6 +102,7 @@ func TestRevocationHappyPath(t *testing.T) {
 
 	second := revocationPath(t, alice, bob, carol)
 	expected := second[len(second)-1].Link()
+	witnesses := second[:len(second)-1]
 	streamCtx, cancelStream := context.WithCancel(ctx)
 	defer cancelStream()
 	records := make(chan error, 1)
@@ -119,13 +120,22 @@ func TestRevocationHappyPath(t *testing.T) {
 			return
 		}
 	}()
-	require.NoError(t, client.Publish(ctx, bob, expected, second))
+	require.NoError(t, client.Publish(ctx, bob, second[len(second)-1], swarfclient.WithWitnessPath(witnesses...)))
 	select {
 	case err := <-records:
 		require.NoError(t, err)
 	case <-time.After(10 * time.Second):
 		require.Fail(t, "timed out waiting for streamed revocation")
 	}
+
+	// bob issued the target delegation directly, so no witness path is needed.
+	third := revocationPath(t, alice, bob, carol)
+	direct := third[len(third)-1]
+	require.NoError(t, client.Publish(ctx, bob, direct))
+	directRecord, err := client.Get(ctx, direct.Link())
+	require.NoError(t, err)
+	require.Len(t, directRecord.Path, 1)
+	require.Equal(t, direct.Link(), directRecord.Path[0].Link())
 }
 
 func revocationPath(t *testing.T, alice, bob, carol ucan.Issuer) []ucan.Delegation {

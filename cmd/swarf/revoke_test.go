@@ -28,11 +28,16 @@ func TestWitnessPath(t *testing.T) {
 	target, err := delegation.Delegate(bob, carol.DID(), alice.DID(), command)
 	require.NoError(t, err)
 
-	path, err := witnessPath(target.Link(), []ucan.Delegation{target, root})
+	path, err := witnessPath(target.Link(), carol.DID(), []ucan.Delegation{target, root})
 	require.NoError(t, err)
 	require.Equal(t, []ucan.Delegation{root, target}, path)
 
-	_, err = witnessPath(target.Link(), []ucan.Delegation{root})
+	// bob issued target, so no witness path is needed beyond the delegation.
+	path, err = witnessPath(target.Link(), bob.DID(), []ucan.Delegation{target})
+	require.NoError(t, err)
+	require.Equal(t, []ucan.Delegation{target}, path)
+
+	_, err = witnessPath(target.Link(), carol.DID(), []ucan.Delegation{root})
 	require.Error(t, err)
 }
 
