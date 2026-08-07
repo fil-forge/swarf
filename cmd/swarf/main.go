@@ -36,6 +36,7 @@ func main() {
 	serve.Flags().String("host", "127.0.0.1", "host to bind")
 	serve.Flags().Int("port", 8080, "port to bind")
 	serve.Flags().Bool("insecure-did-resolution", false, "resolve did:web DIDs over HTTP")
+	serve.Flags().String("plc-directory", config.DefaultPLCDirectory, "did:plc directory endpoint")
 	serve.Flags().String("log-level", "info", "Zap log level")
 	serve.Flags().String("storage", "postgres", "storage backend (memory or postgres)")
 	serve.Flags().String("postgres-dsn", "", "Postgres connection string")

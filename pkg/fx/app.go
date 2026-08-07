@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -25,8 +26,13 @@ import (
 	"github.com/fil-forge/ucantone/binding"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/did/key"
+	"github.com/fil-forge/ucantone/did/plc"
 	"github.com/fil-forge/ucantone/did/resolver"
 	"github.com/fil-forge/ucantone/did/web"
+
+	// Registers the secp256k1 verifier decoder: did:plc issuers carry
+	// secp256k1 verification methods.
+	_ "github.com/fil-forge/ucantone/multikey/secp256k1/verifier"
 	"github.com/fil-forge/ucantone/server"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
@@ -108,7 +114,7 @@ func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStor
 }
 
 func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.RevocationStore) (*server.HTTPServer, error) {
-	didResolver, err := newDIDResolver(id, cfg.Server.InsecureDIDResolution)
+	didResolver, err := newDIDResolver(id, cfg.Server.InsecureDIDResolution, cfg.Server.PLCDirectory)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +124,7 @@ func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.R
 	return srv, nil
 }
 
-func newDIDResolver(id identity.Identity, insecure bool) (resolver.ByMethod, error) {
+func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (resolver.ByMethod, error) {
 	webOptions := []web.Option{}
 	if insecure {
 		webOptions = append(webOptions, web.WithInsecure(true))
@@ -131,9 +137,21 @@ func newDIDResolver(id identity.Identity, insecure bool) (resolver.ByMethod, err
 	if err != nil {
 		return nil, fmt.Errorf("creating DID document: %w", err)
 	}
+	if plcDirectory == "" {
+		plcDirectory = config.DefaultPLCDirectory
+	}
+	plcURL, err := url.Parse(plcDirectory)
+	if err != nil {
+		return nil, fmt.Errorf("parsing PLC directory URL %q: %w", plcDirectory, err)
+	}
+	plcResolver, err := plc.NewResolver(*plcURL)
+	if err != nil {
+		return nil, fmt.Errorf("creating did:plc resolver: %w", err)
+	}
 	return resolver.ByMethod{
 		"key": key.Resolver,
 		"web": resolver.Tiered{resolver.WellKnown{id.DID(): document}, webResolver},
+		"plc": resolver.NewCached(plcResolver, time.Hour*3),
 	}, nil
 }
 
