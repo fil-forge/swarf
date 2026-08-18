@@ -31,7 +31,7 @@ func New(pool *pgxpool.Pool) *Store {
 
 var _ store.RevocationStore = (*Store)(nil)
 
-// Add stores revocation and its delegation path.
+// Add stores revocation and its witness path.
 func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -68,8 +68,8 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 	return nil
 }
 
-// Get retrieves the most recently stored revocation record for delegation.
-func (s *Store) Get(ctx context.Context, delegationCID cid.Cid) (store.RevocationRecord, error) {
+// Get retrieves the most recently stored revocation record for a delegation.
+func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecord, error) {
 	row := s.pool.QueryRow(
 		ctx,
 		`SELECT cause, revoked_delegation, path_witness, recorded_at
@@ -77,14 +77,22 @@ func (s *Store) Get(ctx context.Context, delegationCID cid.Cid) (store.Revocatio
 		 WHERE revoked_delegation = $1
 		 ORDER BY recorded_at DESC, id DESC
 		 LIMIT 1`,
-		delegationCID.String(),
+		revoked.String(),
 	)
-	record, err := ScanRecord(row)
+	var causeBytes []byte
+	var revoke string
+	var pathWitness [][]byte
+	var recordedAt time.Time
+	err := row.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.RevocationRecord{}, store.ErrNotFound
 	}
 	if err != nil {
 		return store.RevocationRecord{}, fmt.Errorf("getting revocation: %w", err)
+	}
+	record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
+	if err != nil {
+		return store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err)
 	}
 	return record, nil
 }
@@ -95,25 +103,25 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 		ticker := time.NewTicker(streamPollInterval)
 		defer ticker.Stop()
 
-		// lastID is the id of the most recently yielded record, so polling
-		// resumes strictly after it rather than re-yielding records that share
-		// its recorded_at timestamp.
+		// lastID is the id column of the most recently yielded row, so
+		// polling resumes strictly after it rather than re-yielding records
+		// that share its recorded_at timestamp.
 		var lastID string
 		for {
 			if err := ctx.Err(); err != nil {
 				yield(store.RevocationRecord{}, err)
 				return
 			}
-			for record, err := range s.recordsFrom(ctx, from, lastID) {
+			for rec, err := range s.recordsFrom(ctx, from, lastID) {
 				if err != nil {
 					yield(store.RevocationRecord{}, err)
 					return
 				}
-				if !yield(record, nil) {
+				if !yield(rec.RevocationRecord, nil) {
 					return
 				}
-				from = record.RecordedAt
-				lastID = record.Cause.Link().String()
+				from = rec.RecordedAt
+				lastID = rec.id
 			}
 
 			select {
@@ -126,66 +134,67 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 	}
 }
 
-func (s *Store) recordsFrom(ctx context.Context, from time.Time, lastID string) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
-		var fromArg, lastIDArg any
-		if !from.IsZero() {
-			fromArg = from
-		}
-		if lastID != "" {
-			lastIDArg = lastID
-		}
-		// The from filter is inclusive so consumers resuming from the
-		// timestamp of the last record they received do not miss records that
-		// share it. Once a record has been yielded, the (recorded_at, id)
-		// cursor resumes strictly after it.
+// streamRecord pairs a revocation record with the id column of its row, so
+// Stream can advance its cursor from the stored id.
+type streamRecord struct {
+	store.RevocationRecord
+	id string
+}
+
+func (s *Store) recordsFrom(ctx context.Context, from time.Time, lastID string) iter.Seq2[streamRecord, error] {
+	return func(yield func(streamRecord, error) bool) {
+		// The (recorded_at, id) cursor resumes strictly after the last
+		// yielded record, but stays inclusive of from until something has
+		// been yielded: every id sorts after the empty string, so with
+		// lastID == "" the filter degenerates to recorded_at >= from. The
+		// zero from predates every record, so an unbounded stream matches
+		// everything.
 		rows, err := s.pool.Query(
 			ctx,
-			`SELECT cause, revoked_delegation, path_witness, recorded_at
+			`SELECT id, cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
-			 WHERE ($1::timestamptz IS NULL)
-			    OR ($2::text IS NULL AND recorded_at >= $1)
-			    OR (recorded_at > $1 OR (recorded_at = $1 AND id > $2))
+			 WHERE recorded_at > $1 OR (recorded_at = $1 AND id > $2)
 			 ORDER BY recorded_at, id`,
-			fromArg,
-			lastIDArg,
+			from,
+			lastID,
 		)
 		if err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("querying revocations: %w", err))
+			yield(streamRecord{}, fmt.Errorf("querying revocations: %w", err))
 			return
 		}
 		defer rows.Close()
 
 		for rows.Next() {
-			record, err := ScanRecord(rows)
-			if err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("scanning revocation: %w", err))
+			var id string
+			var causeBytes []byte
+			var revoke string
+			var pathWitness [][]byte
+			var recordedAt time.Time
+			if err := rows.Scan(&id, &causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
+				yield(streamRecord{}, fmt.Errorf("scanning revocation: %w", err))
 				return
 			}
-			if !yield(record, nil) {
+			record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
+			if err != nil {
+				yield(streamRecord{}, fmt.Errorf("decoding revocation: %w", err))
+				return
+			}
+			if !yield(streamRecord{RevocationRecord: record, id: id}, nil) {
 				return
 			}
 		}
 		if err := rows.Err(); err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("iterating revocations: %w", err))
+			yield(streamRecord{}, fmt.Errorf("iterating revocations: %w", err))
 		}
 	}
 }
 
-func ScanRecord(row pgx.Row) (store.RevocationRecord, error) {
-	var causeBytes []byte
-	var revoke string
-	var pathWitness [][]byte
-	var recordedAt time.Time
-	if err := row.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
-		return store.RevocationRecord{}, err
-	}
-
+func decodeRecord(causeBytes []byte, revoke string, pathWitness [][]byte, recordedAt time.Time) (store.RevocationRecord, error) {
 	cause, err := invocation.Decode(causeBytes)
 	if err != nil {
 		return store.RevocationRecord{}, fmt.Errorf("decoding revocation cause: %w", err)
 	}
-	revokeCID, err := cid.Decode(revoke)
+	revokeLink, err := cid.Decode(revoke)
 	if err != nil {
 		return store.RevocationRecord{}, fmt.Errorf("decoding revoked delegation CID: %w", err)
 	}
@@ -197,7 +206,7 @@ func ScanRecord(row pgx.Row) (store.RevocationRecord, error) {
 		}
 	}
 	return store.RevocationRecord{
-		Revoke:     revokeCID,
+		Revoke:     revokeLink,
 		Cause:      cause,
 		Path:       path,
 		RecordedAt: recordedAt,

@@ -32,9 +32,9 @@ type RevocationStore interface {
 	// from the root delegation to the revoked delegation. The issuer of the
 	// revocation must appear as a delegation issuer in the path.
 	Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error
-	// Get retrieves a revocation record from the store. The delegation is the
-	// revoked delegation. If the record is not found, [ErrNotFound] is returned.
-	Get(ctx context.Context, delegation cid.Cid) (RevocationRecord, error)
+	// Get retrieves a revocation record from the store by revoked delegation CID.
+	// If the record is not found, [ErrNotFound] is returned.
+	Get(ctx context.Context, revoked cid.Cid) (RevocationRecord, error)
 	// Stream streams all revocation records from the store and remains open until
 	// the context is canceled. The from parameter filters records to those
 	// recorded on or after the given time, so consumers resuming from the
