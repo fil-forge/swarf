@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -131,6 +133,8 @@ func TestGetAndStream(t *testing.T) {
 	require.Equal(t, revocation.Link(), record.Cause.Link())
 	require.True(t, record.RecordedAt.Equal(recordedAt))
 
+	// The stream reconnects when a connection ends, so stop after the
+	// expected record instead of draining the iterator.
 	var streamed int
 	for record, err := range client.Stream(context.Background(), time.Time{}) {
 		require.NoError(t, err)
@@ -139,6 +143,115 @@ func TestGetAndStream(t *testing.T) {
 		require.Equal(t, revocation.Link(), record.Cause)
 		require.True(t, record.RecordedAt.Time().Equal(recordedAt))
 		streamed++
+		break
 	}
 	require.Equal(t, 1, streamed)
+}
+
+func TestStreamReconnectDedupes(t *testing.T) {
+	first := time.Now().UTC().Truncate(time.Second)
+	boundary := first.Add(time.Second)
+	last := boundary.Add(time.Second)
+	recordA := firehoseRecord(t, first)
+	recordB := firehoseRecord(t, boundary)
+	recordC := firehoseRecord(t, boundary)
+	recordD := firehoseRecord(t, last)
+
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requests = append(requests, request.URL.Path)
+		connection := len(requests)
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "text/event-stream")
+		switch connection {
+		case 1:
+			_, _ = io.WriteString(writer, sseEvent(t, recordA)+sseEvent(t, recordB))
+		case 2:
+			// The from cursor is inclusive: the record recorded at exactly
+			// the resume timestamp is re-delivered alongside new ones.
+			_, _ = io.WriteString(writer, sseEvent(t, recordB)+sseEvent(t, recordC)+sseEvent(t, recordD))
+		default:
+			<-request.Context().Done()
+		}
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	var received []cid.Cid
+	for record, err := range client.Stream(context.Background(), time.Time{}) {
+		require.NoError(t, err)
+		received = append(received, record.Cause)
+		if len(received) == 4 {
+			break
+		}
+	}
+	require.Equal(t, []cid.Cid{recordA.Cause, recordB.Cause, recordC.Cause, recordD.Cause}, received)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(requests), 2)
+	require.Equal(t, "/revocations/0", requests[0])
+	require.Equal(t, "/revocations/"+boundary.Format(time.RFC3339Nano), requests[1])
+}
+
+func TestStreamReconnectCanceled(t *testing.T) {
+	record := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, sseEvent(t, record))
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var errs []error
+	for streamed, err := range client.Stream(ctx, time.Time{}) {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		require.Equal(t, record.Cause, streamed.Cause)
+		// Cancel while the client waits to reconnect.
+		cancel()
+	}
+	require.Len(t, errs, 1)
+	require.ErrorIs(t, errs[0], context.Canceled)
+}
+
+func firehoseRecord(t *testing.T, recordedAt time.Time) api.FirehoseRevocation {
+	t.Helper()
+	issuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cmd, err := command.Parse("/test/revoke")
+	require.NoError(t, err)
+	revocation, err := invocation.Invoke(issuer, did.Undef, cmd, nil)
+	require.NoError(t, err)
+	return api.FirehoseRevocation{
+		Revoke:     revocation.Link(),
+		Path:       []cid.Cid{revocation.Link()},
+		Cause:      revocation.Link(),
+		RecordedAt: jsg.DagJsonTime(recordedAt),
+	}
+}
+
+func sseEvent(t *testing.T, record api.FirehoseRevocation) string {
+	t.Helper()
+	var payload bytes.Buffer
+	require.NoError(t, record.MarshalDagJSON(&payload))
+	return fmt.Sprintf("event: revocation\ndata: %s\n\n", payload.String())
 }
