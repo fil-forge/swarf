@@ -114,9 +114,9 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 		// recorded_at is the insert transaction's start time, so a concurrent
 		// insert can commit a row at or before timestamps already streamed.
 		// Rows re-read from the unsettled window are deduped by seen, keyed
-		// by id with recorded_at kept for pruning.
+		// by cause link with recorded_at kept for pruning.
 		cursor := from
-		seen := map[string]time.Time{}
+		seen := map[cid.Cid]time.Time{}
 		for {
 			if err := ctx.Err(); err != nil {
 				yield(store.RevocationRecord{}, err)
@@ -134,19 +134,20 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 					yield(store.RevocationRecord{}, err)
 					return
 				}
-				if _, ok := seen[rec.id]; ok {
+				link := rec.Cause.Link()
+				if _, ok := seen[link]; ok {
 					continue
 				}
-				if !yield(rec.RevocationRecord, nil) {
+				if !yield(rec, nil) {
 					return
 				}
-				seen[rec.id] = rec.RecordedAt
+				seen[link] = rec.RecordedAt
 			}
 			if horizon := dbNow.Add(-streamSettleWindow); horizon.After(cursor) {
 				cursor = horizon
-				for id, recordedAt := range seen {
+				for link, recordedAt := range seen {
 					if recordedAt.Before(cursor) {
-						delete(seen, id)
+						delete(seen, link)
 					}
 				}
 			}
@@ -161,54 +162,46 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 	}
 }
 
-// streamRecord pairs a revocation record with the id column of its row, so
-// Stream can dedup rows re-read from the unsettled window.
-type streamRecord struct {
-	store.RevocationRecord
-	id string
-}
-
-func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[streamRecord, error] {
-	return func(yield func(streamRecord, error) bool) {
+func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[store.RevocationRecord, error] {
+	return func(yield func(store.RevocationRecord, error) bool) {
 		// The query is inclusive at the cursor: each poll re-reads the
 		// unsettled window and Stream skips rows it already yielded. The
 		// zero cursor predates every record, so an unbounded stream matches
 		// everything.
 		rows, err := s.pool.Query(
 			ctx,
-			`SELECT id, cause, revoked_delegation, path_witness, recorded_at
+			`SELECT cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
 			 WHERE recorded_at >= $1
 			 ORDER BY recorded_at, id`,
 			cursor,
 		)
 		if err != nil {
-			yield(streamRecord{}, fmt.Errorf("querying revocations: %w", err))
+			yield(store.RevocationRecord{}, fmt.Errorf("querying revocations: %w", err))
 			return
 		}
 		defer rows.Close()
 
 		for rows.Next() {
-			var id string
 			var causeBytes []byte
 			var revoke string
 			var pathWitness [][]byte
 			var recordedAt time.Time
-			if err := rows.Scan(&id, &causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
-				yield(streamRecord{}, fmt.Errorf("scanning revocation: %w", err))
+			if err := rows.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
+				yield(store.RevocationRecord{}, fmt.Errorf("scanning revocation: %w", err))
 				return
 			}
 			record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
 			if err != nil {
-				yield(streamRecord{}, fmt.Errorf("decoding revocation: %w", err))
+				yield(store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err))
 				return
 			}
-			if !yield(streamRecord{RevocationRecord: record, id: id}, nil) {
+			if !yield(record, nil) {
 				return
 			}
 		}
 		if err := rows.Err(); err != nil {
-			yield(streamRecord{}, fmt.Errorf("iterating revocations: %w", err))
+			yield(store.RevocationRecord{}, fmt.Errorf("iterating revocations: %w", err))
 		}
 	}
 }
