@@ -66,8 +66,11 @@ func TestMemoryRevocationStoreStream(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 
+	// The from filter is inclusive: the record recorded at exactly from is
+	// re-delivered.
 	filteredCtx, filteredCancel := context.WithCancel(context.Background())
 	filtered, filteredDone := collectStream(s.Stream(filteredCtx, first.RecordedAt))
+	require.Equal(t, firstRevocation.Link(), (<-filtered).Cause.Link())
 	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause.Link())
 	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause.Link())
 	filteredCancel()

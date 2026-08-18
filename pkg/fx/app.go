@@ -233,7 +233,7 @@ func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocati
 	e.GET("/health", healthHandler)
 	e.GET("/.well-known/did.json", didDocumentHandler(id))
 	e.GET("/revocation/:cid", revocationHandler(revocations))
-	e.GET("/revocations/:since", firehoseHandler(revocations))
+	e.GET("/revocations/:from", firehoseHandler(revocations))
 	e.POST("/", echo.WrapHandler(ucanServer))
 	return e
 }
@@ -283,7 +283,7 @@ func didDocumentHandler(id identity.Identity) echo.HandlerFunc {
 
 func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		since, err := parseSince(c.Param("since"))
+		from, err := parseFrom(c.Param("from"))
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
@@ -293,7 +293,7 @@ func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
 		response.Header().Set(echo.HeaderConnection, "keep-alive")
 		response.WriteHeader(http.StatusOK)
 
-		for record, err := range revocations.Stream(c.Request().Context(), since) {
+		for record, err := range revocations.Stream(c.Request().Context(), from) {
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					return nil
@@ -331,15 +331,15 @@ func revocationHandler(revocations store.RevocationStore) echo.HandlerFunc {
 	}
 }
 
-func parseSince(value string) (time.Time, error) {
+func parseFrom(value string) (time.Time, error) {
 	if value == "0" {
 		return time.Time{}, nil
 	}
-	since, err := time.Parse(time.RFC3339Nano, value)
+	from, err := time.Parse(time.RFC3339Nano, value)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid since timestamp: %w", err)
+		return time.Time{}, fmt.Errorf("invalid from timestamp: %w", err)
 	}
-	return since, nil
+	return from, nil
 }
 
 func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord) error {

@@ -44,7 +44,7 @@ swarf get <revoke-cid>
 The command prints the service response and exits silently if the revocation is
 not found. Override the service endpoint with `--service-url`.
 
-### `swarf stream <since>`
+### `swarf stream`
 
 Stream revocation DAG-JSON records as they arrive with:
 
@@ -52,9 +52,10 @@ Stream revocation DAG-JSON records as they arrive with:
 swarf stream
 ```
 
-By default, it starts from the current time. Pass `--since 0` to stream all
-records or `--since <RFC3339 timestamp>` to start after that time. Press Ctrl+C
-to stop streaming. Override the service endpoint with `--service-url`.
+By default, it starts from the current time. Pass `--from 0` to stream all
+records or `--from <RFC3339 timestamp>` to stream records recorded on or after
+that time. Press Ctrl+C to stop streaming. Override the service endpoint with
+`--service-url`.
 
 ## API
 
@@ -90,13 +91,16 @@ when no revocation exists. For example:
 }
 ```
 
-### `GET /revocations/:since`
+### `GET /revocations/:from`
 
 A Server-Sent Events stream of compact DAG-JSON records. Each event has `revoke`
 (the revoked delegation CID), `path` (the witness delegation CIDs), `cause` (the
 revocation invocation CID), and `recorded_at` (the time the record was recorded). Use `0`
 to stream all stored records, or provide an RFC3339/RFC3339Nano timestamp cursor
-to stream records created after it. For example:
+to stream records recorded on or after it. The cursor is inclusive so consumers
+resuming from the `recorded_at` of the last event they received do not miss
+records that share it; deduplicate by the event `id` (the `cause` CID). For
+example:
 
 ```js
 id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm

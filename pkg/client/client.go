@@ -13,6 +13,7 @@ import (
 	"time"
 
 	jsg "github.com/alanshaw/dag-json-gen"
+	"github.com/cenkalti/backoff/v5"
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
 	"github.com/fil-forge/swarf/pkg/api"
 	"github.com/fil-forge/swarf/pkg/store"
@@ -113,69 +114,148 @@ func (c *Client) Get(ctx context.Context, delegationCID cid.Cid) (store.Revocati
 	return decodeRecord(record)
 }
 
-// Stream yields firehose revocations created after since until ctx is canceled.
-func (c *Client) Stream(ctx context.Context, since time.Time) iter.Seq2[api.FirehoseRevocation, error] {
-	return func(yield func(api.FirehoseRevocation, error) bool) {
-		cursor := "0"
-		if !since.IsZero() {
-			cursor = since.Format(time.RFC3339Nano)
-		}
-		request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("revocations", cursor), nil)
-		if err != nil {
-			yield(api.FirehoseRevocation{}, fmt.Errorf("creating revocation stream request: %w", err))
-			return
-		}
-		request.Header.Set("Accept", "text/event-stream")
-		response, err := c.httpClient.Do(request)
-		if err != nil {
-			if ctx.Err() != nil {
-				yield(api.FirehoseRevocation{}, ctx.Err())
-			} else {
-				yield(api.FirehoseRevocation{}, fmt.Errorf("opening revocation stream: %w", err))
-			}
-			return
-		}
-		defer response.Body.Close()
-		if response.StatusCode != http.StatusOK {
-			yield(api.FirehoseRevocation{}, fmt.Errorf("opening revocation stream: unexpected status %s", response.Status))
-			return
-		}
+// Reconnect backoff bounds: the exponential backoff's initial interval and
+// its cap (growth and jitter use the backoff package's defaults). The backoff
+// resets whenever a connection is established, so it only grows while the
+// service is unreachable.
+const (
+	streamMinBackoff = time.Second
+	streamMaxBackoff = time.Minute
+)
 
-		scanner := bufio.NewScanner(response.Body)
-		var event string
-		var data []string
-		for scanner.Scan() {
-			line := scanner.Text()
-			if line == "" {
-				if event == "revocation" && len(data) > 0 {
-					var value api.FirehoseRevocation
-					if err := value.UnmarshalDagJSON(strings.NewReader(strings.Join(data, "\n"))); err != nil {
-						yield(api.FirehoseRevocation{}, fmt.Errorf("decoding streamed revocation: %w", err))
-						return
+// errStreamStopped signals the stream consumer stopped iterating.
+var errStreamStopped = errors.New("revocation stream stopped")
+
+// connectError reports a stream connection that was never established.
+type connectError struct{ err error }
+
+func (e connectError) Error() string { return e.err.Error() }
+func (e connectError) Unwrap() error { return e.err }
+
+// corruptError reports a stream payload that could not be decoded;
+// reconnecting would only fetch it again.
+type corruptError struct{ err error }
+
+func (e corruptError) Error() string { return e.err.Error() }
+func (e corruptError) Unwrap() error { return e.err }
+
+// Stream yields firehose revocations recorded on or after from and remains
+// open until ctx is canceled, reconnecting with capped exponential backoff
+// when the stream is interrupted.
+// It resumes from the timestamp of the last record it delivered and skips
+// records sharing that timestamp it already delivered, so a single call
+// yields each revocation once. A new call resuming from the timestamp of the
+// last record a previous call delivered still re-receives records recorded
+// at exactly that time; dedupe those by cause CID.
+func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error] {
+	return func(yield func(api.FirehoseRevocation, error) bool) {
+		resume := from
+		// seen holds the cause CIDs of delivered records recorded at exactly
+		// resume, so reconnecting at resume does not re-deliver them.
+		seen := map[cid.Cid]struct{}{}
+		connected := false
+		bo := backoff.NewExponentialBackOff()
+		bo.InitialInterval = streamMinBackoff
+		bo.MaxInterval = streamMaxBackoff
+		for {
+			err := c.streamConn(ctx, resume, func(record api.FirehoseRevocation) bool {
+				recordedAt := record.RecordedAt.Time()
+				if recordedAt.Equal(resume) {
+					if _, ok := seen[record.Cause]; ok {
+						return true
 					}
-					if !yield(value, nil) {
-						return
-					}
+				} else {
+					resume = recordedAt
+					clear(seen)
 				}
-				event = ""
-				data = nil
-				continue
+				seen[record.Cause] = struct{}{}
+				return yield(record, nil)
+			})
+			if errors.Is(err, errStreamStopped) {
+				return
 			}
-			if value, ok := strings.CutPrefix(line, "event:"); ok {
-				event = strings.TrimSpace(value)
-			}
-			if value, ok := strings.CutPrefix(line, "data:"); ok {
-				data = append(data, strings.TrimPrefix(value, " "))
-			}
-		}
-		if err := scanner.Err(); err != nil {
 			if ctx.Err() != nil {
 				yield(api.FirehoseRevocation{}, ctx.Err())
+				return
+			}
+			if _, ok := errors.AsType[corruptError](err); ok {
+				yield(api.FirehoseRevocation{}, err)
+				return
+			}
+			if _, ok := errors.AsType[connectError](err); ok {
+				// Failing to connect at all is fatal; failing to reconnect
+				// an established stream is retried like any interruption.
+				if !connected {
+					yield(api.FirehoseRevocation{}, err)
+					return
+				}
 			} else {
-				yield(api.FirehoseRevocation{}, fmt.Errorf("reading revocation stream: %w", err))
+				connected = true
+				bo.Reset()
+			}
+
+			select {
+			case <-ctx.Done():
+				yield(api.FirehoseRevocation{}, ctx.Err())
+				return
+			case <-time.After(bo.NextBackOff()):
 			}
 		}
 	}
+}
+
+// streamConn opens one SSE connection at from and emits its records. It
+// returns errStreamStopped when emit stops iteration, a connectError when no
+// stream was established, a corruptError for an undecodable payload, and nil
+// when an established connection ended for any other reason.
+func (c *Client) streamConn(ctx context.Context, from time.Time, emit func(api.FirehoseRevocation) bool) error {
+	cursor := "0"
+	if !from.IsZero() {
+		cursor = from.UTC().Format(time.RFC3339Nano)
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("revocations", cursor), nil)
+	if err != nil {
+		return connectError{fmt.Errorf("creating revocation stream request: %w", err)}
+	}
+	request.Header.Set("Accept", "text/event-stream")
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return connectError{fmt.Errorf("opening revocation stream: %w", err)}
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return connectError{fmt.Errorf("opening revocation stream: unexpected status %s", response.Status)}
+	}
+
+	scanner := bufio.NewScanner(response.Body)
+	var event string
+	var data []string
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			if event == "revocation" && len(data) > 0 {
+				var value api.FirehoseRevocation
+				if err := value.UnmarshalDagJSON(strings.NewReader(strings.Join(data, "\n"))); err != nil {
+					return corruptError{fmt.Errorf("decoding streamed revocation: %w", err)}
+				}
+				if !emit(value) {
+					return errStreamStopped
+				}
+			}
+			event = ""
+			data = nil
+			continue
+		}
+		if value, ok := strings.CutPrefix(line, "event:"); ok {
+			event = strings.TrimSpace(value)
+		}
+		if value, ok := strings.CutPrefix(line, "data:"); ok {
+			data = append(data, strings.TrimPrefix(value, " "))
+		}
+	}
+	// A read error means the stream was interrupted; the caller reconnects.
+	_ = scanner.Err()
+	return nil
 }
 
 func (c *Client) endpoint(parts ...string) string {

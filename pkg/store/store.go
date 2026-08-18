@@ -32,11 +32,13 @@ type RevocationStore interface {
 	// from the root delegation to the revoked delegation. The issuer of the
 	// revocation must appear as a delegation issuer in the path.
 	Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error
-	// Get retrieves a revocation record from the store. The delegation is the
-	// revoked delegation. If the record is not found, [ErrNotFound] is returned.
-	Get(ctx context.Context, delegation cid.Cid) (RevocationRecord, error)
+	// Get retrieves a revocation record from the store by revoked delegation CID.
+	// If the record is not found, [ErrNotFound] is returned.
+	Get(ctx context.Context, revoked cid.Cid) (RevocationRecord, error)
 	// Stream streams all revocation records from the store and remains open until
-	// the context is canceled. The since parameter is used to filter records that
-	// were added after the given time. If since is zero, all records are returned.
-	Stream(ctx context.Context, since time.Time) iter.Seq2[RevocationRecord, error]
+	// the context is canceled. The from parameter filters records to those
+	// recorded on or after the given time, so consumers resuming from the
+	// timestamp of the last record they received do not miss records that share
+	// it. If from is zero, all records are returned.
+	Stream(ctx context.Context, from time.Time) iter.Seq2[RevocationRecord, error]
 }

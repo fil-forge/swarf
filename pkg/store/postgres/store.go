@@ -19,6 +19,11 @@ import (
 
 const streamPollInterval = time.Second
 
+// streamSettleWindow bounds how long an insert may take between its
+// recorded_at (NOW() at transaction start) and its row becoming visible.
+// History older than this window is settled: no new rows can appear there.
+const streamSettleWindow = 10 * time.Second
+
 // Store persists revocation records in PostgreSQL.
 type Store struct {
 	pool *pgxpool.Pool
@@ -31,7 +36,7 @@ func New(pool *pgxpool.Pool) *Store {
 
 var _ store.RevocationStore = (*Store)(nil)
 
-// Add stores revocation and its delegation path.
+// Add stores revocation and its witness path.
 func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -68,8 +73,8 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 	return nil
 }
 
-// Get retrieves the most recently stored revocation record for delegation.
-func (s *Store) Get(ctx context.Context, delegationCID cid.Cid) (store.RevocationRecord, error) {
+// Get retrieves the most recently stored revocation record for a delegation.
+func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecord, error) {
 	row := s.pool.QueryRow(
 		ctx,
 		`SELECT cause, revoked_delegation, path_witness, recorded_at
@@ -77,38 +82,74 @@ func (s *Store) Get(ctx context.Context, delegationCID cid.Cid) (store.Revocatio
 		 WHERE revoked_delegation = $1
 		 ORDER BY recorded_at DESC, id DESC
 		 LIMIT 1`,
-		delegationCID.String(),
+		revoked.String(),
 	)
-	record, err := ScanRecord(row)
+	var causeBytes []byte
+	var revoke string
+	var pathWitness [][]byte
+	var recordedAt time.Time
+	err := row.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return store.RevocationRecord{}, store.ErrNotFound
 	}
 	if err != nil {
 		return store.RevocationRecord{}, fmt.Errorf("getting revocation: %w", err)
 	}
+	record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
+	if err != nil {
+		return store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err)
+	}
 	return record, nil
 }
 
 // Stream returns matching revocation records and remains open until ctx is canceled.
-func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.RevocationRecord, error] {
+func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
 	return func(yield func(store.RevocationRecord, error) bool) {
 		ticker := time.NewTicker(streamPollInterval)
 		defer ticker.Stop()
 
+		// cursor is the low-water mark of each poll. It starts at from and
+		// only advances through settled history, because rows can become
+		// visible out of recorded_at order: ids are CIDs (not monotonic) and
+		// recorded_at is the insert transaction's start time, so a concurrent
+		// insert can commit a row at or before timestamps already streamed.
+		// Rows re-read from the unsettled window are deduped by seen, keyed
+		// by cause link with recorded_at kept for pruning.
+		cursor := from
+		seen := map[cid.Cid]time.Time{}
 		for {
 			if err := ctx.Err(); err != nil {
 				yield(store.RevocationRecord{}, err)
 				return
 			}
-			for record, err := range s.recordsSince(ctx, since) {
+
+			// The horizon is read before the rows so it never overtakes them.
+			var dbNow time.Time
+			if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+				yield(store.RevocationRecord{}, fmt.Errorf("reading database clock: %w", err))
+				return
+			}
+			for rec, err := range s.recordsFrom(ctx, cursor) {
 				if err != nil {
 					yield(store.RevocationRecord{}, err)
 					return
 				}
-				if !yield(record, nil) {
+				link := rec.Cause.Link()
+				if _, ok := seen[link]; ok {
+					continue
+				}
+				if !yield(rec, nil) {
 					return
 				}
-				since = record.RecordedAt
+				seen[link] = rec.RecordedAt
+			}
+			if horizon := dbNow.Add(-streamSettleWindow); horizon.After(cursor) {
+				cursor = horizon
+				for link, recordedAt := range seen {
+					if recordedAt.Before(cursor) {
+						delete(seen, link)
+					}
+				}
 			}
 
 			select {
@@ -121,19 +162,19 @@ func (s *Store) Stream(ctx context.Context, since time.Time) iter.Seq2[store.Rev
 	}
 }
 
-func (s *Store) recordsSince(ctx context.Context, since time.Time) iter.Seq2[store.RevocationRecord, error] {
+func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[store.RevocationRecord, error] {
 	return func(yield func(store.RevocationRecord, error) bool) {
-		var sinceArg any
-		if !since.IsZero() {
-			sinceArg = since
-		}
+		// The query is inclusive at the cursor: each poll re-reads the
+		// unsettled window and Stream skips rows it already yielded. The
+		// zero cursor predates every record, so an unbounded stream matches
+		// everything.
 		rows, err := s.pool.Query(
 			ctx,
 			`SELECT cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
-			 WHERE ($1::timestamptz IS NULL OR recorded_at > $1)
+			 WHERE recorded_at >= $1
 			 ORDER BY recorded_at, id`,
-			sinceArg,
+			cursor,
 		)
 		if err != nil {
 			yield(store.RevocationRecord{}, fmt.Errorf("querying revocations: %w", err))
@@ -142,9 +183,17 @@ func (s *Store) recordsSince(ctx context.Context, since time.Time) iter.Seq2[sto
 		defer rows.Close()
 
 		for rows.Next() {
-			record, err := ScanRecord(rows)
-			if err != nil {
+			var causeBytes []byte
+			var revoke string
+			var pathWitness [][]byte
+			var recordedAt time.Time
+			if err := rows.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
 				yield(store.RevocationRecord{}, fmt.Errorf("scanning revocation: %w", err))
+				return
+			}
+			record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
+			if err != nil {
+				yield(store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err))
 				return
 			}
 			if !yield(record, nil) {
@@ -157,20 +206,12 @@ func (s *Store) recordsSince(ctx context.Context, since time.Time) iter.Seq2[sto
 	}
 }
 
-func ScanRecord(row pgx.Row) (store.RevocationRecord, error) {
-	var causeBytes []byte
-	var revoke string
-	var pathWitness [][]byte
-	var recordedAt time.Time
-	if err := row.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
-		return store.RevocationRecord{}, err
-	}
-
+func decodeRecord(causeBytes []byte, revoke string, pathWitness [][]byte, recordedAt time.Time) (store.RevocationRecord, error) {
 	cause, err := invocation.Decode(causeBytes)
 	if err != nil {
 		return store.RevocationRecord{}, fmt.Errorf("decoding revocation cause: %w", err)
 	}
-	revokeCID, err := cid.Decode(revoke)
+	revokeLink, err := cid.Decode(revoke)
 	if err != nil {
 		return store.RevocationRecord{}, fmt.Errorf("decoding revoked delegation CID: %w", err)
 	}
@@ -182,7 +223,7 @@ func ScanRecord(row pgx.Row) (store.RevocationRecord, error) {
 		}
 	}
 	return store.RevocationRecord{
-		Revoke:     revokeCID,
+		Revoke:     revokeLink,
 		Cause:      cause,
 		Path:       path,
 		RecordedAt: recordedAt,
