@@ -19,6 +19,11 @@ import (
 
 const streamPollInterval = time.Second
 
+// streamSettleWindow bounds how long an insert may take between its
+// recorded_at (NOW() at transaction start) and its row becoming visible.
+// History older than this window is settled: no new rows can appear there.
+const streamSettleWindow = 10 * time.Second
+
 // Store persists revocation records in PostgreSQL.
 type Store struct {
 	pool *pgxpool.Pool
@@ -103,25 +108,47 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 		ticker := time.NewTicker(streamPollInterval)
 		defer ticker.Stop()
 
-		// lastID is the id column of the most recently yielded row, so
-		// polling resumes strictly after it rather than re-yielding records
-		// that share its recorded_at timestamp.
-		var lastID string
+		// cursor is the low-water mark of each poll. It starts at from and
+		// only advances through settled history, because rows can become
+		// visible out of recorded_at order: ids are CIDs (not monotonic) and
+		// recorded_at is the insert transaction's start time, so a concurrent
+		// insert can commit a row at or before timestamps already streamed.
+		// Rows re-read from the unsettled window are deduped by seen, keyed
+		// by id with recorded_at kept for pruning.
+		cursor := from
+		seen := map[string]time.Time{}
 		for {
 			if err := ctx.Err(); err != nil {
 				yield(store.RevocationRecord{}, err)
 				return
 			}
-			for rec, err := range s.recordsFrom(ctx, from, lastID) {
+
+			// The horizon is read before the rows so it never overtakes them.
+			var dbNow time.Time
+			if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+				yield(store.RevocationRecord{}, fmt.Errorf("reading database clock: %w", err))
+				return
+			}
+			for rec, err := range s.recordsFrom(ctx, cursor) {
 				if err != nil {
 					yield(store.RevocationRecord{}, err)
 					return
 				}
+				if _, ok := seen[rec.id]; ok {
+					continue
+				}
 				if !yield(rec.RevocationRecord, nil) {
 					return
 				}
-				from = rec.RecordedAt
-				lastID = rec.id
+				seen[rec.id] = rec.RecordedAt
+			}
+			if horizon := dbNow.Add(-streamSettleWindow); horizon.After(cursor) {
+				cursor = horizon
+				for id, recordedAt := range seen {
+					if recordedAt.Before(cursor) {
+						delete(seen, id)
+					}
+				}
 			}
 
 			select {
@@ -135,28 +162,25 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 }
 
 // streamRecord pairs a revocation record with the id column of its row, so
-// Stream can advance its cursor from the stored id.
+// Stream can dedup rows re-read from the unsettled window.
 type streamRecord struct {
 	store.RevocationRecord
 	id string
 }
 
-func (s *Store) recordsFrom(ctx context.Context, from time.Time, lastID string) iter.Seq2[streamRecord, error] {
+func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[streamRecord, error] {
 	return func(yield func(streamRecord, error) bool) {
-		// The (recorded_at, id) cursor resumes strictly after the last
-		// yielded record, but stays inclusive of from until something has
-		// been yielded: every id sorts after the empty string, so with
-		// lastID == "" the filter degenerates to recorded_at >= from. The
-		// zero from predates every record, so an unbounded stream matches
+		// The query is inclusive at the cursor: each poll re-reads the
+		// unsettled window and Stream skips rows it already yielded. The
+		// zero cursor predates every record, so an unbounded stream matches
 		// everything.
 		rows, err := s.pool.Query(
 			ctx,
 			`SELECT id, cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
-			 WHERE recorded_at > $1 OR (recorded_at = $1 AND id > $2)
+			 WHERE recorded_at >= $1
 			 ORDER BY recorded_at, id`,
-			from,
-			lastID,
+			cursor,
 		)
 		if err != nil {
 			yield(streamRecord{}, fmt.Errorf("querying revocations: %w", err))

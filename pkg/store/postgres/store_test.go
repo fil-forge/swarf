@@ -111,6 +111,41 @@ func TestPostgresRevocationStoreStreamSameTimestamp(t *testing.T) {
 	require.ErrorIs(t, <-done, context.Canceled)
 }
 
+func TestPostgresRevocationStoreStreamLateArrivals(t *testing.T) {
+	s, pool := newTestStore(t)
+	recordedAt := time.Now().UTC().Truncate(time.Microsecond)
+
+	firstRevocation, firstPath := revocationPath(t)
+	insertAt(t, pool, firstRevocation, firstPath, recordedAt)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	records, done := collectStream(s.Stream(ctx, time.Time{}))
+	require.Equal(t, firstRevocation.Link(), (<-records).Cause.Link())
+
+	// A concurrent insert can commit a row at a timestamp the stream has
+	// already passed: sharing the first record's recorded_at, or earlier.
+	// Both must still be delivered, in either order, exactly once each.
+	sameTsRevocation, sameTsPath := revocationPath(t)
+	insertAt(t, pool, sameTsRevocation, sameTsPath, recordedAt)
+	earlierRevocation, earlierPath := revocationPath(t)
+	insertAt(t, pool, earlierRevocation, earlierPath, recordedAt.Add(-time.Second))
+
+	delivered := map[string]int{}
+	delivered[(<-records).Cause.Link().String()]++
+	delivered[(<-records).Cause.Link().String()]++
+	require.Equal(t, 1, delivered[sameTsRevocation.Link().String()])
+	require.Equal(t, 1, delivered[earlierRevocation.Link().String()])
+
+	// Hold the stream open past a poll interval: nothing is re-delivered.
+	select {
+	case record := <-records:
+		require.Failf(t, "stream re-delivered a record", "cause: %s", record.Cause.Link())
+	case <-time.After(2 * time.Second):
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
 func TestPostgresRevocationStoreStreamBroadcasts(t *testing.T) {
 	s, _ := newTestStore(t)
 	firstRevocation, firstPath := revocationPath(t)
