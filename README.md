@@ -15,21 +15,24 @@ By default, Swarf uses PostgreSQL. Configure it with `--postgres-dsn`, a
 
 ## CLI
 
-### `swarf revoke <revoke-cid> <witness-path-container>`
+### `swarf revoke <revoke-cid> <delegation-or-container>`
 
-Publish a revocation with an issuer PEM key, the CID to revoke, and a UCAN
-container containing the delegation witnesses:
+Publish a revocation with an issuer PEM key, the CID to revoke, and the
+delegation to revoke:
 
 ```sh
 swarf revoke \
   --issuer-key-file issuer.pem \
   <revoke-cid> \
-  <witness-path-container>
+  <delegation-or-container>
 ```
 
-`witness-path-container` can be a file path or an encoded UCAN container
-string. Swarf builds the witness chain from the revoked delegation CID. The
-service defaults to `did:web:swarf.forgery.network` at
+`delegation-or-container` can be a file path or an encoded UCAN container
+string. A file may contain either a CBOR-encoded delegation or a UCAN container
+holding the delegation to revoke. When the issuer key issued the revoked
+delegation, the delegation alone is enough; otherwise the container must also
+include the delegation witnesses, from which Swarf builds the witness chain.
+The service defaults to `did:web:swarf.forgery.network` at
 `https://swarf.forgery.network`; override these with `--service-id` and
 `--service-url`.
 
@@ -72,6 +75,11 @@ type RevokeArguments struct {
   path [Link]
 }
 ```
+
+`path` proves the revocation issuer's authority over a delegation issued by
+someone else further down a chain the issuer is involved in, and may be empty
+when the revocation issuer issued the revoked delegation directly. The revoked
+delegation itself must always be included in the invocation metadata.
 
 ### `GET /revocation/:cid`
 
@@ -117,8 +125,12 @@ revoking a delegation to each `Publish` call:
 serviceURL, _ := url.Parse("https://swarf.example.com")
 client, _ := swarfclient.New(serviceDID, *serviceURL)
 
-// The final delegation in path is the delegation to revoke.
-err := client.Publish(ctx, revoker, path[len(path)-1].Link(), path)
+// Revoke a delegation you issued directly.
+err := client.Publish(ctx, revoker, revoked)
+
+// Provide a witness path (root first) when revoking a delegation issued by
+// someone else further down a chain you are involved in.
+err = client.Publish(ctx, revoker, revoked, swarfclient.WithWitnessPath(path...))
 
 record, err := client.Get(ctx, delegationCID)
 
@@ -128,6 +140,7 @@ for event, err := range client.Stream(ctx, time.Time{}) {
 ```
 
 `Publish` self-signs the revocation invocation with the passed revoker, which
-must appear as an issuer in the delegation path. `Get` returns a full
+must be the issuer of the revoked delegation or appear as an issuer in the
+witness path provided with `WithWitnessPath`. `Get` returns a full
 `store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
 values.
