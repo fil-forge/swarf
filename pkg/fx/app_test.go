@@ -154,7 +154,7 @@ func TestValidateRevocationPath(t *testing.T) {
 
 type firehoseTestStore struct {
 	record store.RevocationRecord
-	from  time.Time
+	from   time.Time
 }
 
 func (s *firehoseTestStore) Add(context.Context, ucan.Invocation, []ucan.Delegation) error {
