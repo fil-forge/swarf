@@ -144,3 +144,30 @@ must be the issuer of the revoked delegation or appear as an issuer in the
 witness path provided with `WithWitnessPath`. `Get` returns a full
 `store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
 values.
+
+## Container images
+
+A push to `main` publishes to GHCR from the `Container` workflow. The `prod`
+target becomes `ghcr.io/fil-forge/swarf:main`, a stripped binary on a slim
+Debian base. The `dev` target becomes `ghcr.io/fil-forge/swarf:main-dev` and
+adds delve plus a handful of debugging tools. Both cover `linux/amd64` and
+`linux/arm64`, and both also carry a `sha-<short-sha>` tag, the dev image with a
+`-dev` suffix.
+
+## Deploying to dev
+
+The same run asks [infra-central][] to deploy the prod image. It dispatches a
+`bump-deployed-image` event carrying the manifest digest it just pushed, and
+infra-central's [Bump deployed image][receiver] workflow opens a pull request
+pinning that digest in `terraform/envs/dev/apps/terraform.tfvars`, with
+auto-merge enabled. infra-central's [Check and deploy][deploy] workflow runs
+`tofu apply` on `dev/apps` on every push to its `main`, so merging that pull
+request is what deploys.
+
+The dispatch runs as the `fil-forge-bot` GitHub App and needs the
+`FORGE_BOT_APP_ID` variable and the `FORGE_BOT_PRIVATE_KEY` secret. Prod pins
+are promoted by hand.
+
+[infra-central]: https://github.com/fil-forge/infra-central
+[receiver]: https://github.com/fil-forge/infra-central/blob/main/.github/workflows/bump-deployed-image.yml
+[deploy]: https://github.com/fil-forge/infra-central/blob/main/.github/workflows/check-and-deploy.yml
