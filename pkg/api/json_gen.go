@@ -29,7 +29,7 @@ func (t *Revocation) MarshalDagJSON(w io.Writer) error {
 	if err := jw.WriteObjectOpen(); err != nil {
 		return err
 	}
-	written := 0
+	written := false
 
 	// t.Cause ([]uint8) (slice)
 	if len("cause") > 8192 {
@@ -49,8 +49,8 @@ func (t *Revocation) MarshalDagJSON(w io.Writer) error {
 		return fmt.Errorf("writing bytes for field t.Cause: %w", err)
 	}
 
-	written++
-	if written > 0 {
+	written = true
+	if written {
 		if err := jw.WriteComma(); err != nil {
 			return err
 		}
@@ -92,8 +92,8 @@ func (t *Revocation) MarshalDagJSON(w io.Writer) error {
 		return fmt.Errorf("writing array close for field t.Path: %w", err)
 	}
 
-	written++
-	if written > 0 {
+	written = true
+	if written {
 		if err := jw.WriteComma(); err != nil {
 			return err
 		}
@@ -112,8 +112,8 @@ func (t *Revocation) MarshalDagJSON(w io.Writer) error {
 	if err := t.RecordedAt.MarshalDagJSON(jw); err != nil {
 		return fmt.Errorf("marshaling field t.RecordedAt: %w", err)
 	}
-	written++
-	if written > 0 {
+	written = true
+	if written {
 		if err := jw.WriteComma(); err != nil {
 			return err
 		}
@@ -134,7 +134,6 @@ func (t *Revocation) MarshalDagJSON(w io.Writer) error {
 		return fmt.Errorf("writing CID for field t.Revoke: %w", err)
 	}
 
-	written++
 	if err := jw.WriteObjectClose(); err != nil {
 		return err
 	}
@@ -290,7 +289,7 @@ func (t *FirehoseRevocation) MarshalDagJSON(w io.Writer) error {
 	if err := jw.WriteObjectOpen(); err != nil {
 		return err
 	}
-	written := 0
+	written := false
 
 	// t.Cause (cid.Cid) (struct)
 	if len("cause") > 8192 {
@@ -307,8 +306,8 @@ func (t *FirehoseRevocation) MarshalDagJSON(w io.Writer) error {
 		return fmt.Errorf("writing CID for field t.Cause: %w", err)
 	}
 
-	written++
-	if written > 0 {
+	written = true
+	if written {
 		if err := jw.WriteComma(); err != nil {
 			return err
 		}
@@ -347,8 +346,8 @@ func (t *FirehoseRevocation) MarshalDagJSON(w io.Writer) error {
 		return fmt.Errorf("writing array close for field t.Path: %w", err)
 	}
 
-	written++
-	if written > 0 {
+	written = true
+	if written {
 		if err := jw.WriteComma(); err != nil {
 			return err
 		}
@@ -367,8 +366,8 @@ func (t *FirehoseRevocation) MarshalDagJSON(w io.Writer) error {
 	if err := t.RecordedAt.MarshalDagJSON(jw); err != nil {
 		return fmt.Errorf("marshaling field t.RecordedAt: %w", err)
 	}
-	written++
-	if written > 0 {
+	written = true
+	if written {
 		if err := jw.WriteComma(); err != nil {
 			return err
 		}
@@ -389,7 +388,6 @@ func (t *FirehoseRevocation) MarshalDagJSON(w io.Writer) error {
 		return fmt.Errorf("writing CID for field t.Revoke: %w", err)
 	}
 
-	written++
 	if err := jw.WriteObjectClose(); err != nil {
 		return err
 	}

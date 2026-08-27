@@ -1,5 +1,5 @@
 # Build stage - runs natively on build machine, cross-compiles to target.
-FROM --platform=$BUILDPLATFORM golang:1.26-bookworm AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-bookworm AS build
 ARG TARGETARCH
 ARG TARGETOS=linux
 WORKDIR /go/src/swarf
