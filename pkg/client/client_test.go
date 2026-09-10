@@ -13,6 +13,7 @@ import (
 	"time"
 
 	jsg "github.com/alanshaw/dag-json-gen"
+	principalcmd "github.com/fil-forge/libforge/commands/principal"
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/swarf/pkg/api"
@@ -216,7 +217,9 @@ func TestStreamReconnectDedupes(t *testing.T) {
 	defer mu.Unlock()
 	require.GreaterOrEqual(t, len(requests), 2)
 	require.Equal(t, "/revocations/0", requests[0])
-	require.Equal(t, "/revocations/"+boundary.Format(time.RFC3339Nano), requests[1])
+	// The reconnect asks from one settle window before the newest delivered
+	// record; seen suppresses what that re-serves.
+	require.Equal(t, "/revocations/"+boundary.Add(-streamSettleWindow).Format(time.RFC3339Nano), requests[1])
 }
 
 func TestStreamReconnectCanceled(t *testing.T) {
@@ -271,4 +274,189 @@ func sseEvent(t *testing.T, record api.FirehoseRevocation) string {
 	var payload bytes.Buffer
 	require.NoError(t, record.MarshalDagJSON(&payload))
 	return fmt.Sprintf("event: revocation\ndata: %s\n\n", payload.String())
+}
+
+func TestInvalidate(t *testing.T) {
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	hilt, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	tenant, err := did.Parse("did:plc:tenant")
+	require.NoError(t, err)
+
+	var gotIssuer, gotSubject did.DID
+	var gotArgs *principalcmd.InvalidateArguments
+	srv := server.NewHTTP(service)
+	srv.Handle(principalcmd.Invalidate.Command, principalcmd.Invalidate.Handler(
+		func(req *binding.Request[*principalcmd.InvalidateArguments], res *binding.Response[*principalcmd.InvalidateOK]) error {
+			gotIssuer = req.Invocation().Issuer()
+			gotSubject = req.Task().Subject()
+			gotArgs = req.Task().Arguments()
+			return res.SetSuccess(&principalcmd.InvalidateOK{})
+		}))
+
+	serviceURL, err := url.Parse("http://swarf.test")
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL, WithHTTPClient(&http.Client{Transport: srv}))
+	require.NoError(t, err)
+
+	require.NoError(t, client.Invalidate(context.Background(), hilt, tenant, "8f2c"))
+	require.Equal(t, hilt.DID(), gotIssuer)
+	require.Equal(t, hilt.DID(), gotSubject)
+	require.Equal(t, tenant, gotArgs.Tenant)
+	require.Equal(t, "8f2c", gotArgs.Principal)
+
+	t.Run("requires an issuer", func(t *testing.T) {
+		require.ErrorContains(t, client.Invalidate(context.Background(), nil, tenant, "8f2c"), "issuer is required")
+	})
+
+	t.Run("requires a tenant", func(t *testing.T) {
+		require.ErrorContains(t, client.Invalidate(context.Background(), hilt, did.Undef, "8f2c"), "tenant is required")
+	})
+
+	t.Run("requires a principal", func(t *testing.T) {
+		require.ErrorContains(t, client.Invalidate(context.Background(), hilt, tenant, ""), "principal is required")
+	})
+}
+
+func TestStreamEventsCarriesBothKinds(t *testing.T) {
+	recordedAt := time.Now().UTC().Truncate(time.Second)
+	revocation := firehoseRecord(t, recordedAt)
+	invalidation := firehosePrincipalRevocation(t, recordedAt.Add(time.Second))
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		// An event name the client does not know is skipped rather than
+		// treated as a corrupt payload.
+		_, _ = io.WriteString(writer, sseEvent(t, revocation)+"event: future\ndata: {\"unknown\":1}\n\n"+ssePrincipalRevocationEvent(t, invalidation))
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	var received []api.FirehoseEvent
+	for event, err := range client.StreamEvents(context.Background(), time.Time{}) {
+		require.NoError(t, err)
+		received = append(received, event)
+		if len(received) == 2 {
+			break
+		}
+	}
+	require.NotNil(t, received[0].Revocation)
+	require.Equal(t, revocation.Cause, received[0].Revocation.Cause)
+	require.NotNil(t, received[1].PrincipalRevocation)
+	require.Equal(t, invalidation.Tenant, received[1].PrincipalRevocation.Tenant)
+	require.Equal(t, invalidation.Principal, received[1].PrincipalRevocation.Principal)
+	require.Equal(t, invalidation.Cause, received[1].PrincipalRevocation.Cause)
+}
+
+func TestStreamDropsPrincipalRevocationEvents(t *testing.T) {
+	recordedAt := time.Now().UTC().Truncate(time.Second)
+	invalidation := firehosePrincipalRevocation(t, recordedAt)
+	revocation := firehoseRecord(t, recordedAt.Add(time.Second))
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, ssePrincipalRevocationEvent(t, invalidation)+sseEvent(t, revocation))
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	for streamed, err := range client.Stream(context.Background(), time.Time{}) {
+		require.NoError(t, err)
+		require.Equal(t, revocation.Cause, streamed.Cause)
+		break
+	}
+}
+
+func TestStreamResumesFromTheNewestRecord(t *testing.T) {
+	base := time.Now().UTC().Truncate(time.Second)
+	first := firehoseRecord(t, base)
+	newest := firehoseRecord(t, base.Add(2*time.Second))
+	// late is recorded before newest but arrives behind it, as a record
+	// committed inside the service's settle window does.
+	late := firehoseRecord(t, base.Add(time.Second))
+	next := firehoseRecord(t, base.Add(3*time.Second))
+
+	var mu sync.Mutex
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		requests = append(requests, request.URL.Path)
+		connection := len(requests)
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "text/event-stream")
+		switch connection {
+		case 1:
+			_, _ = io.WriteString(writer, sseEvent(t, first)+sseEvent(t, newest)+sseEvent(t, late))
+		case 2:
+			// The cursor is inclusive, so the record recorded at exactly the
+			// resume timestamp comes again.
+			_, _ = io.WriteString(writer, sseEvent(t, newest)+sseEvent(t, next))
+		default:
+			<-request.Context().Done()
+		}
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	var received []cid.Cid
+	for record, err := range client.Stream(context.Background(), time.Time{}) {
+		require.NoError(t, err)
+		received = append(received, record.Cause)
+		if len(received) == 4 {
+			break
+		}
+	}
+	require.Equal(t, []cid.Cid{first.Cause, newest.Cause, late.Cause, next.Cause}, received)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.GreaterOrEqual(t, len(requests), 2)
+	require.Equal(t, "/revocations/0", requests[0])
+	// The reconnect asks from one settle window before the newest delivered
+	// record (bounded by the original from, here zero), so a record
+	// committed late inside that window while the connection was down is
+	// still served; seen suppresses the ones already delivered.
+	require.Equal(t, "/revocations/"+base.Add(2*time.Second-streamSettleWindow).Format(time.RFC3339Nano), requests[1])
+}
+
+func firehosePrincipalRevocation(t *testing.T, recordedAt time.Time) api.FirehosePrincipalRevocation {
+	t.Helper()
+	issuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cmd, err := command.Parse("/principal/invalidate")
+	require.NoError(t, err)
+	invalidation, err := invocation.Invoke(issuer, issuer.DID(), cmd, nil)
+	require.NoError(t, err)
+	tenant, err := did.Parse("did:plc:tenant")
+	require.NoError(t, err)
+	return api.FirehosePrincipalRevocation{
+		Tenant:     tenant,
+		Principal:  "8f2c",
+		Cause:      invalidation.Link(),
+		RecordedAt: jsg.DagJsonTime(recordedAt),
+	}
+}
+
+func ssePrincipalRevocationEvent(t *testing.T, record api.FirehosePrincipalRevocation) string {
+	t.Helper()
+	var payload bytes.Buffer
+	require.NoError(t, record.MarshalDagJSON(&payload))
+	return fmt.Sprintf("event: principal\ndata: %s\n\n", payload.String())
 }

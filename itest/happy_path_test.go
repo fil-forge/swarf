@@ -16,6 +16,7 @@ import (
 	swarfclient "github.com/fil-forge/swarf/pkg/client"
 	"github.com/fil-forge/swarf/pkg/config"
 	appfx "github.com/fil-forge/swarf/pkg/fx"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/ucan"
@@ -66,6 +67,8 @@ func TestRevocationHappyPath(t *testing.T) {
 	pem, err := identity.EncodeSignerToPEM(serviceSigner)
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(keyFile, pem, 0o600))
+	hilt, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
 	port := freePort(t)
 	app := fxtest.New(t, appfx.AppModule(&config.Config{
 		Identity: config.IdentityConfig{KeyFile: keyFile},
@@ -77,6 +80,7 @@ func TestRevocationHappyPath(t *testing.T) {
 				DSN: dsn,
 			},
 		},
+		Principal: config.PrincipalConfig{Publishers: []string{hilt.DID().String()}},
 	}), fx.NopLogger)
 	app.RequireStart()
 	t.Cleanup(app.RequireStop)
@@ -111,9 +115,14 @@ func TestRevocationHappyPath(t *testing.T) {
 		// revocation (recorded at exactly from) before the second, and must
 		// not deliver anything else.
 		expecting := []cid.Cid{record.Revoke, expected}
-		for streamed, err := range client.Stream(streamCtx, record.RecordedAt) {
+		for event, err := range client.StreamEvents(streamCtx, record.RecordedAt) {
 			if err != nil {
 				records <- err
+				return
+			}
+			streamed := event.Revocation
+			if streamed == nil {
+				records <- fmt.Errorf("stream returned a non-revocation event with cause %s", event.Cause())
 				return
 			}
 			if streamed.Revoke != expecting[0] {
@@ -143,6 +152,42 @@ func TestRevocationHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, directRecord.Path, 1)
 	require.Equal(t, direct.Link(), directRecord.Path[0].Link())
+
+	// A principal invalidation from a publisher the service allows reaches
+	// the same firehose as a principal event.
+	tenant, err := did.Parse("did:plc:" + alice.DID().Identifier())
+	require.NoError(t, err)
+	stranger, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	require.Error(t, client.Invalidate(ctx, stranger, tenant, "8f2c"))
+
+	eventCtx, cancelEvents := context.WithCancel(ctx)
+	defer cancelEvents()
+	invalidations := make(chan error, 1)
+	go func() {
+		for event, err := range client.StreamEvents(eventCtx, directRecord.RecordedAt) {
+			if err != nil {
+				invalidations <- err
+				return
+			}
+			if event.PrincipalRevocation == nil {
+				continue
+			}
+			if event.PrincipalRevocation.Tenant != tenant || event.PrincipalRevocation.Principal != "8f2c" {
+				invalidations <- fmt.Errorf("stream returned an unexpected principal event: %s %s", event.PrincipalRevocation.Tenant, event.PrincipalRevocation.Principal)
+				return
+			}
+			invalidations <- nil
+			return
+		}
+	}()
+	require.NoError(t, client.Invalidate(ctx, hilt, tenant, "8f2c"))
+	select {
+	case err := <-invalidations:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "timed out waiting for the streamed principal invalidation")
+	}
 }
 
 func revocationPath(t *testing.T, alice, bob, carol ucan.Issuer) []ucan.Delegation {

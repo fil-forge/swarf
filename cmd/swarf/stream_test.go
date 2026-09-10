@@ -16,7 +16,7 @@ func TestStreamCommand(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		require.Equal(t, "/revocations/0", request.URL.Path)
 		require.Equal(t, "text/event-stream", request.Header.Get("Accept"))
-		_, _ = fmt.Fprint(writer, "event: ignored\ndata: ignored\n\nevent: revocation\ndata: {\"revoke\":\"one\"}\n\nevent: revocation\ndata: {\"revoke\":\"two\"}\n\n")
+		_, _ = fmt.Fprint(writer, "event: ignored\ndata: ignored\n\nevent: revocation\ndata: {\"revoke\":\"one\"}\n\nevent: principal\ndata: {\"principal\":\"8f2c\"}\n\nevent: revocation\ndata: {\"revoke\":\"two\"}\n\n")
 	}))
 	defer server.Close()
 
@@ -25,7 +25,7 @@ func TestStreamCommand(t *testing.T) {
 	command.SetOut(output)
 	command.SetArgs([]string{"--service-url", server.URL, "--from", "0"})
 	require.NoError(t, command.Execute())
-	require.Equal(t, "{\"revoke\":\"one\"}\n{\"revoke\":\"two\"}\n", output.String())
+	require.Equal(t, "revocation {\"revoke\":\"one\"}\nprincipal {\"principal\":\"8f2c\"}\nrevocation {\"revoke\":\"two\"}\n", output.String())
 }
 
 func TestStreamCommandRejectsInvalidFrom(t *testing.T) {

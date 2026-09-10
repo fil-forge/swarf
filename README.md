@@ -10,8 +10,14 @@ swarf serve --storage memory
 
 By default, Swarf uses PostgreSQL. Configure it with `--postgres-dsn`, a
 `config.yaml`, or `SWARF_STORAGE_POSTGRES_DSN`. Configuration sections are
-`identity`, `server`, `log`, and `storage`; environment variable names use the
-`SWARF_` prefix, for example `SWARF_SERVER_PORT`.
+`identity`, `server`, `log`, `storage`, and `principal`; environment variable
+names use the `SWARF_` prefix, for example `SWARF_SERVER_PORT`.
+
+`principal.publishers` holds the DIDs allowed to invoke
+`/principal/invalidate`, the service identities of the Hilt deployments Swarf
+serves. Set it with `--principal-publishers`, repeated or comma-separated, or
+with `SWARF_PRINCIPAL_PUBLISHERS` in comma form. A malformed DID fails
+startup, and an empty list refuses every invalidation.
 
 ## CLI
 
@@ -49,10 +55,17 @@ not found. Override the service endpoint with `--service-url`.
 
 ### `swarf stream`
 
-Stream revocation DAG-JSON records as they arrive with:
+Stream DAG-JSON records as they arrive with:
 
 ```sh
 swarf stream
+```
+
+Each line is the event kind followed by the record:
+
+```
+revocation {"cause":{"/":"bafyreif5fz..."},"path":[],"recorded_at":1784278800000000000,"revoke":{"/":"bafyreiehyt..."}}
+principal {"cause":{"/":"bafyreif5fz..."},"principal":"8f2c","recorded_at":1788948000000000000,"tenant":"did:plc:tenant"}
 ```
 
 By default, it starts from the current time. Pass `--from 0` to stream all
@@ -64,8 +77,10 @@ that time. Press Ctrl+C to stop streaming. Override the service endpoint with
 
 ### `POST /`
 
-The UCAN RPC endpoint. It supports `/ucan/revoke`; the invocation arguments
-identify the revoked delegation and its delegation
+The UCAN RPC endpoint. It supports `/ucan/revoke` and `/principal/invalidate`.
+
+For `/ucan/revoke`, the invocation arguments identify the revoked delegation
+and its delegation
 [path witness](https://github.com/ucan-wg/revocation#path-witness). These
 delegations must be included in the invocation metadata. For example:
 
@@ -80,6 +95,20 @@ type RevokeArguments struct {
 someone else further down a chain the issuer is involved in, and may be empty
 when the revocation issuer issued the revoked delegation directly. The revoked
 delegation itself must always be included in the invocation metadata.
+
+`/principal/invalidate` records that every proof a gateway cached for a
+principal's keys is void. Its arguments name the tenant and the principal:
+
+```ipldsch
+type InvalidateArguments struct {
+  tenant    String
+  principal String
+}
+```
+
+No delegation names a principal, so the invocation carries no proof: the
+issuer self-signs it with its own DID as subject, and Swarf accepts it only
+from an issuer in `principal.publishers`.
 
 ### `GET /revocation/:cid`
 
@@ -146,18 +175,29 @@ err := client.Publish(ctx, revoker, revoked)
 // someone else further down a chain you are involved in.
 err = client.Publish(ctx, revoker, revoked, swarfclient.WithWitnessPath(path...))
 
+// Invalidate a principal. The issuer must be a configured publisher.
+err = client.Invalidate(ctx, hiltIssuer, tenantDID, "8f2c")
+
 record, err := client.Get(ctx, delegationCID)
 
-for event, err := range client.Stream(ctx, time.Time{}) {
-    // event.Revoke, event.Path, and event.Cause are CIDs; event.RecordedAt is a time.
+for event, err := range client.StreamEvents(ctx, time.Time{}) {
+    // Exactly one of event.Revocation and event.PrincipalRevocation is set.
 }
 ```
 
 `Publish` self-signs the revocation invocation with the passed revoker, which
 must be the issuer of the revoked delegation or appear as an issuer in the
-witness path provided with `WithWitnessPath`. `Get` returns a full
-`store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
-values.
+witness path provided with `WithWitnessPath`. `Invalidate` self-signs the
+invalidation the same way, with the issuer as subject; Swarf refuses it unless
+the issuer is a configured publisher. `Get` returns a full
+`store.RevocationRecord`.
+
+`StreamEvents` returns `api.FirehoseEvent` values carrying either a
+`FirehoseRevocation` or a `FirehosePrincipalRevocation`. It resumes from the
+newest record it delivered and skips causes it already delivered, so a record
+that arrives behind newer ones is still yielded once and a reconnect does not
+repeat the newer ones. `Stream` yields only the revocations and is deprecated:
+a consumer using it never learns of a principal invalidation.
 
 ## Container images
 

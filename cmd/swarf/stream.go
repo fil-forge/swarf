@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/fil-forge/swarf/pkg/store"
 	"github.com/spf13/cobra"
 )
 
@@ -17,7 +18,7 @@ func newStreamCommand() *cobra.Command {
 	var from string
 	command := &cobra.Command{
 		Use:   "stream",
-		Short: "Stream revocations",
+		Short: "Stream revocations and principal invalidations",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if from == "" {
@@ -60,7 +61,7 @@ func newStreamCommand() *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&serviceURL, "service-url", defaultServiceURL, "Swarf service URL")
-	command.Flags().StringVar(&from, "from", "", "stream revocations recorded on or after this time: 0, RFC3339, or RFC3339Nano (default: now)")
+	command.Flags().StringVar(&from, "from", "", "stream records recorded on or after this time: 0, RFC3339, or RFC3339Nano (default: now)")
 	return command
 }
 
@@ -74,6 +75,8 @@ func validateFrom(value string) error {
 	return nil
 }
 
+// writeStreamEvents prints one line per record: the event kind followed by
+// the record's DAG-JSON. Event kinds the command does not know are skipped.
 func writeStreamEvents(cmd *cobra.Command, body io.Reader) error {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -82,9 +85,9 @@ func writeStreamEvents(cmd *cobra.Command, body io.Reader) error {
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
-			if event == "revocation" && len(data) > 0 {
-				if _, err := fmt.Fprintln(cmd.OutOrStdout(), strings.Join(data, "\n")); err != nil {
-					return fmt.Errorf("writing revocation event: %w", err)
+			if len(data) > 0 && (event == string(store.EventKindRevocation) || event == string(store.EventKindPrincipalRevocation)) {
+				if _, err := fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", event, strings.Join(data, "\n")); err != nil {
+					return fmt.Errorf("writing %s event: %w", event, err)
 				}
 			}
 			event = ""

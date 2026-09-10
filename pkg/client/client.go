@@ -15,6 +15,7 @@ import (
 
 	jsg "github.com/alanshaw/dag-json-gen"
 	"github.com/cenkalti/backoff/v5"
+	principalcmd "github.com/fil-forge/libforge/commands/principal"
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
 	"github.com/fil-forge/swarf/pkg/api"
 	"github.com/fil-forge/swarf/pkg/store"
@@ -119,6 +120,45 @@ func (c *Client) Publish(ctx context.Context, revoker ucan.Issuer, revoked ucan.
 	return nil
 }
 
+// Invalidate submits a /principal/invalidate invocation self-signed by
+// issuer, recording that every proof a gateway cached for the principal's
+// keys is void. Swarf accepts the command only from issuers in its publisher
+// list, so issuer must be a service identity that list holds.
+func (c *Client) Invalidate(ctx context.Context, issuer ucan.Issuer, tenant did.DID, principal string) error {
+	if issuer == nil {
+		return errors.New("issuer is required")
+	}
+	if !tenant.Defined() {
+		return errors.New("tenant is required")
+	}
+	if principal == "" {
+		return errors.New("principal is required")
+	}
+	// The nonce stays (a fresh random one per invocation): the service keys
+	// its records by the invocation CID and consumers dedupe by it, so two
+	// invalidations of the same principal must not share one. Without a
+	// nonce, an expiry or an issued-at, the CID would be a pure function of
+	// issuer, tenant and principal, and every repeat would be dropped.
+	invalidation, err := principalcmd.Invalidate.Invoke(
+		issuer,
+		issuer.DID(),
+		&principalcmd.InvalidateArguments{Tenant: tenant, Principal: principal},
+		invocation.WithAudience(c.ServiceID),
+		invocation.WithNoExpiration(),
+	)
+	if err != nil {
+		return fmt.Errorf("creating invalidate invocation: %w", err)
+	}
+	response, err := c.executor.Execute(execution.NewRequest(ctx, invalidation))
+	if err != nil {
+		return fmt.Errorf("publishing principal invalidation: %w", err)
+	}
+	if _, err := principalcmd.Invalidate.Unpack(response.Receipt()); err != nil {
+		return fmt.Errorf("unpacking invalidate receipt: %w", err)
+	}
+	return nil
+}
+
 // Get retrieves the most recent revocation for delegation.
 func (c *Client) Get(ctx context.Context, delegationCID cid.Cid) (store.RevocationRecord, error) {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("revocation", delegationCID.String()), nil)
@@ -168,54 +208,82 @@ type corruptError struct{ err error }
 func (e corruptError) Error() string { return e.err.Error() }
 func (e corruptError) Unwrap() error { return e.err }
 
-// Stream yields firehose revocations recorded on or after from and remains
+// streamSettleWindow bounds how far behind the newest record a late record
+// may be recorded. It matches the window the service settles its history
+// over, so a cause delivered within it stays in the dedup set for as long as
+// a reconnect could re-deliver it.
+const streamSettleWindow = 10 * time.Second
+
+// StreamEvents yields firehose events recorded on or after from and remains
 // open until ctx is canceled, reconnecting with capped exponential backoff
 // when the stream is interrupted.
-// It resumes from the timestamp of the last record it delivered and skips
-// records sharing that timestamp it already delivered, so a single call
-// yields each revocation once. A new call resuming from the timestamp of the
-// last record a previous call delivered still re-receives records recorded
-// at exactly that time; dedupe those by cause CID.
-func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error] {
-	return func(yield func(api.FirehoseRevocation, error) bool) {
+// It tracks the newest timestamp it has delivered and, on reconnect, asks
+// for records from one settle window before it, skipping causes it already
+// delivered, so a single call yields each event once even when a record
+// recorded inside the settle window arrives behind newer ones or lands while
+// the connection is down. A new call resuming from the timestamp of the last
+// event a previous call delivered still re-receives events recorded at
+// exactly that time; dedupe those by cause CID.
+func (c *Client) StreamEvents(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseEvent, error] {
+	return func(yield func(api.FirehoseEvent, error) bool) {
+		// resume is the newest recorded time delivered so far and never moves
+		// backwards: a late record must not send the next connection back to
+		// a cursor whose newer records were already delivered. A reconnect
+		// asks from one settle window before it (bounded by from), because a
+		// record committed late inside that window may not have been served
+		// yet when the connection dropped.
 		resume := from
-		// seen holds the cause CIDs of delivered records recorded at exactly
-		// resume, so reconnecting at resume does not re-deliver them.
-		seen := map[cid.Cid]struct{}{}
+		// seen holds the recorded time of each delivered cause, so a
+		// reconnect does not re-deliver them. Causes recorded before the
+		// settle window behind resume can no longer be re-delivered and are
+		// pruned.
+		seen := map[cid.Cid]time.Time{}
 		connected := false
 		bo := backoff.NewExponentialBackOff()
 		bo.InitialInterval = streamMinBackoff
 		bo.MaxInterval = streamMaxBackoff
 		for {
-			err := c.streamConn(ctx, resume, func(record api.FirehoseRevocation) bool {
-				recordedAt := record.RecordedAt.Time()
-				if recordedAt.Equal(resume) {
-					if _, ok := seen[record.Cause]; ok {
-						return true
-					}
-				} else {
-					resume = recordedAt
-					clear(seen)
+			since := resume
+			if resume.After(from) {
+				since = resume.Add(-streamSettleWindow)
+				if since.Before(from) {
+					since = from
 				}
-				seen[record.Cause] = struct{}{}
-				return yield(record, nil)
+			}
+			err := c.streamConn(ctx, since, func(event api.FirehoseEvent) bool {
+				cause := event.Cause()
+				if _, ok := seen[cause]; ok {
+					return true
+				}
+				recordedAt := event.RecordedAt().Time()
+				seen[cause] = recordedAt
+				if recordedAt.After(resume) {
+					resume = recordedAt
+					horizon := resume.Add(-streamSettleWindow)
+					for link, at := range seen {
+						if at.Before(horizon) {
+							delete(seen, link)
+						}
+					}
+				}
+				return yield(event, nil)
 			})
 			if errors.Is(err, errStreamStopped) {
 				return
 			}
 			if ctx.Err() != nil {
-				yield(api.FirehoseRevocation{}, ctx.Err())
+				yield(api.FirehoseEvent{}, ctx.Err())
 				return
 			}
 			if _, ok := errors.AsType[corruptError](err); ok {
-				yield(api.FirehoseRevocation{}, err)
+				yield(api.FirehoseEvent{}, err)
 				return
 			}
 			if _, ok := errors.AsType[connectError](err); ok {
 				// Failing to connect at all is fatal; failing to reconnect
 				// an established stream is retried like any interruption.
 				if !connected {
-					yield(api.FirehoseRevocation{}, err)
+					yield(api.FirehoseEvent{}, err)
 					return
 				}
 			} else {
@@ -225,7 +293,7 @@ func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.Fireh
 
 			select {
 			case <-ctx.Done():
-				yield(api.FirehoseRevocation{}, ctx.Err())
+				yield(api.FirehoseEvent{}, ctx.Err())
 				return
 			case <-time.After(bo.NextBackOff()):
 			}
@@ -233,11 +301,36 @@ func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.Fireh
 	}
 }
 
-// streamConn opens one SSE connection at from and emits its records. It
-// returns errStreamStopped when emit stops iteration, a connectError when no
-// stream was established, a corruptError for an undecodable payload, and nil
-// when an established connection ended for any other reason.
-func (c *Client) streamConn(ctx context.Context, from time.Time, emit func(api.FirehoseRevocation) bool) error {
+// Stream yields the revocations of [Client.StreamEvents].
+//
+// Deprecated: use [Client.StreamEvents]. Stream drops principal events, so a
+// consumer that must forget the proofs it cached for a principal's keys never
+// learns of them.
+func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error] {
+	return func(yield func(api.FirehoseRevocation, error) bool) {
+		for event, err := range c.StreamEvents(ctx, from) {
+			if err != nil {
+				if !yield(api.FirehoseRevocation{}, err) {
+					return
+				}
+				continue
+			}
+			if event.Revocation == nil {
+				continue
+			}
+			if !yield(*event.Revocation, nil) {
+				return
+			}
+		}
+	}
+}
+
+// streamConn opens one SSE connection at from and emits its events. Events
+// it does not know are skipped. It returns errStreamStopped when emit stops
+// iteration, a connectError when no stream was established, a corruptError
+// for an undecodable payload, and nil when an established connection ended
+// for any other reason.
+func (c *Client) streamConn(ctx context.Context, from time.Time, emit func(api.FirehoseEvent) bool) error {
 	cursor := "0"
 	if !from.IsZero() {
 		cursor = from.UTC().Format(time.RFC3339Nano)
@@ -262,13 +355,25 @@ func (c *Client) streamConn(ctx context.Context, from time.Time, emit func(api.F
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {
-			if event == "revocation" && len(data) > 0 {
-				var value api.FirehoseRevocation
-				if err := value.UnmarshalDagJSON(strings.NewReader(strings.Join(data, "\n"))); err != nil {
-					return corruptError{fmt.Errorf("decoding streamed revocation: %w", err)}
-				}
-				if !emit(value) {
-					return errStreamStopped
+			if len(data) > 0 {
+				payload := strings.Join(data, "\n")
+				switch event {
+				case string(store.EventKindRevocation):
+					var value api.FirehoseRevocation
+					if err := value.UnmarshalDagJSON(strings.NewReader(payload)); err != nil {
+						return corruptError{fmt.Errorf("decoding streamed revocation: %w", err)}
+					}
+					if !emit(api.FirehoseEvent{Revocation: &value}) {
+						return errStreamStopped
+					}
+				case string(store.EventKindPrincipalRevocation):
+					var value api.FirehosePrincipalRevocation
+					if err := value.UnmarshalDagJSON(strings.NewReader(payload)); err != nil {
+						return corruptError{fmt.Errorf("decoding streamed principal invalidation: %w", err)}
+					}
+					if !emit(api.FirehoseEvent{PrincipalRevocation: &value}) {
+						return errStreamStopped
+					}
 				}
 			}
 			event = ""

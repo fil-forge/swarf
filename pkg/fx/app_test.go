@@ -15,6 +15,7 @@ import (
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/swarf/pkg/api"
+	swarfclient "github.com/fil-forge/swarf/pkg/client"
 	"github.com/fil-forge/swarf/pkg/config"
 	"github.com/fil-forge/swarf/pkg/store"
 	"github.com/fil-forge/swarf/pkg/store/memory"
@@ -430,6 +431,25 @@ func TestInvalidateRoute(t *testing.T) {
 	_, err = invalidate(records, map[did.DID]struct{}{}, hilt)
 	require.Error(t, err)
 	require.Empty(t, principalRevocationRecords(t, records))
+
+	// Two invalidations of the same principal through the client are two
+	// records with distinct causes: the store keys records by the invocation
+	// CID and consumers dedupe by it, so a repeat that shared the CID of the
+	// first would never reach the firehose.
+	records = memory.New()
+	didResolver := resolver.ByMethod{"key": key.Resolver}
+	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
+	route := invalidateRoute(records, publishers)
+	srv.Handle(route.Command, route.Handler)
+	serviceURL, err := url.Parse("http://swarf.test")
+	require.NoError(t, err)
+	swarf, err := swarfclient.New(service.DID(), *serviceURL, swarfclient.WithHTTPClient(&http.Client{Transport: srv}))
+	require.NoError(t, err)
+	require.NoError(t, swarf.Invalidate(t.Context(), hilt, tenant, "8f2c"))
+	require.NoError(t, swarf.Invalidate(t.Context(), hilt, tenant, "8f2c"))
+	stored = principalRevocationRecords(t, records)
+	require.Len(t, stored, 2)
+	require.NotEqual(t, stored[0].Cause.Link(), stored[1].Cause.Link(), "each invalidation is its own record")
 }
 
 // principalRevocationRecords drains the principal revocation records the
