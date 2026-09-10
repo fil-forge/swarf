@@ -1,6 +1,7 @@
 package fx
 
 import (
+	"bufio"
 	"context"
 	"iter"
 	"net/http"
@@ -95,6 +96,118 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	require.Equal(t, revocation.Link(), event.Cause)
 	require.True(t, event.RecordedAt.Time().Equal(recordedAt))
 	require.NotContains(t, response.Body.String(), `"revocation"`)
+}
+
+func TestFirehoseRouteStreamsPrincipalRevocationEvents(t *testing.T) {
+	id, err := identity.New("", "")
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invalidate")
+	require.NoError(t, err)
+	revocation, err := invocation.Invoke(id, did.Undef, command, nil)
+	require.NoError(t, err)
+	witness, err := delegation.Delegate(id, did.Undef, id.DID(), command)
+	require.NoError(t, err)
+	invalidation, err := invocation.Invoke(id, did.Undef, command, nil, invocation.WithNonce([]byte("principal")))
+	require.NoError(t, err)
+	tenant, err := did.Parse("did:plc:tenant")
+	require.NoError(t, err)
+	recordedAt := time.Now().UTC().Round(0)
+	source := &firehoseTestStore{events: []store.Event{
+		store.RevocationEvent(store.RevocationRecord{Revoke: witness.Link(), Cause: revocation, Path: []ucan.Delegation{witness}, RecordedAt: recordedAt}),
+		store.PrincipalRevocationEvent(store.PrincipalRevocationRecord{Tenant: tenant, Principal: "alice", Cause: invalidation, RecordedAt: recordedAt.Add(time.Second)}),
+	}}
+	e := newEchoServer(id, server.NewHTTP(id), source)
+	request := httptest.NewRequest(http.MethodGet, "/revocations/0", nil)
+	response := httptest.NewRecorder()
+	e.ServeHTTP(response, request)
+
+	require.Equal(t, http.StatusOK, response.Code)
+	frames := strings.Split(strings.TrimSuffix(response.Body.String(), "\n\n"), "\n\n")
+	require.Len(t, frames, 2)
+
+	// Events are written in stream order, each under its own kind.
+	require.True(t, strings.HasPrefix(frames[0], "id: "+revocation.Link().String()+"\nevent: revocation\ndata: "))
+	var revoked api.FirehoseRevocation
+	require.NoError(t, revoked.UnmarshalDagJSON(strings.NewReader(strings.TrimPrefix(frames[0], "id: "+revocation.Link().String()+"\nevent: revocation\ndata: "))))
+	require.Equal(t, witness.Link(), revoked.Revoke)
+
+	prefix := "id: " + invalidation.Link().String() + "\nevent: principal\ndata: "
+	require.True(t, strings.HasPrefix(frames[1], prefix), frames[1])
+	var principal api.FirehosePrincipalRevocation
+	require.NoError(t, principal.UnmarshalDagJSON(strings.NewReader(strings.TrimPrefix(frames[1], prefix))))
+	require.Equal(t, tenant, principal.Tenant)
+	require.Equal(t, "alice", principal.Principal)
+	require.Equal(t, invalidation.Link(), principal.Cause)
+	require.True(t, principal.RecordedAt.Time().Equal(recordedAt.Add(time.Second)))
+	require.NotContains(t, frames[1], `"revoke"`)
+	require.NotContains(t, frames[1], `"path"`)
+}
+
+func TestFirehoseRouteStreamsMemoryStoreEvents(t *testing.T) {
+	id, err := identity.New("", "")
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invalidate")
+	require.NoError(t, err)
+	revocation, err := invocation.Invoke(id, did.Undef, command, nil)
+	require.NoError(t, err)
+	witness, err := delegation.Delegate(id, did.Undef, id.DID(), command)
+	require.NoError(t, err)
+	invalidation, err := invocation.Invoke(id, did.Undef, command, nil, invocation.WithNonce([]byte("principal")))
+	require.NoError(t, err)
+	tenant, err := did.Parse("did:plc:tenant")
+	require.NoError(t, err)
+
+	records := memory.New()
+	require.NoError(t, records.Add(t.Context(), revocation, []ucan.Delegation{witness}))
+	require.NoError(t, records.AddPrincipalRevocation(t.Context(), invalidation, tenant, "alice"))
+
+	srv := httptest.NewServer(newEchoServer(id, server.NewHTTP(id), records))
+	defer srv.Close()
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/revocations/0", nil)
+	require.NoError(t, err)
+	response, err := http.DefaultClient.Do(request)
+	require.NoError(t, err)
+	defer response.Body.Close()
+	require.Equal(t, http.StatusOK, response.StatusCode)
+	require.Equal(t, "text/event-stream", response.Header.Get(echo.HeaderContentType))
+
+	// The stream stays open, so read exactly the two frames the store holds
+	// and then cancel the request.
+	scanner := bufio.NewScanner(response.Body)
+	var frames []map[string]string
+	frame := map[string]string{}
+	for len(frames) < 2 && scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			frames = append(frames, frame)
+			frame = map[string]string{}
+			continue
+		}
+		field, value, ok := strings.Cut(line, ": ")
+		require.True(t, ok, line)
+		frame[field] = value
+	}
+	require.NoError(t, scanner.Err())
+	cancel()
+	require.Len(t, frames, 2)
+
+	require.Equal(t, "revocation", frames[0]["event"])
+	require.Equal(t, revocation.Link().String(), frames[0]["id"])
+	var revoked api.FirehoseRevocation
+	require.NoError(t, revoked.UnmarshalDagJSON(strings.NewReader(frames[0]["data"])))
+	require.Equal(t, witness.Link(), revoked.Revoke)
+	require.Equal(t, revocation.Link(), revoked.Cause)
+
+	require.Equal(t, "principal", frames[1]["event"])
+	require.Equal(t, invalidation.Link().String(), frames[1]["id"])
+	var principal api.FirehosePrincipalRevocation
+	require.NoError(t, principal.UnmarshalDagJSON(strings.NewReader(frames[1]["data"])))
+	require.Equal(t, tenant, principal.Tenant)
+	require.Equal(t, "alice", principal.Principal)
+	require.Equal(t, invalidation.Link(), principal.Cause)
+	require.False(t, principal.RecordedAt.Time().Before(revoked.RecordedAt.Time()))
 }
 
 func TestRevocationRouteReturnsDAGJSON(t *testing.T) {
@@ -217,8 +330,12 @@ func TestValidateRevocationPath(t *testing.T) {
 	require.Error(t, validateRevocationPath(t.Context(), []ucan.Delegation{expired}, resolver))
 }
 
+// firehoseTestStore is a fixed-content store. Get returns record; Stream
+// yields events when set and otherwise record as a single revocation event,
+// then ends.
 type firehoseTestStore struct {
 	record store.RevocationRecord
+	events []store.Event
 	from   time.Time
 }
 
@@ -237,6 +354,14 @@ func (s *firehoseTestStore) Get(context.Context, cid.Cid) (store.RevocationRecor
 func (s *firehoseTestStore) Stream(_ context.Context, from time.Time) iter.Seq2[store.Event, error] {
 	s.from = from
 	return func(yield func(store.Event, error) bool) {
-		yield(store.RevocationEvent(s.record), nil)
+		if s.events == nil {
+			yield(store.RevocationEvent(s.record), nil)
+			return
+		}
+		for _, event := range s.events {
+			if !yield(event, nil) {
+				return
+			}
+		}
 	}
 }

@@ -95,25 +95,39 @@ when no revocation exists. For example:
   "path": [
     {"/": {"bytes": "omF2AWNjYXBsL3Rlc3QvaW52b2tl"}}
   ],
-  "recorded_at": "2026-07-17T09:00:00Z"
+  "recorded_at": 1784278800000000000
 }
 ```
 
 ### `GET /revocations/:from`
 
-A Server-Sent Events stream of compact DAG-JSON records. Each event has `revoke`
-(the revoked delegation CID), `path` (the witness delegation CIDs), `cause` (the
-revocation invocation CID), and `recorded_at` (the time the record was recorded). Use `0`
-to stream all stored records, or provide an RFC3339/RFC3339Nano timestamp cursor
-to stream records recorded on or after it. The cursor is inclusive so consumers
-resuming from the `recorded_at` of the last event they received do not miss
-records that share it; deduplicate by the event `id` (the `cause` CID). For
-example:
+A Server-Sent Events stream of compact DAG-JSON records. Each `revocation`
+event has `revoke` (the revoked delegation CID), `path` (the witness delegation
+CIDs), `cause` (the revocation invocation CID), and `recorded_at` (the time the
+record was recorded). Use `0` to stream all stored records, or provide an
+RFC3339/RFC3339Nano timestamp cursor to stream records recorded on or after it.
+The cursor is inclusive so consumers resuming from the `recorded_at` of the
+last event they received do not miss records that share it; deduplicate by the
+event `id` (the `cause` CID). For example:
 
 ```js
 id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm
 event: revocation
-data: {"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"},"path":[{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}],"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"recorded_at":"2026-07-17T09:00:00Z"}
+data: {"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"path":[{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}],"recorded_at":1784278800000000000,"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}}
+```
+
+The same stream carries `principal` events, which record that every proof a
+gateway cached for a principal's keys is void. Each has `tenant` (the tenant
+DID), `principal` (the principal identifier, unique within the tenant), `cause`
+(the invalidation invocation CID), and `recorded_at` (unix nanoseconds, as for every DAG-JSON time here). Keys are emitted in lexicographic order. The cursor, the inclusive
+resume rule, and deduplication by `cause` are the same as for `revocation`
+events. A principal revocation event revokes no delegation, so
+`GET /revocation/:cid` never returns one. For example:
+
+```js
+id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm
+event: principal
+data: {"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"principal":"8f2c","recorded_at":1788948000000000000,"tenant":"did:plc:tenant"}
 ```
 
 ## Client library

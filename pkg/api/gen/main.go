@@ -13,7 +13,7 @@ const buildTag = "//go:build !codegen\n\n"
 
 func main() {
 	const output = "../json_gen.go"
-	if err := jsg.WriteMapEncodersToFile(output, "api", api.Revocation{}, api.FirehoseRevocation{}); err != nil {
+	if err := jsg.WriteMapEncodersToFile(output, "api", api.Revocation{}, api.FirehoseRevocation{}, api.FirehosePrincipalRevocation{}); err != nil {
 		panic(err)
 	}
 	data, err := os.ReadFile(output)

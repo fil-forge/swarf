@@ -525,3 +525,192 @@ func (t *FirehoseRevocation) UnmarshalDagJSON(r io.Reader) (err error) {
 
 	return nil
 }
+func (t *FirehosePrincipalRevocation) MarshalDagJSON(w io.Writer) error {
+	jw := jsg.NewDagJsonWriter(w)
+	if t == nil {
+		err := jw.WriteNull()
+		return err
+	}
+	if err := jw.WriteObjectOpen(); err != nil {
+		return err
+	}
+	written := false
+
+	// t.Cause (cid.Cid) (struct)
+	if len("cause") > 8192 {
+		return fmt.Errorf("string in field \"cause\" was too long")
+	}
+	if err := jw.WriteString(string("cause")); err != nil {
+		return fmt.Errorf("writing string for field \"cause\": %w", err)
+	}
+	if err := jw.WriteObjectColon(); err != nil {
+		return err
+	}
+
+	if err := jw.WriteCid(t.Cause); err != nil {
+		return fmt.Errorf("writing CID for field t.Cause: %w", err)
+	}
+
+	written = true
+	if written {
+		if err := jw.WriteComma(); err != nil {
+			return err
+		}
+	}
+
+	// t.Principal (string) (string)
+	if len("principal") > 8192 {
+		return fmt.Errorf("string in field \"principal\" was too long")
+	}
+	if err := jw.WriteString(string("principal")); err != nil {
+		return fmt.Errorf("writing string for field \"principal\": %w", err)
+	}
+	if err := jw.WriteObjectColon(); err != nil {
+		return err
+	}
+	if len(t.Principal) > 8192 {
+		return fmt.Errorf("string in field t.Principal was too long")
+	}
+	if err := jw.WriteString(string(t.Principal)); err != nil {
+		return fmt.Errorf("writing string for field t.Principal: %w", err)
+	}
+	written = true
+	if written {
+		if err := jw.WriteComma(); err != nil {
+			return err
+		}
+	}
+
+	// t.RecordedAt (typegen.DagJsonTime) (struct)
+	if len("recorded_at") > 8192 {
+		return fmt.Errorf("string in field \"recorded_at\" was too long")
+	}
+	if err := jw.WriteString(string("recorded_at")); err != nil {
+		return fmt.Errorf("writing string for field \"recorded_at\": %w", err)
+	}
+	if err := jw.WriteObjectColon(); err != nil {
+		return err
+	}
+	if err := t.RecordedAt.MarshalDagJSON(jw); err != nil {
+		return fmt.Errorf("marshaling field t.RecordedAt: %w", err)
+	}
+	written = true
+	if written {
+		if err := jw.WriteComma(); err != nil {
+			return err
+		}
+	}
+
+	// t.Tenant (did.DID) (struct)
+	if len("tenant") > 8192 {
+		return fmt.Errorf("string in field \"tenant\" was too long")
+	}
+	if err := jw.WriteString(string("tenant")); err != nil {
+		return fmt.Errorf("writing string for field \"tenant\": %w", err)
+	}
+	if err := jw.WriteObjectColon(); err != nil {
+		return err
+	}
+	if err := t.Tenant.MarshalDagJSON(jw); err != nil {
+		return fmt.Errorf("marshaling field t.Tenant: %w", err)
+	}
+	if err := jw.WriteObjectClose(); err != nil {
+		return err
+	}
+	return nil
+}
+func (t *FirehosePrincipalRevocation) UnmarshalDagJSON(r io.Reader) (err error) {
+	*t = FirehosePrincipalRevocation{}
+
+	jr := jsg.NewDagJsonReader(r)
+	defer func() {
+		if err == io.EOF {
+			err = io.ErrUnexpectedEOF
+		}
+	}()
+	if err := jr.ReadObjectOpen(); err != nil {
+		return fmt.Errorf("reading object open for FirehosePrincipalRevocation: %w", err)
+	}
+	close, err := jr.PeekObjectClose()
+	if err != nil {
+		return fmt.Errorf("peeking object close for FirehosePrincipalRevocation: %w", err)
+	}
+	if close {
+		if err := jr.ReadObjectClose(); err != nil {
+			return fmt.Errorf("reading object close for FirehosePrincipalRevocation: %w", err)
+		}
+	} else {
+		for i := uint64(0); i < 8192; i++ {
+			name, err := jr.ReadString(8192)
+			if err != nil {
+				if errors.Is(err, jsg.ErrLimitExceeded) {
+					return fmt.Errorf("reading string for field FirehosePrincipalRevocation: string too large")
+				}
+				return fmt.Errorf("reading string for field FirehosePrincipalRevocation: %w", err)
+			}
+			if err := jr.ReadObjectColon(); err != nil {
+				return fmt.Errorf("reading object colon for field FirehosePrincipalRevocation: %w", err)
+			}
+			switch name {
+
+			// t.Cause (cid.Cid) (struct)
+			case "cause":
+				{
+
+					c, err := jr.ReadCid()
+					if err != nil {
+						return fmt.Errorf("reading CID for field t.Cause: %w", err)
+					}
+					t.Cause = c
+
+				}
+
+				// t.Principal (string) (string)
+			case "principal":
+				{
+					sval, err := jr.ReadString(8192)
+					if err != nil {
+						if errors.Is(err, jsg.ErrLimitExceeded) {
+							return fmt.Errorf("reading string for field t.Principal: string too long")
+						}
+						return fmt.Errorf("reading string for field t.Principal: %w", err)
+					}
+					t.Principal = string(sval)
+				}
+
+				// t.RecordedAt (typegen.DagJsonTime) (struct)
+			case "recorded_at":
+
+				if err := t.RecordedAt.UnmarshalDagJSON(jr); err != nil {
+					return fmt.Errorf("unmarshaling t.RecordedAt: %w", err)
+				}
+
+				// t.Tenant (did.DID) (struct)
+			case "tenant":
+
+				if err := t.Tenant.UnmarshalDagJSON(jr); err != nil {
+					return fmt.Errorf("unmarshaling t.Tenant: %w", err)
+				}
+
+			default:
+				// Field doesn't exist on this type, so ignore it
+				if err := jr.DiscardType(); err != nil {
+					return fmt.Errorf("ignoring field %s for FirehosePrincipalRevocation: %w", name, err)
+				}
+			}
+
+			close, err := jr.ReadObjectCloseOrComma()
+			if err != nil {
+				return fmt.Errorf("reading object close or comma for field FirehosePrincipalRevocation: %w", err)
+			}
+			if close {
+				break
+			}
+			if i == 8192-1 {
+				return fmt.Errorf("map too large for FirehosePrincipalRevocation")
+			}
+		}
+	}
+
+	return nil
+}

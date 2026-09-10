@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -367,6 +368,8 @@ func writeFirehoseEvent(response *echo.Response, event store.Event) error {
 	switch event.Kind {
 	case store.EventKindRevocation:
 		return writeFirehoseRecord(response, *event.Revocation)
+	case store.EventKindPrincipalRevocation:
+		return writeFirehosePrincipalRevocation(response, *event.PrincipalRevocation)
 	default:
 		return fmt.Errorf("unsupported firehose event kind %q", event.Kind)
 	}
@@ -377,7 +380,7 @@ func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord)
 	for i, delegation := range record.Path {
 		path[i] = delegation.Link()
 	}
-	data, err := encodeFirehoseEvent(api.FirehoseRevocation{
+	data, err := encodeFirehoseEvent(&api.FirehoseRevocation{
 		Revoke:     record.Revoke,
 		Path:       path,
 		Cause:      record.Cause.Link(),
@@ -386,8 +389,25 @@ func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(response, "id: %s\nevent: revocation\ndata: %s\n\n", record.Cause.Link(), data); err != nil {
+	if _, err := fmt.Fprintf(response, "id: %s\nevent: %s\ndata: %s\n\n", record.Cause.Link(), store.EventKindRevocation, data); err != nil {
 		return fmt.Errorf("writing revocation event: %w", err)
+	}
+	response.Flush()
+	return nil
+}
+
+func writeFirehosePrincipalRevocation(response *echo.Response, record store.PrincipalRevocationRecord) error {
+	data, err := encodeFirehoseEvent(&api.FirehosePrincipalRevocation{
+		Tenant:     record.Tenant,
+		Principal:  record.Principal,
+		Cause:      record.Cause.Link(),
+		RecordedAt: jsg.DagJsonTime(record.RecordedAt),
+	})
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(response, "id: %s\nevent: %s\ndata: %s\n\n", record.Cause.Link(), store.EventKindPrincipalRevocation, data); err != nil {
+		return fmt.Errorf("writing principal event: %w", err)
 	}
 	response.Flush()
 	return nil
@@ -419,7 +439,12 @@ func encodeRevocationRecord(record store.RevocationRecord) ([]byte, error) {
 	return data.Bytes(), nil
 }
 
-func encodeFirehoseEvent(event api.FirehoseRevocation) ([]byte, error) {
+// dagJSONMarshaler is implemented by the generated firehose record types.
+type dagJSONMarshaler interface {
+	MarshalDagJSON(w io.Writer) error
+}
+
+func encodeFirehoseEvent(event dagJSONMarshaler) ([]byte, error) {
 	var data bytes.Buffer
 	if err := event.MarshalDagJSON(&data); err != nil {
 		return nil, fmt.Errorf("encoding firehose record as DAG-JSON: %w", err)
