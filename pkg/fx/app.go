@@ -312,7 +312,7 @@ func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
 		response.Header().Set(echo.HeaderConnection, "keep-alive")
 		response.WriteHeader(http.StatusOK)
 
-		for record, err := range revocations.Stream(c.Request().Context(), from) {
+		for event, err := range revocations.Stream(c.Request().Context(), from) {
 			if err != nil {
 				if errors.Is(err, context.Canceled) {
 					return nil
@@ -320,7 +320,7 @@ func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
 				writeFirehoseError(response, err)
 				return nil
 			}
-			if err := writeFirehoseRecord(response, record); err != nil {
+			if err := writeFirehoseEvent(response, event); err != nil {
 				return err
 			}
 		}
@@ -359,6 +359,17 @@ func parseFrom(value string) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("invalid from timestamp: %w", err)
 	}
 	return from, nil
+}
+
+// writeFirehoseEvent writes one server-sent event for a streamed store event.
+// Event kinds without a wire representation are an error.
+func writeFirehoseEvent(response *echo.Response, event store.Event) error {
+	switch event.Kind {
+	case store.EventKindRevocation:
+		return writeFirehoseRecord(response, *event.Revocation)
+	default:
+		return fmt.Errorf("unsupported firehose event kind %q", event.Kind)
+	}
 }
 
 func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord) error {

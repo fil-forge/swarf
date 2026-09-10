@@ -102,9 +102,9 @@ func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecor
 	return record, nil
 }
 
-// Stream returns matching revocation records and remains open until ctx is canceled.
-func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
+// Stream returns matching records as events and remains open until ctx is canceled.
+func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Event, error] {
+	return func(yield func(store.Event, error) bool) {
 		ticker := time.NewTicker(streamPollInterval)
 		defer ticker.Stop()
 
@@ -119,29 +119,32 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 		seen := map[cid.Cid]time.Time{}
 		for {
 			if err := ctx.Err(); err != nil {
-				yield(store.RevocationRecord{}, err)
+				yield(store.Event{}, err)
 				return
 			}
 
 			// The horizon is read before the rows so it never overtakes them.
 			var dbNow time.Time
 			if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("reading database clock: %w", err))
+				yield(store.Event{}, fmt.Errorf("reading database clock: %w", err))
 				return
 			}
 			for rec, err := range s.recordsFrom(ctx, cursor) {
 				if err != nil {
-					yield(store.RevocationRecord{}, err)
+					yield(store.Event{}, err)
 					return
 				}
-				link := rec.Cause.Link()
+				link := rec.Cause().Link()
 				if _, ok := seen[link]; ok {
 					continue
 				}
+				// Read before yielding: the consumer may retain and mutate
+				// the event it is handed.
+				recordedAt := rec.RecordedAt()
 				if !yield(rec, nil) {
 					return
 				}
-				seen[link] = rec.RecordedAt
+				seen[link] = recordedAt
 			}
 			if horizon := dbNow.Add(-streamSettleWindow); horizon.After(cursor) {
 				cursor = horizon
@@ -154,7 +157,7 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 
 			select {
 			case <-ctx.Done():
-				yield(store.RevocationRecord{}, ctx.Err())
+				yield(store.Event{}, ctx.Err())
 				return
 			case <-ticker.C:
 			}
@@ -162,8 +165,8 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 	}
 }
 
-func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
+func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[store.Event, error] {
+	return func(yield func(store.Event, error) bool) {
 		// The query is inclusive at the cursor: each poll re-reads the
 		// unsettled window and Stream skips rows it already yielded. The
 		// zero cursor predates every record, so an unbounded stream matches
@@ -177,7 +180,7 @@ func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[sto
 			cursor,
 		)
 		if err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("querying revocations: %w", err))
+			yield(store.Event{}, fmt.Errorf("querying revocations: %w", err))
 			return
 		}
 		defer rows.Close()
@@ -188,20 +191,20 @@ func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[sto
 			var pathWitness [][]byte
 			var recordedAt time.Time
 			if err := rows.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("scanning revocation: %w", err))
+				yield(store.Event{}, fmt.Errorf("scanning revocation: %w", err))
 				return
 			}
 			record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
 			if err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err))
+				yield(store.Event{}, fmt.Errorf("decoding revocation: %w", err))
 				return
 			}
-			if !yield(record, nil) {
+			if !yield(store.RevocationEvent(record), nil) {
 				return
 			}
 		}
 		if err := rows.Err(); err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("iterating revocations: %w", err))
+			yield(store.Event{}, fmt.Errorf("iterating revocations: %w", err))
 		}
 	}
 }

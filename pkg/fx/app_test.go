@@ -230,9 +230,9 @@ func (s *firehoseTestStore) Get(context.Context, cid.Cid) (store.RevocationRecor
 	return s.record, nil
 }
 
-func (s *firehoseTestStore) Stream(_ context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
+func (s *firehoseTestStore) Stream(_ context.Context, from time.Time) iter.Seq2[store.Event, error] {
 	s.from = from
-	return func(yield func(store.RevocationRecord, error) bool) {
-		yield(s.record, nil)
+	return func(yield func(store.Event, error) bool) {
+		yield(store.RevocationEvent(s.record), nil)
 	}
 }

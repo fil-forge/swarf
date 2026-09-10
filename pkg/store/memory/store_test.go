@@ -57,12 +57,12 @@ func TestMemoryRevocationStoreStream(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	records, done := collectStream(s.Stream(ctx, time.Time{}))
-	require.Equal(t, firstRevocation.Link(), (<-records).Cause.Link())
-	require.Equal(t, secondRevocation.Link(), (<-records).Cause.Link())
+	require.Equal(t, firstRevocation.Link(), (<-records).Cause().Link())
+	require.Equal(t, secondRevocation.Link(), (<-records).Cause().Link())
 
 	thirdRevocation, thirdPath := revocationPath(t)
 	add(t, s, thirdRevocation, thirdPath)
-	require.Equal(t, thirdRevocation.Link(), (<-records).Cause.Link())
+	require.Equal(t, thirdRevocation.Link(), (<-records).Cause().Link())
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 
@@ -70,11 +70,36 @@ func TestMemoryRevocationStoreStream(t *testing.T) {
 	// re-delivered.
 	filteredCtx, filteredCancel := context.WithCancel(context.Background())
 	filtered, filteredDone := collectStream(s.Stream(filteredCtx, first.RecordedAt))
-	require.Equal(t, firstRevocation.Link(), (<-filtered).Cause.Link())
-	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause.Link())
-	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause.Link())
+	require.Equal(t, firstRevocation.Link(), (<-filtered).Cause().Link())
+	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause().Link())
+	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause().Link())
 	filteredCancel()
 	require.ErrorIs(t, <-filteredDone, context.Canceled)
+}
+
+func TestMemoryRevocationStoreStreamEvents(t *testing.T) {
+	s := memory.New()
+	revocation, path := revocationPath(t)
+	add(t, s, revocation, path)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events, done := collectStream(s.Stream(ctx, time.Time{}))
+	event := <-events
+	require.Equal(t, store.EventKindRevocation, event.Kind)
+	require.Nil(t, event.PrincipalRevocation)
+	require.NotNil(t, event.Revocation)
+	require.Equal(t, path[len(path)-1].Link(), event.Revocation.Revoke)
+	require.Equal(t, revocation.Link(), event.Revocation.Cause.Link())
+	require.Len(t, event.Revocation.Path, len(path))
+	require.False(t, event.Revocation.RecordedAt.IsZero())
+
+	// Streamed records are copies: mutating one does not affect the store.
+	event.Revocation.Path[0] = nil
+	again, err := s.Get(context.Background(), path[len(path)-1].Link())
+	require.NoError(t, err)
+	require.NotNil(t, again.Path[0])
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
 }
 
 func TestMemoryRevocationStoreStreamBroadcasts(t *testing.T) {
@@ -91,8 +116,8 @@ func TestMemoryRevocationStoreStreamBroadcasts(t *testing.T) {
 
 	revocation, path := revocationPath(t)
 	add(t, s, revocation, path)
-	require.Equal(t, revocation.Link(), (<-firstRecords).Cause.Link())
-	require.Equal(t, revocation.Link(), (<-secondRecords).Cause.Link())
+	require.Equal(t, revocation.Link(), (<-firstRecords).Cause().Link())
+	require.Equal(t, revocation.Link(), (<-secondRecords).Cause().Link())
 
 	firstCancel()
 	secondCancel()
@@ -114,6 +139,44 @@ func TestMemoryRevocationStoreStreamCanceled(t *testing.T) {
 	require.Fail(t, "Stream did not return context.Canceled")
 }
 
+func TestMemoryRevocationStoreAddIgnoresRetriedRevocation(t *testing.T) {
+	s := memory.New()
+	revocation, path := revocationPath(t)
+	add(t, s, revocation, path)
+	add(t, s, revocation, path)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events, done := collectStream(s.Stream(ctx, time.Time{}))
+	require.Equal(t, revocation.Link(), (<-events).Cause().Link())
+	select {
+	case event := <-events:
+		require.Fail(t, "retried revocation streamed twice", event.Cause().Link())
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestMemoryRevocationStoreAddSecondRevocationOfDelegation(t *testing.T) {
+	s := memory.New()
+	firstRevocation, path := revocationPath(t)
+	// A second revocation of the same delegation, by a different invocation.
+	secondRevocation, _ := revocationPath(t)
+	add(t, s, firstRevocation, path)
+	add(t, s, secondRevocation, path)
+
+	record, err := s.Get(context.Background(), path[len(path)-1].Link())
+	require.NoError(t, err)
+	require.Equal(t, secondRevocation.Link(), record.Cause.Link())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events, done := collectStream(s.Stream(ctx, time.Time{}))
+	require.Equal(t, firstRevocation.Link(), (<-events).Cause().Link())
+	require.Equal(t, secondRevocation.Link(), (<-events).Cause().Link())
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
 func TestMemoryRevocationStoreAddRejectsInvalidPath(t *testing.T) {
 	err := memory.New().Add(context.Background(), nil, nil)
 	require.Error(t, err)
@@ -124,8 +187,8 @@ func add(t *testing.T, s store.RevocationStore, revocation ucan.Invocation, path
 	require.NoError(t, s.Add(context.Background(), revocation, path))
 }
 
-func collectStream(stream iter.Seq2[store.RevocationRecord, error]) (<-chan store.RevocationRecord, <-chan error) {
-	records := make(chan store.RevocationRecord)
+func collectStream(stream iter.Seq2[store.Event, error]) (<-chan store.Event, <-chan error) {
+	records := make(chan store.Event)
 	done := make(chan error, 1)
 	go func() {
 		for record, err := range stream {

@@ -60,12 +60,12 @@ func TestPostgresRevocationStoreStream(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	records, done := collectStream(s.Stream(ctx, time.Time{}))
-	require.Equal(t, firstRevocation.Link(), (<-records).Cause.Link())
-	require.Equal(t, secondRevocation.Link(), (<-records).Cause.Link())
+	require.Equal(t, firstRevocation.Link(), (<-records).Cause().Link())
+	require.Equal(t, secondRevocation.Link(), (<-records).Cause().Link())
 
 	thirdRevocation, thirdPath := revocationPath(t)
 	add(t, s, thirdRevocation, thirdPath)
-	require.Equal(t, thirdRevocation.Link(), (<-records).Cause.Link())
+	require.Equal(t, thirdRevocation.Link(), (<-records).Cause().Link())
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 
@@ -73,11 +73,30 @@ func TestPostgresRevocationStoreStream(t *testing.T) {
 	// re-delivered.
 	filteredCtx, filteredCancel := context.WithCancel(context.Background())
 	filtered, filteredDone := collectStream(s.Stream(filteredCtx, first.RecordedAt))
-	require.Equal(t, firstRevocation.Link(), (<-filtered).Cause.Link())
-	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause.Link())
-	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause.Link())
+	require.Equal(t, firstRevocation.Link(), (<-filtered).Cause().Link())
+	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause().Link())
+	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause().Link())
 	filteredCancel()
 	require.ErrorIs(t, <-filteredDone, context.Canceled)
+}
+
+func TestPostgresRevocationStoreStreamEvents(t *testing.T) {
+	s, _ := newTestStore(t)
+	revocation, path := revocationPath(t)
+	add(t, s, revocation, path)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events, done := collectStream(s.Stream(ctx, time.Time{}))
+	event := <-events
+	require.Equal(t, store.EventKindRevocation, event.Kind)
+	require.Nil(t, event.PrincipalRevocation)
+	require.NotNil(t, event.Revocation)
+	require.Equal(t, path[len(path)-1].Link(), event.Revocation.Revoke)
+	require.Equal(t, revocation.Link(), event.Revocation.Cause.Link())
+	require.Len(t, event.Revocation.Path, len(path))
+	require.False(t, event.Revocation.RecordedAt.IsZero())
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
 }
 
 func TestPostgresRevocationStoreStreamSameTimestamp(t *testing.T) {
@@ -95,8 +114,8 @@ func TestPostgresRevocationStoreStreamSameTimestamp(t *testing.T) {
 	// Records sharing recorded_at are ordered by id, so delivery order is not
 	// deterministic: both must arrive, exactly once each.
 	delivered := map[string]int{}
-	delivered[(<-records).Cause.Link().String()]++
-	delivered[(<-records).Cause.Link().String()]++
+	delivered[(<-records).Cause().Link().String()]++
+	delivered[(<-records).Cause().Link().String()]++
 	require.Equal(t, 1, delivered[firstRevocation.Link().String()])
 	require.Equal(t, 1, delivered[secondRevocation.Link().String()])
 
@@ -104,7 +123,7 @@ func TestPostgresRevocationStoreStreamSameTimestamp(t *testing.T) {
 	// timestamp must not be re-delivered.
 	select {
 	case record := <-records:
-		require.Failf(t, "stream re-delivered a record", "cause: %s", record.Cause.Link())
+		require.Failf(t, "stream re-delivered a record", "cause: %s", record.Cause().Link())
 	case <-time.After(2 * time.Second):
 	}
 	cancel()
@@ -120,7 +139,7 @@ func TestPostgresRevocationStoreStreamLateArrivals(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	records, done := collectStream(s.Stream(ctx, time.Time{}))
-	require.Equal(t, firstRevocation.Link(), (<-records).Cause.Link())
+	require.Equal(t, firstRevocation.Link(), (<-records).Cause().Link())
 
 	// A concurrent insert can commit a row at a timestamp the stream has
 	// already passed: sharing the first record's recorded_at, or earlier.
@@ -131,15 +150,15 @@ func TestPostgresRevocationStoreStreamLateArrivals(t *testing.T) {
 	insertAt(t, pool, earlierRevocation, earlierPath, recordedAt.Add(-time.Second))
 
 	delivered := map[string]int{}
-	delivered[(<-records).Cause.Link().String()]++
-	delivered[(<-records).Cause.Link().String()]++
+	delivered[(<-records).Cause().Link().String()]++
+	delivered[(<-records).Cause().Link().String()]++
 	require.Equal(t, 1, delivered[sameTsRevocation.Link().String()])
 	require.Equal(t, 1, delivered[earlierRevocation.Link().String()])
 
 	// Hold the stream open past a poll interval: nothing is re-delivered.
 	select {
 	case record := <-records:
-		require.Failf(t, "stream re-delivered a record", "cause: %s", record.Cause.Link())
+		require.Failf(t, "stream re-delivered a record", "cause: %s", record.Cause().Link())
 	case <-time.After(2 * time.Second):
 	}
 	cancel()
@@ -160,8 +179,8 @@ func TestPostgresRevocationStoreStreamBroadcasts(t *testing.T) {
 
 	revocation, path := revocationPath(t)
 	add(t, s, revocation, path)
-	require.Equal(t, revocation.Link(), (<-firstRecords).Cause.Link())
-	require.Equal(t, revocation.Link(), (<-secondRecords).Cause.Link())
+	require.Equal(t, revocation.Link(), (<-firstRecords).Cause().Link())
+	require.Equal(t, revocation.Link(), (<-secondRecords).Cause().Link())
 
 	firstCancel()
 	secondCancel()
@@ -250,8 +269,8 @@ func insertAt(t *testing.T, pool *pgxpool.Pool, revocation ucan.Invocation, path
 	require.NoError(t, err)
 }
 
-func collectStream(stream iter.Seq2[store.RevocationRecord, error]) (<-chan store.RevocationRecord, <-chan error) {
-	records := make(chan store.RevocationRecord)
+func collectStream(stream iter.Seq2[store.Event, error]) (<-chan store.Event, <-chan error) {
+	records := make(chan store.Event)
 	done := make(chan error, 1)
 	go func() {
 		for record, err := range stream {
