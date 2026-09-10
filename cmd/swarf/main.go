@@ -41,6 +41,7 @@ func main() {
 	serve.Flags().String("storage", "postgres", "storage backend (memory or postgres)")
 	serve.Flags().String("postgres-dsn", "", "Postgres connection string")
 	serve.Flags().Bool("skip-migrations", false, "skip Postgres migrations on startup")
+	serve.Flags().StringSlice("principal-publishers", nil, "DIDs allowed to publish principal invalidations")
 	root.PersistentFlags().StringVarP(&configFile, "config", "c", "", "configuration file path")
 	root.AddCommand(serve)
 	root.AddCommand(newRevokeCommand())

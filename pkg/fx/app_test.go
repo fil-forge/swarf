@@ -11,9 +11,11 @@ import (
 	"testing"
 	"time"
 
+	principalcmd "github.com/fil-forge/libforge/commands/principal"
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/swarf/pkg/api"
+	"github.com/fil-forge/swarf/pkg/config"
 	"github.com/fil-forge/swarf/pkg/store"
 	"github.com/fil-forge/swarf/pkg/store/memory"
 	"github.com/fil-forge/ucantone/client"
@@ -31,6 +33,7 @@ import (
 	"github.com/ipfs/go-cid"
 	"github.com/labstack/echo/v4"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func TestEchoPublicRoutes(t *testing.T) {
@@ -364,4 +367,104 @@ func (s *firehoseTestStore) Stream(_ context.Context, from time.Time) iter.Seq2[
 			}
 		}
 	}
+}
+
+func TestInvalidateRoute(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	hilt, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	stranger, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	tenant, err := did.Parse("did:plc:tenant")
+	require.NoError(t, err)
+
+	invalidate := func(records store.RevocationStore, publishers map[did.DID]struct{}, issuer ucan.Issuer) (cid.Cid, error) {
+		didResolver := resolver.ByMethod{"key": key.Resolver}
+		srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
+		route := invalidateRoute(records, publishers)
+		srv.Handle(route.Command, route.Handler)
+		serviceURL, err := url.Parse("http://swarf.test")
+		require.NoError(t, err)
+		executor, err := client.NewHTTP(serviceURL, client.WithHTTPClient(&http.Client{Transport: srv}))
+		require.NoError(t, err)
+
+		invalidation, err := principalcmd.Invalidate.Invoke(
+			issuer,
+			issuer.DID(),
+			&principalcmd.InvalidateArguments{Tenant: tenant, Principal: "8f2c"},
+			invocation.WithAudience(service.DID()),
+			invocation.WithNoNonce(),
+			invocation.WithNoExpiration(),
+		)
+		require.NoError(t, err)
+		response, err := executor.Execute(execution.NewRequest(t.Context(), invalidation))
+		if err != nil {
+			return cid.Undef, err
+		}
+		if _, err := principalcmd.Invalidate.Unpack(response.Receipt()); err != nil {
+			return cid.Undef, err
+		}
+		return invalidation.Link(), nil
+	}
+
+	// An allowlisted publisher self-signs the invalidation and it is stored.
+	records := memory.New()
+	publishers := map[did.DID]struct{}{hilt.DID(): {}}
+	cause, err := invalidate(records, publishers, hilt)
+	require.NoError(t, err)
+	stored := principalRevocationRecords(t, records)
+	require.Len(t, stored, 1)
+	require.Equal(t, tenant, stored[0].Tenant)
+	require.Equal(t, "8f2c", stored[0].Principal)
+	require.Equal(t, cause, stored[0].Cause.Link())
+
+	// Any other issuer is refused and nothing is stored.
+	records = memory.New()
+	_, err = invalidate(records, publishers, stranger)
+	require.Error(t, err)
+	require.Empty(t, principalRevocationRecords(t, records))
+
+	// An empty publisher list refuses every invalidation.
+	records = memory.New()
+	_, err = invalidate(records, map[did.DID]struct{}{}, hilt)
+	require.Error(t, err)
+	require.Empty(t, principalRevocationRecords(t, records))
+}
+
+// principalRevocationRecords drains the principal revocation records the
+// store holds.
+func principalRevocationRecords(t *testing.T, records store.RevocationStore) []store.PrincipalRevocationRecord {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+	var stored []store.PrincipalRevocationRecord
+	for event, err := range records.Stream(ctx, time.Time{}) {
+		if err != nil {
+			break
+		}
+		if event.PrincipalRevocation != nil {
+			stored = append(stored, *event.PrincipalRevocation)
+		}
+	}
+	return stored
+}
+
+func TestNewPrincipalPublishers(t *testing.T) {
+	publishers, err := newPrincipalPublishers(&config.Config{
+		Principal: config.PrincipalConfig{Publishers: []string{"did:web:auth.example.com"}},
+	}, zap.NewNop())
+	require.NoError(t, err)
+	publisher, err := did.Parse("did:web:auth.example.com")
+	require.NoError(t, err)
+	require.Contains(t, publishers, publisher)
+
+	empty, err := newPrincipalPublishers(&config.Config{}, zap.NewNop())
+	require.NoError(t, err)
+	require.Empty(t, empty)
+
+	_, err = newPrincipalPublishers(&config.Config{
+		Principal: config.PrincipalConfig{Publishers: []string{"not-a-did"}},
+	}, zap.NewNop())
+	require.Error(t, err)
 }

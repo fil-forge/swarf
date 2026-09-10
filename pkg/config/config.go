@@ -19,11 +19,12 @@ const (
 const DefaultPLCDirectory = "https://plc.directory"
 
 type Config struct {
-	Identity IdentityConfig `mapstructure:"identity"`
-	Server   ServerConfig   `mapstructure:"server"`
-	Log      LogConfig      `mapstructure:"log"`
-	Storage  StorageConfig  `mapstructure:"storage"`
-	PLC      PLCConfig      `mapstructure:"plc"`
+	Identity  IdentityConfig  `mapstructure:"identity"`
+	Server    ServerConfig    `mapstructure:"server"`
+	Log       LogConfig       `mapstructure:"log"`
+	Storage   StorageConfig   `mapstructure:"storage"`
+	PLC       PLCConfig       `mapstructure:"plc"`
+	Principal PrincipalConfig `mapstructure:"principal"`
 }
 
 type IdentityConfig struct {
@@ -42,6 +43,14 @@ type PLCConfig struct {
 	// Directory is the did:plc directory endpoint used to resolve did:plc
 	// DIDs, e.g. "https://plc.directory".
 	Directory string `mapstructure:"directory"`
+}
+
+// PrincipalConfig holds settings for principal invalidations.
+type PrincipalConfig struct {
+	// Publishers are the DIDs allowed to invoke /principal/invalidate. It
+	// holds the service identities of the Hilt deployments Swarf serves.
+	// An empty list refuses every invalidation.
+	Publishers []string `mapstructure:"publishers"`
 }
 
 type LogConfig struct {
@@ -71,6 +80,7 @@ var flagBindings = map[string]string{
 	"storage.type":                     "storage",
 	"storage.postgres.dsn":             "postgres-dsn",
 	"storage.postgres.skip_migrations": "skip-migrations",
+	"principal.publishers":             "principal-publishers",
 }
 
 func Load(configFile string, flags *pflag.FlagSet) (*Config, error) {

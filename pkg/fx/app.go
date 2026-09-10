@@ -15,6 +15,7 @@ import (
 	"time"
 
 	jsg "github.com/alanshaw/dag-json-gen"
+	principalcmd "github.com/fil-forge/libforge/commands/principal"
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/swarf/pkg/api"
@@ -50,7 +51,7 @@ import (
 func AppModule(cfg *config.Config) fx.Option {
 	opts := []fx.Option{
 		fx.Supply(cfg),
-		fx.Provide(newLogger, newIdentity, newUCANServer, newEchoServer),
+		fx.Provide(newLogger, newIdentity, newPrincipalPublishers, newUCANServer, newEchoServer),
 		fx.Invoke(registerServerLifecycle),
 	}
 	switch cfg.Storage.Type {
@@ -77,6 +78,27 @@ func newIdentity(cfg *config.Config) (identity.Identity, error) {
 		return identity.New("", cfg.Identity.ServiceID)
 	}
 	return identity.NewFromPEMFileWithDID(cfg.Identity.KeyFile, cfg.Identity.ServiceID)
+}
+
+// principalPublishers is the set of DIDs allowed to invoke
+// /principal/invalidate.
+type principalPublishers map[did.DID]struct{}
+
+// newPrincipalPublishers parses the configured publisher DIDs. A malformed
+// DID fails startup; an empty list is allowed and refuses every invalidation.
+func newPrincipalPublishers(cfg *config.Config, log *zap.Logger) (principalPublishers, error) {
+	publishers := make(principalPublishers, len(cfg.Principal.Publishers))
+	for _, value := range cfg.Principal.Publishers {
+		publisher, err := did.Parse(value)
+		if err != nil {
+			return nil, fmt.Errorf("parsing principal publisher %q: %w", value, err)
+		}
+		publishers[publisher] = struct{}{}
+	}
+	if len(publishers) == 0 {
+		log.Warn("no principal invalidation publishers configured: every /principal/invalidate will be refused")
+	}
+	return publishers, nil
 }
 
 func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStore, error) {
@@ -114,14 +136,18 @@ func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStor
 	return pgstore.New(pool), nil
 }
 
-func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.RevocationStore) (*server.HTTPServer, error) {
+func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.RevocationStore, publishers principalPublishers) (*server.HTTPServer, error) {
 	didResolver, err := newDIDResolver(id, cfg.Server.InsecureDIDResolution, cfg.PLC.Directory)
 	if err != nil {
 		return nil, err
 	}
 	srv := server.NewHTTP(id, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	route := revokeRoute(revocations, didResolver)
-	srv.Handle(route.Command, route.Handler)
+	for _, route := range []server.Route{
+		revokeRoute(revocations, didResolver),
+		invalidateRoute(revocations, publishers),
+	} {
+		srv.Handle(route.Command, route.Handler)
+	}
 	return srv, nil
 }
 
@@ -213,6 +239,23 @@ func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMetho
 			return fmt.Errorf("adding revocation: %w", err)
 		}
 		return res.SetSuccess(&ucancmd.RevokeOK{})
+	})
+}
+
+// invalidateRoute handles /principal/invalidate. No delegation names a
+// principal, so there is no proof chain to check: the invocation is
+// self-signed by its issuer and the publisher set is the authorization.
+func invalidateRoute(records store.RevocationStore, publishers map[did.DID]struct{}) server.Route {
+	return principalcmd.Invalidate.Route(func(req *binding.Request[*principalcmd.InvalidateArguments], res *binding.Response[*principalcmd.InvalidateOK]) error {
+		issuer := req.Invocation().Issuer()
+		if _, ok := publishers[issuer]; !ok {
+			return fmt.Errorf("issuer %s may not publish principal invalidations", issuer)
+		}
+		args := req.Task().Arguments()
+		if err := records.AddPrincipalRevocation(req.Context(), req.Invocation(), args.Tenant, args.Principal); err != nil {
+			return fmt.Errorf("adding principal invalidation: %w", err)
+		}
+		return res.SetSuccess(&principalcmd.InvalidateOK{})
 	})
 }
 
