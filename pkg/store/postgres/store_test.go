@@ -298,3 +298,141 @@ func revocationPath(t *testing.T) (ucan.Invocation, []ucan.Delegation) {
 	require.NoError(t, err)
 	return revocation, []ucan.Delegation{delegation}
 }
+
+func TestPostgresPrincipalStoreStreamInterleaved(t *testing.T) {
+	s, _ := newTestStore(t)
+	firstRevocation, firstPath := revocationPath(t)
+	add(t, s, firstRevocation, firstPath)
+	invalidation, tenant, principal := principalInvalidation(t)
+	addPrincipalRevocation(t, s, invalidation, tenant, principal)
+	secondRevocation, secondPath := revocationPath(t)
+	add(t, s, secondRevocation, secondPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events, done := collectStream(s.Stream(ctx, time.Time{}))
+
+	// Both kinds share one stream, ordered by recorded_at.
+	event := <-events
+	require.Equal(t, store.EventKindRevocation, event.Kind)
+	require.Equal(t, firstRevocation.Link(), event.Cause().Link())
+
+	event = <-events
+	require.Equal(t, store.EventKindPrincipalRevocation, event.Kind)
+	require.Nil(t, event.Revocation)
+	require.NotNil(t, event.PrincipalRevocation)
+	require.Equal(t, tenant, event.PrincipalRevocation.Tenant)
+	require.Equal(t, principal, event.PrincipalRevocation.Principal)
+	require.Equal(t, invalidation.Link(), event.PrincipalRevocation.Cause.Link())
+	require.False(t, event.PrincipalRevocation.RecordedAt.IsZero())
+	require.Equal(t, invalidation.Link(), event.Cause().Link())
+	require.True(t, event.RecordedAt().Equal(event.PrincipalRevocation.RecordedAt))
+
+	event = <-events
+	require.Equal(t, store.EventKindRevocation, event.Kind)
+	require.Equal(t, secondRevocation.Link(), event.Cause().Link())
+
+	// A principal invalidation stored while streaming is picked up by the
+	// next poll.
+	liveInvalidation, liveTenant, livePrincipal := principalInvalidation(t)
+	addPrincipalRevocation(t, s, liveInvalidation, liveTenant, livePrincipal)
+	event = <-events
+	require.Equal(t, store.EventKindPrincipalRevocation, event.Kind)
+	require.Equal(t, liveInvalidation.Link(), event.Cause().Link())
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	// Principal records do not affect revocation lookup.
+	record, err := s.Get(context.Background(), firstPath[len(firstPath)-1].Link())
+	require.NoError(t, err)
+	require.Equal(t, firstRevocation.Link(), record.Cause.Link())
+}
+
+func TestPostgresPrincipalStoreStreamLateArrivals(t *testing.T) {
+	s, pool := newTestStore(t)
+	recordedAt := time.Now().UTC().Truncate(time.Microsecond)
+
+	revocation, path := revocationPath(t)
+	insertAt(t, pool, revocation, path, recordedAt)
+	invalidation, tenant, principal := principalInvalidation(t)
+	insertPrincipalAt(t, pool, invalidation, tenant, principal, recordedAt)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	events, done := collectStream(s.Stream(ctx, recordedAt))
+
+	// Records of both kinds sharing recorded_at are ordered by id, so
+	// delivery order is not deterministic: both must arrive, exactly once.
+	delivered := map[string]int{}
+	delivered[(<-events).Cause().Link().String()]++
+	delivered[(<-events).Cause().Link().String()]++
+	require.Equal(t, 1, delivered[revocation.Link().String()])
+	require.Equal(t, 1, delivered[invalidation.Link().String()])
+
+	// A principal invalidation committing at a timestamp the stream has
+	// already passed is still delivered, exactly once.
+	lateInvalidation, lateTenant, latePrincipal := principalInvalidation(t)
+	insertPrincipalAt(t, pool, lateInvalidation, lateTenant, latePrincipal, recordedAt)
+	event := <-events
+	require.Equal(t, store.EventKindPrincipalRevocation, event.Kind)
+	require.Equal(t, lateInvalidation.Link(), event.Cause().Link())
+
+	// Hold the stream open past a poll interval: rows in the unsettled window
+	// are re-read but not re-delivered.
+	select {
+	case event := <-events:
+		require.Failf(t, "stream re-delivered a record", "cause: %s", event.Cause().Link())
+	case <-time.After(2 * time.Second):
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func TestPostgresPrincipalStoreAddRejectsInvalid(t *testing.T) {
+	s := postgres.New(nil)
+	invalidation, tenant, principal := principalInvalidation(t)
+
+	require.Error(t, s.AddPrincipalRevocation(context.Background(), invalidation, did.Undef, principal))
+	require.Error(t, s.AddPrincipalRevocation(context.Background(), invalidation, tenant, ""))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	require.ErrorIs(t, s.AddPrincipalRevocation(ctx, invalidation, tenant, principal), context.Canceled)
+}
+
+func addPrincipalRevocation(t *testing.T, s store.RevocationStore, invalidation ucan.Invocation, tenant did.DID, principal string) {
+	t.Helper()
+	require.NoError(t, s.AddPrincipalRevocation(context.Background(), invalidation, tenant, principal))
+}
+
+// insertPrincipalAt stores a principal invalidation like
+// AddPrincipalRevocation, but with an explicit recorded_at instead of the
+// column default.
+func insertPrincipalAt(t *testing.T, pool *pgxpool.Pool, invalidation ucan.Invocation, tenant did.DID, principal string, recordedAt time.Time) {
+	t.Helper()
+	invalidationBytes, err := invocation.Encode(invalidation)
+	require.NoError(t, err)
+	_, err = pool.Exec(
+		context.Background(),
+		`INSERT INTO principal_invalidation (id, cause, tenant, principal, recorded_at)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		invalidation.Link().String(),
+		invalidationBytes,
+		tenant.String(),
+		principal,
+		recordedAt,
+	)
+	require.NoError(t, err)
+}
+
+func principalInvalidation(t *testing.T) (ucan.Invocation, did.DID, string) {
+	t.Helper()
+
+	issuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cmd, err := command.Parse("/test/invalidate")
+	require.NoError(t, err)
+	invalidation, err := invocation.Invoke(issuer, did.Undef, cmd, nil)
+	require.NoError(t, err)
+	tenant, err := did.Parse("did:plc:" + issuer.DID().Identifier())
+	require.NoError(t, err)
+	return invalidation, tenant, "principal-" + invalidation.Link().String()[:8]
+}

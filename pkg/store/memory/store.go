@@ -10,11 +10,12 @@ import (
 	"time"
 
 	"github.com/fil-forge/swarf/pkg/store"
+	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/ipfs/go-cid"
 )
 
-// Store stores revocation records in process memory.
+// Store stores revocation and principal invalidation records in process memory.
 type Store struct {
 	mu sync.RWMutex
 	// records indexes the latest revocation record by revoked delegation for Get.
@@ -74,6 +75,31 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 	}
 	s.records[record.Revoke] = record
 	s.appendLocked(store.RevocationEvent(record))
+	return nil
+}
+
+// AddPrincipalRevocation stores a principal invalidation record.
+func (s *Store) AddPrincipalRevocation(ctx context.Context, invalidation ucan.Invocation, tenant did.DID, principal string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !tenant.Defined() {
+		return errors.New("principal invalidation tenant must be defined")
+	}
+	if principal == "" {
+		return errors.New("principal invalidation principal must not be empty")
+	}
+
+	record := store.PrincipalRevocationRecord{
+		Tenant:    tenant,
+		Principal: principal,
+		Cause:     invalidation,
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	record.RecordedAt = time.Now() // under the lock, as in Add
+	s.appendLocked(store.PrincipalRevocationEvent(record))
 	return nil
 }
 

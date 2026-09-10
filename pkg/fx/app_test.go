@@ -226,6 +226,10 @@ func (s *firehoseTestStore) Add(context.Context, ucan.Invocation, []ucan.Delegat
 	return nil
 }
 
+func (s *firehoseTestStore) AddPrincipalRevocation(context.Context, ucan.Invocation, did.DID, string) error {
+	return nil
+}
+
 func (s *firehoseTestStore) Get(context.Context, cid.Cid) (store.RevocationRecord, error) {
 	return s.record, nil
 }

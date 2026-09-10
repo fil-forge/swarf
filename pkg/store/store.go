@@ -102,6 +102,10 @@ type RevocationStore interface {
 	// from the root delegation to the revoked delegation. The issuer of the
 	// revocation must appear as a delegation issuer in the path.
 	Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error
+	// AddPrincipalRevocation adds a principal invalidation record to the store.
+	// The invalidation is the invocation that voids every proof cached for the
+	// principal's keys; tenant must be defined and principal must not be empty.
+	AddPrincipalRevocation(ctx context.Context, invalidation ucan.Invocation, tenant did.DID, principal string) error
 	// Get retrieves a revocation record from the store by revoked delegation CID.
 	// If the record is not found, [ErrNotFound] is returned.
 	Get(ctx context.Context, revoked cid.Cid) (RevocationRecord, error)
