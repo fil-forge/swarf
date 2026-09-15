@@ -141,7 +141,9 @@ for event, err := range client.Stream(ctx, time.Time{}) {
 
 `Publish` self-signs the revocation invocation with the passed revoker, which
 must be the issuer of the revoked delegation or appear as an issuer in the
-witness path provided with `WithWitnessPath`. `Get` returns a full
+witness path provided with `WithWitnessPath`. Swarf records one revocation per
+invocation CID and ignores a repeat, so pass `WithNonce` to make a second
+revocation of the same delegation a new record. `Get` returns a full
 `store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
 values.
 

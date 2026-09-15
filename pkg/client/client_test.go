@@ -46,12 +46,16 @@ func TestPublish(t *testing.T) {
 	require.NoError(t, err)
 
 	var gotIssuer did.DID
+	var gotCause cid.Cid
+	var gotNonce []byte
 	var gotArgs *ucancmd.RevokeArguments
 	var gotWitnesses []cid.Cid
 	srv := server.NewHTTP(service)
 	srv.Handle(ucancmd.Revoke.Command, ucancmd.Revoke.Handler(
 		func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
 			gotIssuer = req.Invocation().Issuer()
+			gotCause = req.Invocation().Link()
+			gotNonce = req.Invocation().Nonce()
 			gotArgs = req.Task().Arguments()
 			for _, dlg := range req.Metadata().Delegations() {
 				gotWitnesses = append(gotWitnesses, dlg.Link())
@@ -88,6 +92,25 @@ func TestPublish(t *testing.T) {
 		require.NoError(t, client.Publish(context.Background(), alice, target, WithWitnessPath(root, target)))
 		require.Equal(t, []cid.Cid{root.Link(), target.Link()}, gotArgs.Path)
 		require.ElementsMatch(t, []cid.Cid{root.Link(), target.Link()}, gotWitnesses)
+	})
+
+	t.Run("gives a repeated revocation a new CID with a nonce", func(t *testing.T) {
+		// Swarf records one revocation per invocation CID and ignores a
+		// repeat, so a nonce is what makes revoking the same delegation
+		// twice a second record.
+		require.NoError(t, client.Publish(context.Background(), bob, target))
+		first := gotCause
+		require.NoError(t, client.Publish(context.Background(), bob, target))
+		require.Equal(t, first, gotCause)
+
+		require.NoError(t, client.Publish(context.Background(), bob, target, WithNonce([]byte("nonce-one"))))
+		nonced := gotCause
+		require.Equal(t, []byte("nonce-one"), gotNonce)
+		require.NotEqual(t, first, nonced)
+
+		require.NoError(t, client.Publish(context.Background(), bob, target, WithNonce([]byte("nonce-two"))))
+		require.Equal(t, []byte("nonce-two"), gotNonce)
+		require.NotEqual(t, nonced, gotCause)
 	})
 
 	t.Run("requires a revoker", func(t *testing.T) {
