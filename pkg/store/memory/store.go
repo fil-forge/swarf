@@ -21,6 +21,7 @@ type Store struct {
 	subscribers    map[uint64]chan struct{}
 	nextSeq        uint64
 	nextSubscriber uint64
+	now            func() time.Time // wall clock; tests substitute it
 }
 
 type memoryRecord struct {
@@ -33,6 +34,7 @@ func New() *Store {
 	return &Store{
 		records:     make(map[cid.Cid]memoryRecord),
 		subscribers: make(map[uint64]chan struct{}),
+		now:         time.Now,
 	}
 }
 
@@ -48,14 +50,19 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 	}
 
 	record := store.RevocationRecord{
-		Revoke:     path[len(path)-1].Link(),
-		Cause:      revocation,
-		Path:       append([]ucan.Delegation(nil), path...),
-		RecordedAt: time.Now(),
+		Revoke: path[len(path)-1].Link(),
+		Cause:  revocation,
+		Path:   append([]ucan.Delegation(nil), path...),
 	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Stamped under the lock so the store's sequence order is its time
+	// order: a streamer that has already yielded a later record never sees
+	// an earlier one arrive behind it, which would send a resuming client's
+	// cursor backwards.
+	record.RecordedAt = s.now()
 
 	if s.records == nil {
 		s.records = make(map[cid.Cid]memoryRecord)
