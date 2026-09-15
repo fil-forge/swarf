@@ -114,6 +114,26 @@ func TestMemoryRevocationStoreStreamCanceled(t *testing.T) {
 	require.Fail(t, "Stream did not return context.Canceled")
 }
 
+func TestMemoryRevocationStoreStreamsInTimeOrder(t *testing.T) {
+	s := memory.New()
+	firstRevocation, firstPath := revocationPath(t)
+	add(t, s, firstRevocation, firstPath)
+	secondRevocation, secondPath := revocationPath(t)
+	add(t, s, secondRevocation, secondPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	records, _ := collectStream(s.Stream(ctx, time.Time{}))
+
+	first := <-records
+	second := <-records
+	require.Equal(t, firstRevocation.Link(), first.Cause.Link())
+	require.Equal(t, secondRevocation.Link(), second.Cause.Link())
+	// The record stored second is never stamped before the one stored first,
+	// so the stream's order is also its time order.
+	require.False(t, second.RecordedAt.Before(first.RecordedAt))
+}
+
 func TestMemoryRevocationStoreAddRejectsInvalidPath(t *testing.T) {
 	err := memory.New().Add(context.Background(), nil, nil)
 	require.Error(t, err)
