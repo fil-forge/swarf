@@ -58,6 +58,7 @@ type PublishOption func(*publishConfig)
 
 type publishConfig struct {
 	witnessPath []ucan.Delegation
+	nonce       []byte
 }
 
 // WithWitnessPath sets the delegation witness path proving the revoker's
@@ -68,6 +69,18 @@ type publishConfig struct {
 func WithWitnessPath(path ...ucan.Delegation) PublishOption {
 	return func(cfg *publishConfig) {
 		cfg.witnessPath = path
+	}
+}
+
+// WithNonce sets the nonce of the revocation invocation. Swarf keys a
+// revocation record by its invocation CID and ignores a repeat, so without a
+// nonce every revocation of one delegation by one revoker has the same CID
+// and only the first is recorded. Pass a fresh nonce when a later revocation
+// of the same delegation must be a new record, as when a delegation is
+// reissued and revoked again. An empty or nil nonce is treated as no nonce.
+func WithNonce(nonce []byte) PublishOption {
+	return func(cfg *publishConfig) {
+		cfg.nonce = nonce
 	}
 }
 
@@ -98,14 +111,16 @@ func (c *Client) Publish(ctx context.Context, revoker ucan.Issuer, revoked ucan.
 			args.Path[i] = delegation.Link()
 		}
 	}
-	invocation, err := ucancmd.Revoke.Invoke(
-		revoker,
-		revoker.DID(),
-		args,
+	opts := []invocation.Option{
 		invocation.WithAudience(c.ServiceID),
-		invocation.WithNoNonce(),
 		invocation.WithNoExpiration(),
-	)
+	}
+	if len(cfg.nonce) > 0 {
+		opts = append(opts, invocation.WithNonce(cfg.nonce))
+	} else {
+		opts = append(opts, invocation.WithNoNonce())
+	}
+	invocation, err := ucancmd.Revoke.Invoke(revoker, revoker.DID(), args, opts...)
 	if err != nil {
 		return fmt.Errorf("creating revoke invocation: %w", err)
 	}
