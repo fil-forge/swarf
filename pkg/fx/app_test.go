@@ -59,6 +59,21 @@ func TestEchoPublicRoutes(t *testing.T) {
 	require.Equal(t, http.StatusOK, response.Code)
 }
 
+// A handler panic must not escape to net/http, which drops the connection
+// without ever writing a response.
+func TestAHandlerPanicBecomesAServerError(t *testing.T) {
+	id, err := identity.New("", "")
+	require.NoError(t, err)
+	e := newEchoServer(id, server.NewHTTP(id), memory.New())
+	e.GET("/panic", func(echo.Context) error { panic("handler exploded") })
+
+	response := httptest.NewRecorder()
+	require.NotPanics(t, func() {
+		e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/panic", nil))
+	})
+	require.Equal(t, http.StatusInternalServerError, response.Code)
+}
+
 func TestParseFrom(t *testing.T) {
 	from, err := parseFrom("0")
 	require.NoError(t, err)
