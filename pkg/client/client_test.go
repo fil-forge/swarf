@@ -3,6 +3,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/server"
+	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
@@ -102,6 +104,68 @@ func TestPublish(t *testing.T) {
 		require.ErrorContains(t, err, "revoked delegation is required")
 	})
 }
+
+func TestPublishBatch(t *testing.T) {
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	alice, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+
+	cmd, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	first, err := delegation.Delegate(alice, bob.DID(), alice.DID(), cmd)
+	require.NoError(t, err)
+	second, err := delegation.Delegate(alice, bob.DID(), alice.DID(), cmd)
+	require.NoError(t, err)
+
+	var requests int
+	var revoked []cid.Cid
+	srv := server.NewHTTP(service)
+	srv.Handle(ucancmd.Revoke.Command, ucancmd.Revoke.Handler(
+		func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
+			revoked = append(revoked, req.Task().Arguments().Revoke)
+			return res.SetSuccess(&ucancmd.RevokeOK{})
+		}))
+	transport := http.RoundTripper(roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		requests++
+		return srv.RoundTrip(r)
+	}))
+
+	serviceURL, err := url.Parse("http://swarf.test")
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL, WithHTTPClient(&http.Client{Transport: transport}))
+	require.NoError(t, err)
+
+	require.NoError(t, client.PublishBatch(context.Background(), alice, []ucan.Delegation{first, second}))
+	require.Equal(t, 1, requests, "one request carries every revocation")
+	require.ElementsMatch(t, []cid.Cid{first.Link(), second.Link()}, revoked)
+
+	t.Run("publishes nothing for no delegations", func(t *testing.T) {
+		requests = 0
+		require.NoError(t, client.PublishBatch(context.Background(), alice, nil))
+		require.Equal(t, 0, requests)
+	})
+
+	t.Run("fails when a revocation is refused", func(t *testing.T) {
+		refusing := server.NewHTTP(service)
+		refusing.Handle(ucancmd.Revoke.Command, ucancmd.Revoke.Handler(
+			func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
+				if req.Task().Arguments().Revoke == second.Link() {
+					return res.SetFailure(errors.New("refused"))
+				}
+				return res.SetSuccess(&ucancmd.RevokeOK{})
+			}))
+		client, err := New(service.DID(), *serviceURL, WithHTTPClient(&http.Client{Transport: refusing}))
+		require.NoError(t, err)
+		require.Error(t, client.PublishBatch(context.Background(), alice, []ucan.Delegation{first, second}))
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func TestGetAndStream(t *testing.T) {
 	issuer, err := identity.New("", "")

@@ -21,6 +21,7 @@ import (
 	"github.com/fil-forge/ucantone/client"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/execution"
+	"github.com/fil-forge/ucantone/execution/batch"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
@@ -31,7 +32,7 @@ import (
 type Client struct {
 	ServiceID  did.DID
 	serviceURL url.URL
-	executor   execution.Executor
+	executor   *client.HTTPClient
 	httpClient *http.Client
 }
 
@@ -115,6 +116,52 @@ func (c *Client) Publish(ctx context.Context, revoker ucan.Issuer, revoked ucan.
 	}
 	if _, err := ucancmd.Revoke.Unpack(response.Receipt()); err != nil {
 		return fmt.Errorf("unpacking revoke receipt: %w", err)
+	}
+	return nil
+}
+
+// PublishBatch submits one /ucan/revoke invocation per revoked delegation,
+// all self-signed by revoker and sent in a single request. The revoker must be
+// the issuer of every revoked delegation; no witness path is carried. Every
+// invocation must succeed, otherwise the first failure is returned. A repeat of
+// the same delegation is a duplicate the service records once.
+func (c *Client) PublishBatch(ctx context.Context, revoker ucan.Issuer, revoked []ucan.Delegation) error {
+	if revoker == nil {
+		return errors.New("revoker is required")
+	}
+	if len(revoked) == 0 {
+		return nil
+	}
+	invocations := make([]ucan.Invocation, 0, len(revoked))
+	for _, d := range revoked {
+		if d == nil {
+			return errors.New("revoked delegation is required")
+		}
+		inv, err := ucancmd.Revoke.Invoke(
+			revoker,
+			revoker.DID(),
+			&ucancmd.RevokeArguments{Revoke: d.Link()},
+			invocation.WithAudience(c.ServiceID),
+			invocation.WithNoNonce(),
+			invocation.WithNoExpiration(),
+		)
+		if err != nil {
+			return fmt.Errorf("creating revoke invocation: %w", err)
+		}
+		invocations = append(invocations, inv)
+	}
+	response, err := c.executor.ExecuteBatch(batch.NewRequest(ctx, invocations, batch.WithDelegations(revoked...)))
+	if err != nil {
+		return fmt.Errorf("publishing revocations: %w", err)
+	}
+	for i, inv := range invocations {
+		receipt, ok := response.Receipt(inv.Task().Link())
+		if !ok {
+			return fmt.Errorf("no receipt for the revocation of %s", revoked[i].Link())
+		}
+		if _, err := ucancmd.Revoke.Unpack(receipt); err != nil {
+			return fmt.Errorf("unpacking revoke receipt: %w", err)
+		}
 	}
 	return nil
 }
