@@ -1,5 +1,7 @@
 # Agent Guidelines
 
+Swarf is the UCAN revocation service; `README.md` describes running it and its CLI.
+
 ## Observability
 
 When a change adds or alters behavior someone depends on, decide how on-call
@@ -15,9 +17,10 @@ useful. Skip it for changes nothing operational depends on.
   act on it (DIDs and CIDs, never key material), in a stable message an alert
   can match.
 - **Metrics.** When a feature's health is best read as a number, such as a
-  failure count, a queue depth or the time of the last success, note it on
-  [FIL-1152](https://linear.app/filecoin-foundation/issue/FIL-1152) so it is
-  instrumented when the service exports metrics.
+  failure count, a queue depth or the time of the last success, say so in the
+  PR description, naming the metric and
+  [FIL-1152](https://linear.app/filecoin-foundation/issue/FIL-1152), so it can
+  be carried to the issue and instrumented when the service exports metrics.
 - **Alerts and dashboard panels** live in fil-forge/infra-central, under
   `terraform/envs/grafana/`; its `AGENTS.md` says how to add them. Open a
   companion PR there, or say in this PR that one is needed.
