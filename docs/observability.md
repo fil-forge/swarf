@@ -19,5 +19,6 @@ do.
   [FIL-1152](https://linear.app/filecoin-foundation/issue/FIL-1152), so it can
   be carried to the issue and instrumented when the service exports metrics.
 - **Alerts and dashboard panels** live in fil-forge/infra-central, under
-  `terraform/envs/grafana/`; its `docs/observability.md` ("Adding an alert or panel") says how to add them. Open a
-  companion PR there, or say in this PR that one is needed.
+  `terraform/envs/grafana/`; its `docs/observability.md` ("Adding an alert or
+  panel") says how to add them. Open a companion PR there, or say in this PR
+  that one is needed.
