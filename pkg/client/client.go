@@ -283,12 +283,12 @@ func (c *Client) StreamEvents(ctx context.Context, from time.Time) iter.Seq2[Eve
 //
 // The service refuses a cursor ahead of its head, which it cannot have
 // issued, and the stream then ends with an error wrapping ErrCursorRefused.
-// Not every cursor from before the service's database moved to another server
-// is ahead of the head, though, so a move still calls for resetting every
-// consumer, a call open across the move included (see Swarf's README). Starting over from Now skips the revocations
-// that reached the firehose after the consumer's last one; StreamEvents from
-// a time well before that one's RecordedAt, or from zero, deduped by Cause,
-// does not.
+// Not every cursor from before a dump and restore, or a logical replication,
+// of the service's database is ahead of the head, though, so such a move still
+// calls for resetting every consumer, a call open across the move included
+// (see Swarf's README). Starting over from Now skips the revocations that
+// reached the firehose after the consumer's last one; StreamEvents from a time
+// well before that one's RecordedAt, or from zero, deduped by Cause, does not.
 func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event, error] {
 	if after == "" {
 		return func(yield func(Event, error) bool) {
