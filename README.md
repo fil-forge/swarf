@@ -192,12 +192,13 @@ does not keep the counter, and voids every cursor issued before the move:
   stream until it catches up. Before Swarf serves the stream from the new
   server, run `UPDATE revocation SET transaction_id = '0'`, so every copied row
   streams first.
-- A consumer resuming after an old cursor can skip records. Have every consumer
-  drop its stored cursor and start over as it would after a `409`: from `0`, or
-  from a time well before the last record it applied, deduplicating by
-  `cause`. Swarf refuses with `409` an old cursor that is ahead of the new
-  server's head, but it accepts one that is not, so the refusal can't be relied
-  on to catch every old cursor.
+- A consumer resuming after an old cursor can skip records, and that includes
+  a stream left open across the move, which reconnects after the last event it
+  received. Stop every consumer's stream, have each drop its stored cursor, and
+  start them over as after a `409`: from `0`, or from a time well before the
+  last record each applied, deduplicating by `cause`. Swarf refuses with `409`
+  an old cursor that is ahead of the new server's head, but it accepts one that
+  is not, so the refusal can't be relied on to catch every old cursor.
 
 ## Client library
 

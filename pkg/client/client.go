@@ -242,8 +242,9 @@ func (e corruptError) Unwrap() error { return e.err }
 // reconnecting with capped exponential backoff when the stream is
 // interrupted. A reconnect resumes after the last revocation the call
 // delivered, so a call yields each revocation once, and never one recorded
-// before from. (If the service's database moves to another server while the
-// call is open, a reconnect starts over from from, repeating revocations.)
+// before from. Moving the service's database to another server voids that
+// position, though: a call open across the move can then repeat or skip
+// revocations, and has to be started over (see Swarf's README).
 //
 // Revocations do not reach the firehose in recorded_at order, so a new call
 // from the timestamp of the last revocation a previous call delivered can miss
