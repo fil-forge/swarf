@@ -405,6 +405,56 @@ func TestStreamAfter(t *testing.T) {
 	})
 }
 
+// A reconnect the service refuses, such as for a cursor it did not issue,
+// ends the stream with an error rather than retrying forever; a reconnect
+// that fails any other way is retried.
+func TestStreamEndsWhenAReconnectIsRefused(t *testing.T) {
+	record := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
+	var mu sync.Mutex
+	var connections int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		connections++
+		connection := connections
+		mu.Unlock()
+		switch connection {
+		case 1:
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, sseEventWithID(t, "1-a", record))
+		case 2:
+			http.Error(writer, "unavailable", http.StatusServiceUnavailable)
+		default:
+			http.Error(writer, "cursor is ahead of the revocation stream", http.StatusConflict)
+		}
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var delivered int
+	var errs []error
+	for _, err := range client.StreamAfter(ctx, "0") {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		delivered++
+	}
+	require.Equal(t, 1, delivered)
+	require.Len(t, errs, 1)
+	require.ErrorContains(t, errs[0], "409")
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 3, connections)
+}
+
 func TestStreamReconnectCanceled(t *testing.T) {
 	record := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {

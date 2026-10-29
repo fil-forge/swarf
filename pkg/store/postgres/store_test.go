@@ -167,6 +167,12 @@ func TestPostgresRevocationStoreStreamAfterCursor(t *testing.T) {
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 
+	// Every cursor the store issues is at or before its head, which is how
+	// Swarf tells a cursor another store issued.
+	head, err := s.Head(context.Background())
+	require.NoError(t, err)
+	require.LessOrEqual(t, second.Cursor.Compare(head), 0)
+
 	// A stream after the first record's cursor starts at the second, and
 	// carries on with records added later.
 	resumedCtx, resumedCancel := context.WithCancel(context.Background())

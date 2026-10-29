@@ -218,11 +218,22 @@ const (
 // errStreamStopped signals the stream consumer stopped iterating.
 var errStreamStopped = errors.New("revocation stream stopped")
 
-// connectError reports a stream connection that was never established.
-type connectError struct{ err error }
+// connectError reports a stream connection that was never established, and
+// the response status if the service answered.
+type connectError struct {
+	err    error
+	status int
+}
 
 func (e connectError) Error() string { return e.err.Error() }
 func (e connectError) Unwrap() error { return e.err }
+
+// refused reports whether the service rejected the request itself, such as a
+// cursor it did not issue, which sending it again cannot fix.
+func (e connectError) refused() bool {
+	return e.status >= 400 && e.status < 500 &&
+		e.status != http.StatusRequestTimeout && e.status != http.StatusTooManyRequests
+}
 
 // corruptError reports a stream payload that could not be decoded;
 // reconnecting would only fetch it again.
@@ -270,7 +281,10 @@ func (c *Client) StreamEvents(ctx context.Context, from time.Time) iter.Seq2[Eve
 // A call yields each revocation once, and a call resuming after the cursor of
 // the last revocation a consumer applied misses nothing. A consumer that
 // stores its cursor less often than it applies revocations has some
-// re-delivered when it resumes; dedupe those by Cause.
+// re-delivered when it resumes; dedupe those by Cause. The service refuses a
+// cursor it did not issue, such as one from before its database moved to
+// another server, and the stream then ends with an error: start again from a
+// time with StreamEvents, or from Now.
 func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event, error] {
 	if after == "" {
 		return func(yield func(Event, error) bool) {
@@ -283,7 +297,8 @@ func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event,
 // stream follows the firehose at endpoint until ctx is canceled, reconnecting
 // with capped exponential backoff when it is interrupted. Each reconnect sends
 // the id of the last event the service sent as Last-Event-ID, so the service
-// resumes after it, still serving only what endpoint selects.
+// resumes after it, still serving only what endpoint selects. It ends with an
+// error when the first connection fails or the service refuses a request.
 func (c *Client) stream(ctx context.Context, endpoint string) iter.Seq2[Event, error] {
 	return func(yield func(Event, error) bool) {
 		var lastEventID Cursor
@@ -306,10 +321,11 @@ func (c *Client) stream(ctx context.Context, endpoint string) iter.Seq2[Event, e
 				yield(Event{}, err)
 				return
 			}
-			if _, ok := errors.AsType[connectError](err); ok {
-				// Failing to connect at all is fatal; failing to reconnect
-				// an established stream is retried like any interruption.
-				if !connected {
+			if connectErr, ok := errors.AsType[connectError](err); ok {
+				// Failing to connect at all is fatal, and so is a request the
+				// service refuses; failing to reconnect an established stream
+				// otherwise is retried like any interruption.
+				if !connected || connectErr.refused() {
 					yield(Event{}, err)
 					return
 				}
@@ -338,7 +354,7 @@ func (c *Client) stream(ctx context.Context, endpoint string) iter.Seq2[Event, e
 func (c *Client) streamConn(ctx context.Context, endpoint string, lastEventID *Cursor, emit func(Event) bool) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return connectError{fmt.Errorf("creating revocation stream request: %w", err)}
+		return connectError{fmt.Errorf("creating revocation stream request: %w", err), 0}
 	}
 	request.Header.Set("Accept", "text/event-stream")
 	if *lastEventID != "" {
@@ -346,11 +362,11 @@ func (c *Client) streamConn(ctx context.Context, endpoint string, lastEventID *C
 	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return connectError{fmt.Errorf("opening revocation stream: %w", err)}
+		return connectError{fmt.Errorf("opening revocation stream: %w", err), 0}
 	}
 	defer response.Body.Close()
 	if response.StatusCode != http.StatusOK {
-		return connectError{fmt.Errorf("opening revocation stream: unexpected status %s", response.Status)}
+		return connectError{fmt.Errorf("opening revocation stream: unexpected status %s", response.Status), response.StatusCode}
 	}
 
 	events := sse.NewScanner(response.Body)

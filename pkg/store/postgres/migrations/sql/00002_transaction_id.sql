@@ -8,7 +8,9 @@ ALTER TABLE revocation ALTER COLUMN transaction_id SET DEFAULT pg_current_xact_i
 
 COMMENT ON COLUMN revocation.transaction_id IS 'ID of the transaction that inserted the revocation; the firehose streams in (transaction_id, id) order';
 
-CREATE INDEX revocation_transaction_id_idx ON revocation (transaction_id, id);
+-- The stream orders id bytewise (the "C" collation), as store.Cursor does, so
+-- the database's collation cannot reorder it.
+CREATE INDEX revocation_transaction_id_idx ON revocation (transaction_id, id COLLATE "C");
 -- +goose StatementEnd
 
 -- +goose Down

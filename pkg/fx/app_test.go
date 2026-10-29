@@ -130,12 +130,14 @@ func TestFirehoseRouteResumesAfterLastEventID(t *testing.T) {
 		after       store.Cursor
 	}{
 		{name: "a cursor", lastEventID: "7-bafy", after: store.Cursor{Seq: 7, ID: "bafy"}},
-		// An id from before ids were cursors starts the query over: records
-		// can repeat, but none is skipped.
+		// An id from before ids were cursors, or a cursor ahead of the head,
+		// which another database issued, starts the query over: records can
+		// repeat, but none is skipped.
 		{name: "not a cursor", lastEventID: "bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm", after: store.Cursor{}},
+		{name: "ahead of the head", lastEventID: "10-bafy", after: store.Cursor{}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			source := &firehoseTestStore{err: context.Canceled}
+			source := &firehoseTestStore{err: context.Canceled, head: store.Cursor{Seq: 9}}
 			e := newEchoServer(id, server.NewHTTP(id), source)
 			request := httptest.NewRequest(http.MethodGet, "/revocations/"+from.Format(time.RFC3339Nano), nil)
 			request.Header.Set("Last-Event-ID", test.lastEventID)
@@ -154,7 +156,7 @@ func TestFirehoseAfterRoute(t *testing.T) {
 	require.NoError(t, err)
 
 	t.Run("resumes after the cursor", func(t *testing.T) {
-		source := &firehoseTestStore{err: context.Canceled}
+		source := &firehoseTestStore{err: context.Canceled, head: store.Cursor{Seq: 9}}
 		e := newEchoServer(id, server.NewHTTP(id), source)
 		response := httptest.NewRecorder()
 		e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/after/7-bafy", nil))
@@ -191,6 +193,30 @@ func TestFirehoseAfterRoute(t *testing.T) {
 			require.Equal(t, http.StatusOK, response.Code, path)
 			require.Equal(t, store.Cursor{Seq: 8, ID: "bafz"}, source.after, path)
 			require.Empty(t, response.Body.String(), path)
+		}
+	})
+
+	t.Run("ignores a Last-Event-ID ahead of the head", func(t *testing.T) {
+		source := &firehoseTestStore{err: context.Canceled, head: store.Cursor{Seq: 9}}
+		e := newEchoServer(id, server.NewHTTP(id), source)
+		request := httptest.NewRequest(http.MethodGet, "/revocations/after/7-bafy", nil)
+		request.Header.Set("Last-Event-ID", "10-bafz")
+		response := httptest.NewRecorder()
+		e.ServeHTTP(response, request)
+
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Equal(t, store.Cursor{Seq: 7, ID: "bafy"}, source.after)
+	})
+
+	// Streaming after a cursor ahead of the head would skip every record up
+	// to it.
+	t.Run("refuses a cursor ahead of the head", func(t *testing.T) {
+		for _, cursor := range []string{"10", "9-bafy"} {
+			source := &firehoseTestStore{head: store.Cursor{Seq: 9}}
+			e := newEchoServer(id, server.NewHTTP(id), source)
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/after/"+cursor, nil))
+			require.Equal(t, http.StatusConflict, response.Code, cursor)
 		}
 	})
 

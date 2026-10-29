@@ -8,7 +8,7 @@ Swarf is a UCAN revocation service.
 swarf serve --storage memory
 ```
 
-By default, Swarf uses PostgreSQL. Configure it with `--postgres-dsn`, a
+By default, Swarf uses PostgreSQL, version 13 or later. Configure it with `--postgres-dsn`, a
 `config.yaml`, or `SWARF_STORAGE_POSTGRES_DSN`. Configuration sections are
 `identity`, `server`, `log`, and `storage`; environment variable names use the
 `SWARF_` prefix, for example `SWARF_SERVER_PORT`.
@@ -131,6 +131,11 @@ with only an `id`, the cursor `now` stands for. It carries no data, so it
 dispatches nothing, but it sets an SSE client's last event ID, so a client that
 reconnects before the first record resumes from there.
 
+Swarf answers `409` for a cursor ahead of the stream's head, which it cannot
+have issued: one from before its database [moved](#moving-the-database), or
+from before an in-memory store restarted. Streaming after it would skip every
+record up to it. Start again from a time, or from `now`.
+
 ### Cursors
 
 A cursor is an opaque token, sent as each event's `id`. A stream resumed after
@@ -145,8 +150,8 @@ request header, which an SSE client such as `EventSource` sends when it
 reconnects. The stream resumes after that event, and keeps whatever the URL
 selects: a time query reconnected this way still yields nothing recorded
 before its time, and `Last-Event-ID` takes the place of a `/revocations/after/`
-cursor. A `Last-Event-ID` that is not a cursor is ignored, and the stream
-starts where the URL says.
+cursor. A `Last-Event-ID` that is not a cursor, or is one ahead of the head,
+is ignored, and the stream starts where the URL says.
 
 Delivery is at least once: a consumer that stores its cursor less often than
 it applies records, or reconnects with an older one, receives some records
@@ -159,11 +164,32 @@ With PostgreSQL storage, the stream holds a record back until every database
 transaction that started writing before it has finished, so that no earlier
 record can appear once it is sent. That covers every transaction on the
 PostgreSQL server, in any database, that has been assigned a transaction ID,
-which a transaction is when it first writes. So a long-running transaction that
-has written, or a session left idle in one, delays the stream for as long as it
-stays open; a transaction that only reads does not. To find what is holding the
-stream back, look for the oldest transactions with a `backend_xid` in
-`pg_stat_activity`, and in `pg_prepared_xacts`.
+which a transaction is when it first writes or locks rows. So a long-running
+transaction that has written, or a session left idle in one, delays the stream
+for as long as it stays open; a transaction that only reads does not. To find
+what is holding the stream back, look for the oldest transactions with a
+`backend_xid` in `pg_stat_activity`, and in `pg_prepared_xacts`.
+
+### Moving the database
+
+The stream's order and its cursors come from the PostgreSQL server's
+transaction IDs. A row keeps its transaction ID when it is copied to another
+server, while new rows there get that server's. Upgrading in place with
+`pg_upgrade`, or failing over to a physical replica that is caught up, keeps
+the counter, and cursors keep working.
+
+Moving the data with `pg_dump` and a restore, or with logical replication,
+does not keep the counter, and voids every cursor issued before the move:
+
+- Copied rows can sit ahead of the new server's counter, and stay out of the
+  stream until it catches up. Before Swarf serves the stream from the new
+  server, run `UPDATE revocation SET transaction_id = '0'`, so every copied row
+  streams first.
+- A consumer resuming after an old cursor can skip records. Have every consumer
+  drop its stored cursor and start again from a time at or before the last
+  record it applied. Swarf refuses with `409` an old cursor that is ahead of
+  the new server's head, but it accepts one that is not, so the refusal can't
+  be relied on to catch every old cursor.
 
 ## Client library
 

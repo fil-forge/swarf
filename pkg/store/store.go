@@ -87,7 +87,8 @@ type RevocationStore interface {
 	// Head returns the cursor at the head of the stream: a stream after it
 	// yields every record that reaches the stream from then on. It can also
 	// yield records added shortly before Head was called that had not reached
-	// the stream yet.
+	// the stream yet. Every cursor the store has issued is at or before its
+	// head.
 	Head(ctx context.Context) (Cursor, error)
 	// Stream yields the records ordered after the after cursor and recorded on
 	// or after from, in cursor order, and remains open until the context is

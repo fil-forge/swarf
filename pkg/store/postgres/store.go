@@ -124,8 +124,12 @@ func (s *Store) Head(ctx context.Context) (store.Cursor, error) {
 // The trade-off is that the horizon is cluster-wide: a transaction that holds
 // a transaction ID and stays open, such as a long-running one or a session
 // idle in transaction, holds the horizon back and delays the stream until it
-// ends, whichever database it runs in. A transaction that only reads holds no
-// transaction ID and does not.
+// ends, whichever database it runs in. A transaction gets an ID when it first
+// writes or locks rows; one that only reads holds none and does not.
+//
+// Transaction IDs are also the cluster's own: a row copied to another cluster
+// keeps its ID, but new rows there get that cluster's. README.md says what
+// moving the database involves.
 func (s *Store) Stream(ctx context.Context, after store.Cursor, from time.Time) iter.Seq2[store.StreamRecord, error] {
 	return func(yield func(store.StreamRecord, error) bool) {
 		ticker := time.NewTicker(streamPollInterval)
@@ -161,16 +165,18 @@ func (s *Store) Stream(ctx context.Context, after store.Cursor, from time.Time) 
 func (s *Store) recordsAfter(ctx context.Context, after store.Cursor, from time.Time) iter.Seq2[store.StreamRecord, error] {
 	return func(yield func(store.StreamRecord, error) bool) {
 		// pg_current_snapshot is the statement's own snapshot, so every row
-		// below its horizon is visible to this query. The zero from predates
-		// every record, so an unbounded stream matches everything.
+		// below its horizon is visible to this query. id is ordered bytewise,
+		// as store.Cursor orders it, whatever the database's collation. The
+		// zero from predates every record, so an unbounded stream matches
+		// everything.
 		rows, err := s.pool.Query(
 			ctx,
 			`SELECT transaction_id, id, cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
-			 WHERE (transaction_id, id) > ($1, $2)
+			 WHERE (transaction_id, id COLLATE "C") > ($1, $2)
 			   AND transaction_id < pg_snapshot_xmin(pg_current_snapshot())
 			   AND recorded_at >= $3
-			 ORDER BY transaction_id, id`,
+			 ORDER BY transaction_id, id COLLATE "C"`,
 			after.Seq,
 			after.ID,
 			from,
