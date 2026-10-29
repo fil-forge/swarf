@@ -101,20 +101,69 @@ when no revocation exists. For example:
 
 ### `GET /revocations/:from`
 
-A Server-Sent Events stream of compact DAG-JSON records. Each event has `revoke`
-(the revoked delegation CID), `path` (the witness delegation CIDs), `cause` (the
-revocation invocation CID), and `recorded_at` (the time the record was recorded). Use `0`
-to stream all stored records, or provide an RFC3339/RFC3339Nano timestamp cursor
-to stream records recorded on or after it. The cursor is inclusive so consumers
-resuming from the `recorded_at` of the last event they received do not miss
-records that share it; deduplicate by the event `id` (the `cause` CID). For
-example:
+A Server-Sent Events stream of compact DAG-JSON records recorded at or after a
+time. Each event has `revoke` (the revoked delegation CID), `path` (the witness
+delegation CIDs), `cause` (the revocation invocation CID), and `recorded_at`
+(the time the record was recorded). Use `0` to stream all stored records, or
+provide an RFC3339/RFC3339Nano timestamp to stream records recorded on or after
+it. The stream never yields a record recorded before that time. Each event's
+`id` is a [cursor](#cursors). For example:
 
 ```js
-id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm
+id: 1734-bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm
 event: revocation
 data: {"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"},"path":[{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}],"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"recorded_at":"2026-07-17T09:00:00Z"}
 ```
+
+Records do not reach the stream in `recorded_at` order: `recorded_at` is when
+the transaction recording a revocation started, and a transaction that started
+earlier can finish later. So a time query is not a way to resume a stream. A
+new query from the `recorded_at` of the last event received can miss records
+recorded before it that reached the stream after it. To resume, use a cursor.
+
+### `GET /revocations/after/:cursor`
+
+The same stream, starting after a [cursor](#cursors): the `id` of an event
+received earlier, from either endpoint. Pass `now` instead to start at the head
+of the stream as Swarf's database sees it when the request arrives, rather than
+at a time on the client's clock. A stream started at `now` first sends an event
+with only an `id`, the cursor `now` stands for. It carries no data, so it
+dispatches nothing, but it sets an SSE client's last event ID, so a client that
+reconnects before the first record resumes from there.
+
+### Cursors
+
+A cursor is an opaque token, sent as each event's `id`. A stream resumed after
+a cursor yields every record that follows it, and only those. A record reaches
+the stream only once no earlier record can still appear, so a consumer that
+stores the cursor of the last record it applied, and resumes after it, misses
+nothing.
+
+Both endpoints honor the standard
+[`Last-Event-ID`](https://html.spec.whatwg.org/multipage/server-sent-events.html#the-last-event-id-header)
+request header, which an SSE client such as `EventSource` sends when it
+reconnects. The stream resumes after that event, and keeps whatever the URL
+selects: a time query reconnected this way still yields nothing recorded
+before its time, and `Last-Event-ID` takes the place of a `/revocations/after/`
+cursor. A `Last-Event-ID` that is not a cursor is ignored, and the stream
+starts where the URL says.
+
+Delivery is at least once: a consumer that stores its cursor less often than
+it applies records, or reconnects with an older one, receives some records
+again. Deduplicate by `cause`, the CID of the revocation invocation, which is
+unique to a record.
+
+### Stream delays
+
+With PostgreSQL storage, the stream holds a record back until every database
+transaction that started writing before it has finished, so that no earlier
+record can appear once it is sent. That covers every transaction on the
+PostgreSQL server, in any database, that has been assigned a transaction ID,
+which a transaction is when it first writes. So a long-running transaction that
+has written, or a session left idle in one, delays the stream for as long as it
+stays open; a transaction that only reads does not. To find what is holding the
+stream back, look for the oldest transactions with a `backend_xid` in
+`pg_stat_activity`, and in `pg_prepared_xacts`.
 
 ## Client library
 
@@ -134,8 +183,16 @@ err = client.Publish(ctx, revoker, revoked, swarfclient.WithWitnessPath(path...)
 
 record, err := client.Get(ctx, delegationCID)
 
-for event, err := range client.Stream(ctx, time.Time{}) {
-    // event.Revoke, event.Path, and event.Cause are CIDs; event.RecordedAt is a time.
+for revocation, err := range client.Stream(ctx, time.Time{}) {
+    // revocation.Revoke, revocation.Path, and revocation.Cause are CIDs;
+    // revocation.RecordedAt is a time.
+}
+
+// Resume after a stored cursor, or start at the head of the stream with
+// swarfclient.Now.
+for event, err := range client.StreamAfter(ctx, swarfclient.Now) {
+    // event.Revocation is the revocation; store event.Cursor once it is
+    // applied, and pass it to StreamAfter to resume.
 }
 ```
 
@@ -143,7 +200,8 @@ for event, err := range client.Stream(ctx, time.Time{}) {
 must be the issuer of the revoked delegation or appear as an issuer in the
 witness path provided with `WithWitnessPath`. `Get` returns a full
 `store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
-values.
+values, and `StreamAfter` returns them with their cursors. Both reconnect when
+the stream is interrupted, resuming after the last event received.
 
 ## Container images
 

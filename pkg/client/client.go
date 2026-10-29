@@ -190,6 +190,22 @@ func (c *Client) Get(ctx context.Context, delegationCID cid.Cid) (store.Revocati
 	return decodeRecord(record)
 }
 
+// Cursor is a position in the revocation firehose, which the service sends
+// with each revocation. Its form is the service's own and opaque: store one,
+// and pass it back to StreamAfter to resume after that revocation.
+type Cursor string
+
+// Now is the cursor at the head of the firehose, as the service sees it when
+// the stream opens.
+const Now Cursor = "now"
+
+// Event is a firehose revocation and the cursor that resumes the firehose
+// after it.
+type Event struct {
+	Revocation api.FirehoseRevocation
+	Cursor     Cursor
+}
+
 // Reconnect backoff bounds: the exponential backoff's initial interval and
 // its cap (growth and jitter use the backoff package's defaults). The backoff
 // resets whenever a connection is established, so it only grows while the
@@ -215,54 +231,80 @@ type corruptError struct{ err error }
 func (e corruptError) Error() string { return e.err.Error() }
 func (e corruptError) Unwrap() error { return e.err }
 
-// Stream yields firehose revocations recorded on or after from and remains
-// open until ctx is canceled, reconnecting with capped exponential backoff
-// when the stream is interrupted.
-// It resumes from the timestamp of the last record it delivered and skips
-// records sharing that timestamp it already delivered, so a single call
-// yields each revocation once. A new call resuming from the timestamp of the
-// last record a previous call delivered still re-receives records recorded
-// at exactly that time; dedupe those by cause CID.
+// Stream yields firehose revocations recorded on or after from, or every
+// revocation if from is zero, and remains open until ctx is canceled,
+// reconnecting with capped exponential backoff when the stream is
+// interrupted. A reconnect resumes after the last revocation the call
+// delivered, so a call yields each revocation once, and never one recorded
+// before from.
+//
+// Revocations do not reach the firehose in recorded_at order, so a new call
+// from the timestamp of the last revocation a previous call delivered can miss
+// revocations recorded earlier that reached the firehose later. To resume
+// across calls, use StreamAfter.
 func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error] {
+	position := "0"
+	if !from.IsZero() {
+		position = from.UTC().Format(time.RFC3339Nano)
+	}
 	return func(yield func(api.FirehoseRevocation, error) bool) {
-		resume := from
-		// seen holds the cause CIDs of delivered records recorded at exactly
-		// resume, so reconnecting at resume does not re-deliver them.
-		seen := map[cid.Cid]struct{}{}
+		for event, err := range c.stream(ctx, c.endpoint("revocations", position)) {
+			if !yield(event.Revocation, err) {
+				return
+			}
+		}
+	}
+}
+
+// StreamAfter yields the firehose revocations after cursor, each with its own
+// cursor, and remains open until ctx is canceled, reconnecting as Stream
+// does. Pass the cursor of an Event a previous call yielded to resume after
+// that revocation, or Now to start at the head of the firehose.
+//
+// A call yields each revocation once, and a call resuming after the cursor of
+// the last revocation a consumer applied misses nothing. A consumer that
+// stores its cursor less often than it applies revocations has some
+// re-delivered when it resumes; dedupe those by Cause.
+func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event, error] {
+	if after == "" {
+		return func(yield func(Event, error) bool) {
+			yield(Event{}, errors.New("cursor is required"))
+		}
+	}
+	return c.stream(ctx, c.endpoint("revocations", "after", string(after)))
+}
+
+// stream follows the firehose at endpoint until ctx is canceled, reconnecting
+// with capped exponential backoff when it is interrupted. Each reconnect sends
+// the id of the last event the service sent as Last-Event-ID, so the service
+// resumes after it, still serving only what endpoint selects.
+func (c *Client) stream(ctx context.Context, endpoint string) iter.Seq2[Event, error] {
+	return func(yield func(Event, error) bool) {
+		var lastEventID Cursor
 		connected := false
 		bo := backoff.NewExponentialBackOff()
 		bo.InitialInterval = streamMinBackoff
 		bo.MaxInterval = streamMaxBackoff
 		for {
-			err := c.streamConn(ctx, resume, func(record api.FirehoseRevocation) bool {
-				recordedAt := record.RecordedAt.Time()
-				if recordedAt.Equal(resume) {
-					if _, ok := seen[record.Cause]; ok {
-						return true
-					}
-				} else {
-					resume = recordedAt
-					clear(seen)
-				}
-				seen[record.Cause] = struct{}{}
-				return yield(record, nil)
+			err := c.streamConn(ctx, endpoint, &lastEventID, func(event Event) bool {
+				return yield(event, nil)
 			})
 			if errors.Is(err, errStreamStopped) {
 				return
 			}
 			if ctx.Err() != nil {
-				yield(api.FirehoseRevocation{}, ctx.Err())
+				yield(Event{}, ctx.Err())
 				return
 			}
 			if _, ok := errors.AsType[corruptError](err); ok {
-				yield(api.FirehoseRevocation{}, err)
+				yield(Event{}, err)
 				return
 			}
 			if _, ok := errors.AsType[connectError](err); ok {
 				// Failing to connect at all is fatal; failing to reconnect
 				// an established stream is retried like any interruption.
 				if !connected {
-					yield(api.FirehoseRevocation{}, err)
+					yield(Event{}, err)
 					return
 				}
 			} else {
@@ -272,7 +314,7 @@ func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.Fireh
 
 			select {
 			case <-ctx.Done():
-				yield(api.FirehoseRevocation{}, ctx.Err())
+				yield(Event{}, ctx.Err())
 				return
 			case <-time.After(bo.NextBackOff()):
 			}
@@ -280,21 +322,22 @@ func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.Fireh
 	}
 }
 
-// streamConn opens one SSE connection at from and emits its records. It
+// streamConn opens one SSE connection to endpoint, sending *lastEventID as
+// Last-Event-ID if it is set, and emits its revocations. It leaves
+// *lastEventID at the last event ID the service sent, if it sent one. It
 // returns errStreamStopped when emit stops iteration, a connectError when no
 // stream was established, a corruptError for a payload that is undecodable or
-// larger than sse.MaxEventBytes, and nil when an established connection ended for
-// any other reason.
-func (c *Client) streamConn(ctx context.Context, from time.Time, emit func(api.FirehoseRevocation) bool) error {
-	cursor := "0"
-	if !from.IsZero() {
-		cursor = from.UTC().Format(time.RFC3339Nano)
-	}
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("revocations", cursor), nil)
+// larger than sse.MaxEventBytes, and nil when an established connection ended
+// for any other reason.
+func (c *Client) streamConn(ctx context.Context, endpoint string, lastEventID *Cursor, emit func(Event) bool) error {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return connectError{fmt.Errorf("creating revocation stream request: %w", err)}
 	}
 	request.Header.Set("Accept", "text/event-stream")
+	if *lastEventID != "" {
+		request.Header.Set("Last-Event-ID", string(*lastEventID))
+	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
 		return connectError{fmt.Errorf("opening revocation stream: %w", err)}
@@ -305,6 +348,13 @@ func (c *Client) streamConn(ctx context.Context, from time.Time, emit func(api.F
 	}
 
 	events := sse.NewScanner(response.Body)
+	// The last event ID can come from an event Scan does not report: the
+	// service sends one with no data when a stream starts at Now.
+	defer func() {
+		if id := events.ID(); id != "" {
+			*lastEventID = Cursor(id)
+		}
+	}()
 	for events.Scan() {
 		if events.Event() != "revocation" {
 			continue
@@ -313,7 +363,7 @@ func (c *Client) streamConn(ctx context.Context, from time.Time, emit func(api.F
 		if err := value.UnmarshalDagJSON(strings.NewReader(events.Data())); err != nil {
 			return corruptError{fmt.Errorf("decoding streamed revocation: %w", err)}
 		}
-		if !emit(value) {
+		if !emit(Event{Revocation: value, Cursor: Cursor(events.ID())}) {
 			return errStreamStopped
 		}
 	}

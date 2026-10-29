@@ -19,11 +19,6 @@ import (
 
 const streamPollInterval = time.Second
 
-// streamSettleWindow bounds how long an insert may take between its
-// recorded_at (NOW() at transaction start) and its row becoming visible.
-// History older than this window is settled: no new rows can appear there.
-const streamSettleWindow = 10 * time.Second
-
 // Store persists revocation records in PostgreSQL.
 type Store struct {
 	pool *pgxpool.Pool
@@ -102,59 +97,60 @@ func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecor
 	return record, nil
 }
 
-// Stream returns matching revocation records and remains open until ctx is canceled.
-func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
+// Head returns the cursor at the transaction horizon, which Stream describes.
+// Rows at or above it, including any whose transactions committed but that
+// have not reached the stream, are after it.
+func (s *Store) Head(ctx context.Context) (store.Cursor, error) {
+	var horizon uint64
+	if err := s.pool.QueryRow(ctx, `SELECT pg_snapshot_xmin(pg_current_snapshot())`).Scan(&horizon); err != nil {
+		return store.Cursor{}, fmt.Errorf("reading transaction horizon: %w", err)
+	}
+	return store.Cursor{Seq: horizon}, nil
+}
+
+// Stream yields matching revocation records and remains open until ctx is
+// canceled. A record's cursor is the ID of the transaction that inserted it
+// and the record's id.
+//
+// Rows become visible out of recorded_at order: recorded_at is the inserting
+// transaction's start time, and a transaction that started first can commit
+// last. So the stream is ordered by the inserting transaction's ID instead,
+// and each poll reads only rows below the transaction horizon, the oldest
+// transaction ID still running. Every transaction below the horizon has
+// finished, and any other transaction has or will get an ID at or above it,
+// so once a row is below the horizon no row can appear ahead of it, and each
+// poll resumes strictly after the last row yielded.
+//
+// The trade-off is that the horizon is cluster-wide: a transaction that holds
+// a transaction ID and stays open, such as a long-running one or a session
+// idle in transaction, holds the horizon back and delays the stream until it
+// ends, whichever database it runs in. A transaction that only reads holds no
+// transaction ID and does not.
+func (s *Store) Stream(ctx context.Context, after store.Cursor, from time.Time) iter.Seq2[store.StreamRecord, error] {
+	return func(yield func(store.StreamRecord, error) bool) {
 		ticker := time.NewTicker(streamPollInterval)
 		defer ticker.Stop()
 
-		// cursor is the low-water mark of each poll. It starts at from and
-		// only advances through settled history, because rows can become
-		// visible out of recorded_at order: ids are CIDs (not monotonic) and
-		// recorded_at is the insert transaction's start time, so a concurrent
-		// insert can commit a row at or before timestamps already streamed.
-		// Rows re-read from the unsettled window are deduped by seen, keyed
-		// by cause link with recorded_at kept for pruning.
-		cursor := from
-		seen := map[cid.Cid]time.Time{}
 		for {
 			if err := ctx.Err(); err != nil {
-				yield(store.RevocationRecord{}, err)
+				yield(store.StreamRecord{}, err)
 				return
 			}
 
-			// The horizon is read before the rows so it never overtakes them.
-			var dbNow time.Time
-			if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("reading database clock: %w", err))
-				return
-			}
-			for rec, err := range s.recordsFrom(ctx, cursor) {
+			for rec, err := range s.recordsAfter(ctx, after, from) {
 				if err != nil {
-					yield(store.RevocationRecord{}, err)
+					yield(store.StreamRecord{}, err)
 					return
-				}
-				link := rec.Cause.Link()
-				if _, ok := seen[link]; ok {
-					continue
 				}
 				if !yield(rec, nil) {
 					return
 				}
-				seen[link] = rec.RecordedAt
-			}
-			if horizon := dbNow.Add(-streamSettleWindow); horizon.After(cursor) {
-				cursor = horizon
-				for link, recordedAt := range seen {
-					if recordedAt.Before(cursor) {
-						delete(seen, link)
-					}
-				}
+				after = rec.Cursor
 			}
 
 			select {
 			case <-ctx.Done():
-				yield(store.RevocationRecord{}, ctx.Err())
+				yield(store.StreamRecord{}, ctx.Err())
 				return
 			case <-ticker.C:
 			}
@@ -162,46 +158,50 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 	}
 }
 
-func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
-		// The query is inclusive at the cursor: each poll re-reads the
-		// unsettled window and Stream skips rows it already yielded. The
-		// zero cursor predates every record, so an unbounded stream matches
-		// everything.
+func (s *Store) recordsAfter(ctx context.Context, after store.Cursor, from time.Time) iter.Seq2[store.StreamRecord, error] {
+	return func(yield func(store.StreamRecord, error) bool) {
+		// pg_current_snapshot is the statement's own snapshot, so every row
+		// below its horizon is visible to this query. The zero from predates
+		// every record, so an unbounded stream matches everything.
 		rows, err := s.pool.Query(
 			ctx,
-			`SELECT cause, revoked_delegation, path_witness, recorded_at
+			`SELECT transaction_id, id, cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
-			 WHERE recorded_at >= $1
-			 ORDER BY recorded_at, id`,
-			cursor,
+			 WHERE (transaction_id, id) > ($1, $2)
+			   AND transaction_id < pg_snapshot_xmin(pg_current_snapshot())
+			   AND recorded_at >= $3
+			 ORDER BY transaction_id, id`,
+			after.Seq,
+			after.ID,
+			from,
 		)
 		if err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("querying revocations: %w", err))
+			yield(store.StreamRecord{}, fmt.Errorf("querying revocations: %w", err))
 			return
 		}
 		defer rows.Close()
 
 		for rows.Next() {
+			var cursor store.Cursor
 			var causeBytes []byte
 			var revoke string
 			var pathWitness [][]byte
 			var recordedAt time.Time
-			if err := rows.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("scanning revocation: %w", err))
+			if err := rows.Scan(&cursor.Seq, &cursor.ID, &causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
+				yield(store.StreamRecord{}, fmt.Errorf("scanning revocation: %w", err))
 				return
 			}
 			record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
 			if err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err))
+				yield(store.StreamRecord{}, fmt.Errorf("decoding revocation: %w", err))
 				return
 			}
-			if !yield(record, nil) {
+			if !yield(store.StreamRecord{RevocationRecord: record, Cursor: cursor}, nil) {
 				return
 			}
 		}
 		if err := rows.Err(); err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("iterating revocations: %w", err))
+			yield(store.StreamRecord{}, fmt.Errorf("iterating revocations: %w", err))
 		}
 	}
 }

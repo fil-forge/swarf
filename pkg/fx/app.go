@@ -256,6 +256,7 @@ func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocati
 	e.GET("/.well-known/did.json", didDocumentHandler(id))
 	e.GET("/revocation/:cid", revocationHandler(revocations))
 	e.GET("/revocations/:from", firehoseHandler(revocations))
+	e.GET("/revocations/after/:cursor", firehoseAfterHandler(revocations))
 	e.POST("/", echo.WrapHandler(ucanServer))
 	return e
 }
@@ -303,36 +304,100 @@ func didDocumentHandler(id identity.Identity) echo.HandlerFunc {
 	}
 }
 
+// firehoseHandler streams the records recorded on or after :from. A
+// reconnect that sends Last-Event-ID resumes after that event, still without
+// any record recorded before :from.
 func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		from, err := parseFrom(c.Param("from"))
 		if err != nil {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
-		response := c.Response()
-		response.Header().Set(echo.HeaderContentType, "text/event-stream")
-		response.Header().Set(echo.HeaderCacheControl, "no-cache")
-		response.Header().Set(echo.HeaderConnection, "keep-alive")
-		response.WriteHeader(http.StatusOK)
+		after, _ := lastEventID(c.Request())
+		return streamFirehose(c, revocations, after, from, false)
+	}
+}
 
-		for record, err := range revocations.Stream(c.Request().Context(), from) {
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				writeFirehoseError(response, err)
-				// The response committed 200 before the stream began, so the
-				// status cannot carry this. Returning the error is the only
-				// thing an error handler or request logger ever sees; on nil
-				// a failed stream is indistinguishable from a clean one.
-				return fmt.Errorf("streaming revocations: %w", err)
-			}
-			if err := writeFirehoseRecord(response, record); err != nil {
-				return err
+// firehoseAfterHandler streams the records after :cursor, which is either a
+// cursor an earlier stream sent as an event's id, or "now", the head of the
+// stream when the request arrives. A reconnect that sends Last-Event-ID
+// resumes after that event instead, since it is the later position.
+func firehoseAfterHandler(revocations store.RevocationStore) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		var after store.Cursor
+		now := c.Param("cursor") == "now"
+		if !now {
+			var err error
+			if after, err = store.ParseCursor(c.Param("cursor")); err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 			}
 		}
-		return nil
+		if resumed, ok := lastEventID(c.Request()); ok {
+			after, now = resumed, false
+		}
+		if now {
+			var err error
+			if after, err = revocations.Head(c.Request().Context()); err != nil {
+				return fmt.Errorf("reading the revocation stream head: %w", err)
+			}
+		}
+		return streamFirehose(c, revocations, after, time.Time{}, now)
 	}
+}
+
+// lastEventID returns the cursor in the Last-Event-ID header an SSE client
+// sends when it reconnects: the id of the last event it received. A header
+// that does not hold a cursor, such as an id from before ids were cursors, is
+// ignored, and the stream starts where the request's URL says.
+func lastEventID(request *http.Request) (store.Cursor, bool) {
+	value := request.Header.Get("Last-Event-ID")
+	if value == "" {
+		return store.Cursor{}, false
+	}
+	cursor, err := store.ParseCursor(value)
+	if err != nil {
+		return store.Cursor{}, false
+	}
+	return cursor, true
+}
+
+// streamFirehose writes the records after the after cursor and recorded on or
+// after from as server-sent events, each with its cursor as its id. With
+// announce, it first sends the after cursor alone.
+func streamFirehose(c echo.Context, revocations store.RevocationStore, after store.Cursor, from time.Time, announce bool) error {
+	response := c.Response()
+	response.Header().Set(echo.HeaderContentType, "text/event-stream")
+	response.Header().Set(echo.HeaderCacheControl, "no-cache")
+	response.Header().Set(echo.HeaderConnection, "keep-alive")
+	response.WriteHeader(http.StatusOK)
+
+	if announce {
+		// An event with only an id sets the client's last event ID without
+		// dispatching anything, so a client that reconnects before the first
+		// record resumes from here rather than from a later head.
+		if _, err := fmt.Fprintf(response, "id: %s\n\n", after); err != nil {
+			return fmt.Errorf("writing stream head: %w", err)
+		}
+		response.Flush()
+	}
+
+	for record, err := range revocations.Stream(c.Request().Context(), after, from) {
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			writeFirehoseError(response, err)
+			// The response committed 200 before the stream began, so the
+			// status cannot carry this. Returning the error is the only
+			// thing an error handler or request logger ever sees; on nil
+			// a failed stream is indistinguishable from a clean one.
+			return fmt.Errorf("streaming revocations: %w", err)
+		}
+		if err := writeFirehoseRecord(response, record); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func revocationHandler(revocations store.RevocationStore) echo.HandlerFunc {
@@ -368,7 +433,7 @@ func parseFrom(value string) (time.Time, error) {
 	return from, nil
 }
 
-func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord) error {
+func writeFirehoseRecord(response *echo.Response, record store.StreamRecord) error {
 	path := make([]cid.Cid, len(record.Path))
 	for i, delegation := range record.Path {
 		path[i] = delegation.Link()
@@ -382,7 +447,7 @@ func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(response, "id: %s\nevent: revocation\ndata: %s\n\n", record.Cause.Link(), data); err != nil {
+	if _, err := fmt.Fprintf(response, "id: %s\nevent: revocation\ndata: %s\n\n", record.Cursor, data); err != nil {
 		return fmt.Errorf("writing revocation event: %w", err)
 	}
 	response.Flush()
