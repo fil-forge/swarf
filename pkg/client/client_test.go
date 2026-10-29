@@ -121,10 +121,15 @@ func TestPublishBatch(t *testing.T) {
 	require.NoError(t, err)
 
 	var requests int
+	// The server runs a batch's invocations concurrently, so the handler
+	// appends under a lock.
+	var mu sync.Mutex
 	var revoked []cid.Cid
 	srv := server.NewHTTP(service)
 	srv.Handle(ucancmd.Revoke.Command, ucancmd.Revoke.Handler(
 		func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
+			mu.Lock()
+			defer mu.Unlock()
 			revoked = append(revoked, req.Task().Arguments().Revoke)
 			return res.SetSuccess(&ucancmd.RevokeOK{})
 		}))

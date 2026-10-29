@@ -3,11 +3,11 @@ module github.com/fil-forge/swarf
 go 1.27.0
 
 require (
-	github.com/alanshaw/dag-json-gen v0.0.9
+	github.com/alanshaw/dag-json-gen v0.0.11
 	github.com/cenkalti/backoff/v5 v5.0.3
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/fil-forge/libforge v0.0.0-20260807225550-3e6895b41be5
-	github.com/fil-forge/ucantone v0.0.0-20260921155257-b59f1d1fcbb6
+	github.com/fil-forge/ucantone v0.0.0-20261009233513-d0abe2ce473c
 	github.com/ipfs/go-cid v0.6.2
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/labstack/echo/v4 v4.15.0
