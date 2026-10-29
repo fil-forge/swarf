@@ -8,10 +8,11 @@ Swarf is a UCAN revocation service.
 swarf serve --storage memory
 ```
 
-By default, Swarf uses PostgreSQL, version 13 or later. Configure it with `--postgres-dsn`, a
-`config.yaml`, or `SWARF_STORAGE_POSTGRES_DSN`. Configuration sections are
-`identity`, `server`, `log`, and `storage`; environment variable names use the
-`SWARF_` prefix, for example `SWARF_SERVER_PORT`.
+By default, Swarf uses PostgreSQL, version 13 or later. Configure it with
+`--postgres-dsn`, a `config.yaml`, or `SWARF_STORAGE_POSTGRES_DSN`.
+Configuration sections are `identity`, `server`, `log`, and `storage`;
+environment variable names use the `SWARF_` prefix, for example
+`SWARF_SERVER_PORT`.
 
 ## CLI
 
@@ -154,9 +155,10 @@ reconnects. The stream resumes after that event, and keeps whatever the URL
 selects: a time query reconnected this way still yields nothing recorded
 before its time, and `Last-Event-ID` takes the place of a `/revocations/after/`
 cursor. A `Last-Event-ID` that is not a cursor is ignored, and the stream
-starts where the URL says. So is one ahead of the head, except with `now`,
-where Swarf answers `409`, since starting at the head would skip the records
-since that event.
+starts where the URL says. One ahead of the head shows that the stream's
+database changed since the stream began: a time query ignores it and starts
+over from its time, and `/revocations/after/` answers `409`, since neither its
+cursor nor the head is a safe place to start.
 
 Delivery is at least once: a consumer that stores its cursor less often than
 it applies records, or reconnects with an older one, receives some records

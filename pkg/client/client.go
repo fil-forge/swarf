@@ -242,7 +242,8 @@ func (e corruptError) Unwrap() error { return e.err }
 // reconnecting with capped exponential backoff when the stream is
 // interrupted. A reconnect resumes after the last revocation the call
 // delivered, so a call yields each revocation once, and never one recorded
-// before from.
+// before from. (If the service's database moves to another server while the
+// call is open, a reconnect starts over from from, repeating revocations.)
 //
 // Revocations do not reach the firehose in recorded_at order, so a new call
 // from the timestamp of the last revocation a previous call delivered can miss
@@ -283,8 +284,9 @@ func (c *Client) StreamEvents(ctx context.Context, from time.Time) iter.Seq2[Eve
 // Not every cursor from before the service's database moved to another server
 // is ahead of the head, though, so a move still calls for resetting every
 // consumer (see Swarf's README). Starting over from Now skips the revocations
-// recorded since the consumer's last one; StreamEvents from well before that
-// one, deduped by Cause, does not.
+// that reached the firehose after the consumer's last one; StreamEvents from
+// a time well before that one's RecordedAt, or from zero, deduped by Cause,
+// does not.
 func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event, error] {
 	if after == "" {
 		return func(yield func(Event, error) bool) {

@@ -196,28 +196,19 @@ func TestFirehoseAfterRoute(t *testing.T) {
 		}
 	})
 
-	t.Run("ignores a Last-Event-ID ahead of the head", func(t *testing.T) {
-		source := &firehoseTestStore{err: context.Canceled, head: store.Cursor{Seq: 9}}
-		e := newEchoServer(id, server.NewHTTP(id), source)
-		request := httptest.NewRequest(http.MethodGet, "/revocations/after/7-bafy", nil)
-		request.Header.Set("Last-Event-ID", "10-bafz")
-		response := httptest.NewRecorder()
-		e.ServeHTTP(response, request)
+	// The store changed since the stream began, so neither the head nor
+	// :cursor, from the same stream, is a safe place to start.
+	t.Run("refuses a Last-Event-ID ahead of the head", func(t *testing.T) {
+		for _, path := range []string{"/revocations/after/7-bafy", "/revocations/after/now"} {
+			source := &firehoseTestStore{head: store.Cursor{Seq: 9}}
+			e := newEchoServer(id, server.NewHTTP(id), source)
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.Header.Set("Last-Event-ID", "10-bafz")
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, request)
 
-		require.Equal(t, http.StatusOK, response.Code)
-		require.Equal(t, store.Cursor{Seq: 7, ID: "bafy"}, source.after)
-	})
-
-	// Starting at the head instead would skip the records since that event.
-	t.Run("refuses now with a Last-Event-ID ahead of the head", func(t *testing.T) {
-		source := &firehoseTestStore{head: store.Cursor{Seq: 9}}
-		e := newEchoServer(id, server.NewHTTP(id), source)
-		request := httptest.NewRequest(http.MethodGet, "/revocations/after/now", nil)
-		request.Header.Set("Last-Event-ID", "10-bafz")
-		response := httptest.NewRecorder()
-		e.ServeHTTP(response, request)
-
-		require.Equal(t, http.StatusConflict, response.Code)
+			require.Equal(t, http.StatusConflict, response.Code, path)
+		}
 	})
 
 	// Streaming after a cursor ahead of the head would skip every record up

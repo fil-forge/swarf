@@ -339,10 +339,9 @@ func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
 // of it came from somewhere else: from before the database was moved to
 // another server, say, or before the memory store restarted. Streaming after
 // it would skip every record up to it, so the request is refused instead. A
-// Last-Event-ID ahead of the head is ignored when :cursor is a cursor, which
-// is at or before the head, so starting there repeats records but skips none;
-// with "now" it is refused, since starting at the head would skip the records
-// since that event.
+// Last-Event-ID ahead of the head is refused too: it shows the store changed
+// since the stream began, so :cursor, from the same stream, is no position in
+// this store either.
 func firehoseAfterHandler(revocations store.RevocationStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var after store.Cursor
@@ -361,12 +360,10 @@ func firehoseAfterHandler(revocations store.RevocationStore) echo.HandlerFunc {
 			return errCursorAhead
 		}
 		if resumed, ok := lastEventID(c.Request()); ok {
-			switch {
-			case resumed.Compare(head) <= 0:
-				after, now = resumed, false
-			case now:
+			if resumed.Compare(head) > 0 {
 				return errCursorAhead
 			}
+			after, now = resumed, false
 		}
 		if now {
 			after = head
