@@ -218,22 +218,17 @@ const (
 // errStreamStopped signals the stream consumer stopped iterating.
 var errStreamStopped = errors.New("revocation stream stopped")
 
-// connectError reports a stream connection that was never established, and
-// the response status if the service answered.
-type connectError struct {
-	err    error
-	status int
-}
+// ErrCursorRefused reports that the service refused a stream's cursor as one
+// it cannot have issued, because it is ahead of the service's head: a cursor
+// from before the service's database moved to another server, say. Resuming
+// after it again cannot succeed.
+var ErrCursorRefused = errors.New("revocation service refused the stream cursor")
+
+// connectError reports a stream connection that was never established.
+type connectError struct{ err error }
 
 func (e connectError) Error() string { return e.err.Error() }
 func (e connectError) Unwrap() error { return e.err }
-
-// refused reports whether the service rejected the request itself, such as a
-// cursor it did not issue, which sending it again cannot fix.
-func (e connectError) refused() bool {
-	return e.status >= 400 && e.status < 500 &&
-		e.status != http.StatusRequestTimeout && e.status != http.StatusTooManyRequests
-}
 
 // corruptError reports a stream payload that could not be decoded;
 // reconnecting would only fetch it again.
@@ -281,10 +276,15 @@ func (c *Client) StreamEvents(ctx context.Context, from time.Time) iter.Seq2[Eve
 // A call yields each revocation once, and a call resuming after the cursor of
 // the last revocation a consumer applied misses nothing. A consumer that
 // stores its cursor less often than it applies revocations has some
-// re-delivered when it resumes; dedupe those by Cause. The service refuses a
-// cursor it did not issue, such as one from before its database moved to
-// another server, and the stream then ends with an error: start again from a
-// time with StreamEvents, or from Now.
+// re-delivered when it resumes; dedupe those by Cause.
+//
+// The service refuses a cursor ahead of its head, which it cannot have
+// issued, and the stream then ends with an error wrapping ErrCursorRefused.
+// Not every cursor from before the service's database moved to another server
+// is ahead of the head, though, so a move still calls for resetting every
+// consumer (see Swarf's README). Starting over from Now skips the revocations
+// recorded since the consumer's last one; StreamEvents from well before that
+// one, deduped by Cause, does not.
 func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event, error] {
 	if after == "" {
 		return func(yield func(Event, error) bool) {
@@ -298,7 +298,7 @@ func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event,
 // with capped exponential backoff when it is interrupted. Each reconnect sends
 // the id of the last event the service sent as Last-Event-ID, so the service
 // resumes after it, still serving only what endpoint selects. It ends with an
-// error when the first connection fails or the service refuses a request.
+// error when the first connection fails or the service refuses the cursor.
 func (c *Client) stream(ctx context.Context, endpoint string) iter.Seq2[Event, error] {
 	return func(yield func(Event, error) bool) {
 		var lastEventID Cursor
@@ -321,11 +321,11 @@ func (c *Client) stream(ctx context.Context, endpoint string) iter.Seq2[Event, e
 				yield(Event{}, err)
 				return
 			}
-			if connectErr, ok := errors.AsType[connectError](err); ok {
-				// Failing to connect at all is fatal, and so is a request the
-				// service refuses; failing to reconnect an established stream
+			if _, ok := errors.AsType[connectError](err); ok {
+				// Failing to connect at all is fatal, and so is a refused
+				// cursor; failing to reconnect an established stream
 				// otherwise is retried like any interruption.
-				if !connected || connectErr.refused() {
+				if !connected || errors.Is(err, ErrCursorRefused) {
 					yield(Event{}, err)
 					return
 				}
@@ -354,7 +354,7 @@ func (c *Client) stream(ctx context.Context, endpoint string) iter.Seq2[Event, e
 func (c *Client) streamConn(ctx context.Context, endpoint string, lastEventID *Cursor, emit func(Event) bool) error {
 	request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
-		return connectError{fmt.Errorf("creating revocation stream request: %w", err), 0}
+		return connectError{fmt.Errorf("creating revocation stream request: %w", err)}
 	}
 	request.Header.Set("Accept", "text/event-stream")
 	if *lastEventID != "" {
@@ -362,11 +362,14 @@ func (c *Client) streamConn(ctx context.Context, endpoint string, lastEventID *C
 	}
 	response, err := c.httpClient.Do(request)
 	if err != nil {
-		return connectError{fmt.Errorf("opening revocation stream: %w", err), 0}
+		return connectError{fmt.Errorf("opening revocation stream: %w", err)}
 	}
 	defer response.Body.Close()
+	if response.StatusCode == http.StatusConflict {
+		return connectError{fmt.Errorf("opening revocation stream: %w (%s)", ErrCursorRefused, response.Status)}
+	}
 	if response.StatusCode != http.StatusOK {
-		return connectError{fmt.Errorf("opening revocation stream: unexpected status %s", response.Status), response.StatusCode}
+		return connectError{fmt.Errorf("opening revocation stream: unexpected status %s", response.Status)}
 	}
 
 	events := sse.NewScanner(response.Body)

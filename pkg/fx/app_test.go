@@ -208,6 +208,18 @@ func TestFirehoseAfterRoute(t *testing.T) {
 		require.Equal(t, store.Cursor{Seq: 7, ID: "bafy"}, source.after)
 	})
 
+	// Starting at the head instead would skip the records since that event.
+	t.Run("refuses now with a Last-Event-ID ahead of the head", func(t *testing.T) {
+		source := &firehoseTestStore{head: store.Cursor{Seq: 9}}
+		e := newEchoServer(id, server.NewHTTP(id), source)
+		request := httptest.NewRequest(http.MethodGet, "/revocations/after/now", nil)
+		request.Header.Set("Last-Event-ID", "10-bafz")
+		response := httptest.NewRecorder()
+		e.ServeHTTP(response, request)
+
+		require.Equal(t, http.StatusConflict, response.Code)
+	})
+
 	// Streaming after a cursor ahead of the head would skip every record up
 	// to it.
 	t.Run("refuses a cursor ahead of the head", func(t *testing.T) {

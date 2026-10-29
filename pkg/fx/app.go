@@ -314,12 +314,17 @@ func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
 			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
 		}
 		var after store.Cursor
-		if c.Request().Header.Get(headerLastEventID) != "" {
+		if resumed, ok := lastEventID(c.Request()); ok {
 			head, err := revocations.Head(c.Request().Context())
 			if err != nil {
 				return fmt.Errorf("reading the revocation stream head: %w", err)
 			}
-			after, _ = lastEventID(c.Request(), head)
+			// A cursor ahead of the head came from another database (see
+			// firehoseAfterHandler). Starting over from :from instead
+			// repeats records but skips none.
+			if resumed.Compare(head) <= 0 {
+				after = resumed
+			}
 		}
 		return streamFirehose(c, revocations, after, from, false)
 	}
@@ -333,7 +338,11 @@ func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
 // Every cursor the store issues is at or before its head, so a cursor ahead
 // of it came from somewhere else: from before the database was moved to
 // another server, say, or before the memory store restarted. Streaming after
-// it would skip every record up to it, so the request is refused instead.
+// it would skip every record up to it, so the request is refused instead. A
+// Last-Event-ID ahead of the head is ignored when :cursor is a cursor, which
+// is at or before the head, so starting there repeats records but skips none;
+// with "now" it is refused, since starting at the head would skip the records
+// since that event.
 func firehoseAfterHandler(revocations store.RevocationStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
 		var after store.Cursor
@@ -349,33 +358,41 @@ func firehoseAfterHandler(revocations store.RevocationStore) echo.HandlerFunc {
 			return fmt.Errorf("reading the revocation stream head: %w", err)
 		}
 		if after.Compare(head) > 0 {
-			return echo.NewHTTPError(http.StatusConflict, "cursor is ahead of the revocation stream; it was not issued by this stream's database")
+			return errCursorAhead
+		}
+		if resumed, ok := lastEventID(c.Request()); ok {
+			switch {
+			case resumed.Compare(head) <= 0:
+				after, now = resumed, false
+			case now:
+				return errCursorAhead
+			}
 		}
 		if now {
 			after = head
-		}
-		if resumed, ok := lastEventID(c.Request(), head); ok {
-			after, now = resumed, false
 		}
 		return streamFirehose(c, revocations, after, time.Time{}, now)
 	}
 }
 
+// errCursorAhead refuses a cursor ahead of the stream's head.
+var errCursorAhead = echo.NewHTTPError(http.StatusConflict,
+	"cursor is ahead of the revocation stream; it was not issued by this stream's database")
+
 // headerLastEventID is the header an SSE client sends when it reconnects: the
 // id of the last event it received.
 const headerLastEventID = "Last-Event-ID"
 
-// lastEventID returns the cursor in a request's Last-Event-ID header. A header
-// that does not hold a cursor at or before head -- an id from before ids were
-// cursors, say, or a cursor another database issued -- is ignored, and the
-// stream starts where the request's URL says.
-func lastEventID(request *http.Request, head store.Cursor) (store.Cursor, bool) {
+// lastEventID returns the cursor in a request's Last-Event-ID header, if it
+// holds one. A header that does not, such as an id from before ids were
+// cursors, is ignored, and the stream starts where the request's URL says.
+func lastEventID(request *http.Request) (store.Cursor, bool) {
 	value := request.Header.Get(headerLastEventID)
 	if value == "" {
 		return store.Cursor{}, false
 	}
 	cursor, err := store.ParseCursor(value)
-	if err != nil || cursor.Compare(head) > 0 {
+	if err != nil {
 		return store.Cursor{}, false
 	}
 	return cursor, true

@@ -405,9 +405,9 @@ func TestStreamAfter(t *testing.T) {
 	})
 }
 
-// A reconnect the service refuses, such as for a cursor it did not issue,
-// ends the stream with an error rather than retrying forever; a reconnect
-// that fails any other way is retried.
+// A reconnect whose cursor the service refuses ends the stream with an error
+// rather than retrying forever; a reconnect that fails any other way, a
+// client error from a proxy included, is retried.
 func TestStreamEndsWhenAReconnectIsRefused(t *testing.T) {
 	record := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
 	var mu sync.Mutex
@@ -423,6 +423,8 @@ func TestStreamEndsWhenAReconnectIsRefused(t *testing.T) {
 			_, _ = io.WriteString(writer, sseEventWithID(t, "1-a", record))
 		case 2:
 			http.Error(writer, "unavailable", http.StatusServiceUnavailable)
+		case 3:
+			http.Error(writer, "no route", http.StatusNotFound)
 		default:
 			http.Error(writer, "cursor is ahead of the revocation stream", http.StatusConflict)
 		}
@@ -449,10 +451,10 @@ func TestStreamEndsWhenAReconnectIsRefused(t *testing.T) {
 	}
 	require.Equal(t, 1, delivered)
 	require.Len(t, errs, 1)
-	require.ErrorContains(t, errs[0], "409")
+	require.ErrorIs(t, errs[0], ErrCursorRefused)
 	mu.Lock()
 	defer mu.Unlock()
-	require.Equal(t, 3, connections)
+	require.Equal(t, 4, connections)
 }
 
 func TestStreamReconnectCanceled(t *testing.T) {

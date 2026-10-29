@@ -134,7 +134,10 @@ reconnects before the first record resumes from there.
 Swarf answers `409` for a cursor ahead of the stream's head, which it cannot
 have issued: one from before its database [moved](#moving-the-database), or
 from before an in-memory store restarted. Streaming after it would skip every
-record up to it. Start again from a time, or from `now`.
+record up to it. A consumer that gets one has to start over: from `0`, or from
+a time well before the last record it applied, deduplicating by `cause`. A
+time query from that record's own `recorded_at` can miss records, as described
+above, and `now` skips every record since it.
 
 ### Cursors
 
@@ -150,8 +153,10 @@ request header, which an SSE client such as `EventSource` sends when it
 reconnects. The stream resumes after that event, and keeps whatever the URL
 selects: a time query reconnected this way still yields nothing recorded
 before its time, and `Last-Event-ID` takes the place of a `/revocations/after/`
-cursor. A `Last-Event-ID` that is not a cursor, or is one ahead of the head,
-is ignored, and the stream starts where the URL says.
+cursor. A `Last-Event-ID` that is not a cursor is ignored, and the stream
+starts where the URL says. So is one ahead of the head, except with `now`,
+where Swarf answers `409`, since starting at the head would skip the records
+since that event.
 
 Delivery is at least once: a consumer that stores its cursor less often than
 it applies records, or reconnects with an older one, receives some records
@@ -186,10 +191,11 @@ does not keep the counter, and voids every cursor issued before the move:
   server, run `UPDATE revocation SET transaction_id = '0'`, so every copied row
   streams first.
 - A consumer resuming after an old cursor can skip records. Have every consumer
-  drop its stored cursor and start again from a time at or before the last
-  record it applied. Swarf refuses with `409` an old cursor that is ahead of
-  the new server's head, but it accepts one that is not, so the refusal can't
-  be relied on to catch every old cursor.
+  drop its stored cursor and start over as it would after a `409`: from `0`, or
+  from a time well before the last record it applied, deduplicating by
+  `cause`. Swarf refuses with `409` an old cursor that is ahead of the new
+  server's head, but it accepts one that is not, so the refusal can't be relied
+  on to catch every old cursor.
 
 ## Client library
 
@@ -229,7 +235,8 @@ witness path provided with `WithWitnessPath`. `Get` returns a full
 values. `StreamAfter` returns them as `Event`s with their cursors, and so does
 `StreamEvents`, which runs `Stream`'s time query, for a consumer that starts
 from a time and then resumes by cursor. All of them reconnect when the stream
-is interrupted, resuming after the last event received.
+is interrupted, resuming after the last event received. A `409` ends the
+stream with an error wrapping `ErrCursorRefused`.
 
 ## Container images
 
