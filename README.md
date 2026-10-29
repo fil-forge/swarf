@@ -200,8 +200,10 @@ for event, err := range client.StreamAfter(ctx, swarfclient.Now) {
 must be the issuer of the revoked delegation or appear as an issuer in the
 witness path provided with `WithWitnessPath`. `Get` returns a full
 `store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
-values, and `StreamAfter` returns them with their cursors. Both reconnect when
-the stream is interrupted, resuming after the last event received.
+values. `StreamAfter` returns them as `Event`s with their cursors, and so does
+`StreamEvents`, which runs `Stream`'s time query, for a consumer that starts
+from a time and then resumes by cursor. All of them reconnect when the stream
+is interrupted, resuming after the last event received.
 
 ## Container images
 

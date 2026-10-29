@@ -243,17 +243,23 @@ func (e corruptError) Unwrap() error { return e.err }
 // revocations recorded earlier that reached the firehose later. To resume
 // across calls, use StreamAfter.
 func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error] {
-	position := "0"
-	if !from.IsZero() {
-		position = from.UTC().Format(time.RFC3339Nano)
-	}
 	return func(yield func(api.FirehoseRevocation, error) bool) {
-		for event, err := range c.stream(ctx, c.endpoint("revocations", position)) {
+		for event, err := range c.StreamEvents(ctx, from) {
 			if !yield(event.Revocation, err) {
 				return
 			}
 		}
 	}
+}
+
+// StreamEvents is Stream, yielding each revocation with its cursor, so a
+// consumer that starts with a time query can resume with StreamAfter.
+func (c *Client) StreamEvents(ctx context.Context, from time.Time) iter.Seq2[Event, error] {
+	position := "0"
+	if !from.IsZero() {
+		position = from.UTC().Format(time.RFC3339Nano)
+	}
+	return c.stream(ctx, c.endpoint("revocations", position))
 }
 
 // StreamAfter yields the firehose revocations after cursor, each with its own

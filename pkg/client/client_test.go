@@ -286,6 +286,37 @@ func TestStreamReconnectResumesAfterLastEvent(t *testing.T) {
 	require.Equal(t, request{path: path, lastEventID: "2-b"}, requests[1])
 }
 
+// StreamEvents is Stream's query, yielding each revocation's cursor too.
+func TestStreamEvents(t *testing.T) {
+	from := time.Now().UTC().Truncate(time.Second)
+	record := firehoseRecord(t, from)
+	var path string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
+		path = r.URL.Path
+		writer.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(writer, sseEventWithID(t, "3-c", record))
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	var streamed int
+	for event, err := range client.StreamEvents(context.Background(), from) {
+		require.NoError(t, err)
+		require.Equal(t, record.Cause, event.Revocation.Cause)
+		require.Equal(t, Cursor("3-c"), event.Cursor)
+		streamed++
+		break
+	}
+	require.Equal(t, 1, streamed)
+	require.Equal(t, "/revocations/"+from.Format(time.RFC3339Nano), path)
+}
+
 func TestStreamAfter(t *testing.T) {
 	recordA := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
 	recordB := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
