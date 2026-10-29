@@ -186,19 +186,24 @@ server, while new rows there get that server's. Upgrading in place with
 the counter, and cursors keep working.
 
 Moving the data with `pg_dump` and a restore, or with logical replication,
-does not keep the counter, and voids every cursor issued before the move:
+does not keep the counter, and voids every position from before the move,
+whether a stored cursor or the last event of a stream still open:
 
 - Copied rows can sit ahead of the new server's counter, and stay out of the
   stream until it catches up. Before Swarf serves the stream from the new
   server, run `UPDATE revocation SET transaction_id = '0'`, so every copied row
   streams first.
-- A consumer resuming after an old cursor can skip records, and that includes
-  a stream left open across the move, which reconnects after the last event it
-  received. Stop every consumer's stream, have each drop its stored cursor, and
-  start them over as after a `409`: from `0`, or from a time well before the
-  last record each applied, deduplicating by `cause`. Swarf refuses with `409`
-  an old cursor that is ahead of the new server's head, but it accepts one that
-  is not, so the refusal can't be relied on to catch every old cursor.
+- A consumer resuming after an old cursor can skip records, and so can a stream
+  left open across the move, which resumes after the last event it received.
+  Before Swarf serves the stream from the new server, stop every consumer's
+  stream and have each drop its stored cursor. Then start them over as after a
+  `409`: from `0`, or from a time well before the last record each applied
+  from the old server, deduplicating by `cause`. Swarf refuses with `409` an
+  old cursor that is ahead of the new server's head, but it accepts one that is
+  not, so the refusal can't be relied on to catch every old cursor.
+
+Restarting Swarf with in-memory storage voids every position in the same way,
+besides losing every record.
 
 ## Client library
 
