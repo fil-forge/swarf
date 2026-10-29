@@ -56,7 +56,7 @@ func TestMemoryRevocationStoreStream(t *testing.T) {
 	add(t, s, secondRevocation, secondPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	records, done := collectStream(s.Stream(ctx, time.Time{}))
+	records, done := collectStream(s.Stream(ctx, store.Cursor{}, time.Time{}))
 	require.Equal(t, firstRevocation.Link(), (<-records).Cause.Link())
 	require.Equal(t, secondRevocation.Link(), (<-records).Cause.Link())
 
@@ -69,12 +69,74 @@ func TestMemoryRevocationStoreStream(t *testing.T) {
 	// The from filter is inclusive: the record recorded at exactly from is
 	// re-delivered.
 	filteredCtx, filteredCancel := context.WithCancel(context.Background())
-	filtered, filteredDone := collectStream(s.Stream(filteredCtx, first.RecordedAt))
+	filtered, filteredDone := collectStream(s.Stream(filteredCtx, store.Cursor{}, first.RecordedAt))
 	require.Equal(t, firstRevocation.Link(), (<-filtered).Cause.Link())
 	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause.Link())
 	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause.Link())
 	filteredCancel()
 	require.ErrorIs(t, <-filteredDone, context.Canceled)
+}
+
+func TestMemoryRevocationStoreStreamAfterCursor(t *testing.T) {
+	s := memory.New()
+	firstRevocation, firstPath := revocationPath(t)
+	add(t, s, firstRevocation, firstPath)
+	secondRevocation, secondPath := revocationPath(t)
+	add(t, s, secondRevocation, secondPath)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	records, done := collectStream(s.Stream(ctx, store.Cursor{}, time.Time{}))
+	first := <-records
+	require.Equal(t, firstRevocation.Link(), first.Cause.Link())
+	second := <-records
+	require.Equal(t, secondRevocation.Link(), second.Cause.Link())
+	require.Positive(t, second.Cursor.Compare(first.Cursor))
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	// Every cursor the store issues is at or before its head, which is how
+	// Swarf tells a cursor another store issued.
+	head, err := s.Head(context.Background())
+	require.NoError(t, err)
+	require.LessOrEqual(t, second.Cursor.Compare(head), 0)
+
+	// A stream after the first record's cursor starts at the second.
+	resumedCtx, resumedCancel := context.WithCancel(context.Background())
+	resumed, resumedDone := collectStream(s.Stream(resumedCtx, first.Cursor, time.Time{}))
+	require.Equal(t, secondRevocation.Link(), (<-resumed).Cause.Link())
+	thirdRevocation, thirdPath := revocationPath(t)
+	add(t, s, thirdRevocation, thirdPath)
+	require.Equal(t, thirdRevocation.Link(), (<-resumed).Cause.Link())
+	resumedCancel()
+	require.ErrorIs(t, <-resumedDone, context.Canceled)
+
+	// A cursor past every record yields nothing until a record passes it.
+	aheadCtx, aheadCancel := context.WithCancel(context.Background())
+	ahead, aheadDone := collectStream(s.Stream(aheadCtx, store.Cursor{Seq: 4}, time.Time{}))
+	fourthRevocation, fourthPath := revocationPath(t)
+	add(t, s, fourthRevocation, fourthPath)
+	fifthRevocation, fifthPath := revocationPath(t)
+	add(t, s, fifthRevocation, fifthPath)
+	require.Equal(t, fifthRevocation.Link(), (<-ahead).Cause.Link())
+	aheadCancel()
+	require.ErrorIs(t, <-aheadDone, context.Canceled)
+}
+
+func TestMemoryRevocationStoreStreamAfterHead(t *testing.T) {
+	s := memory.New()
+	firstRevocation, firstPath := revocationPath(t)
+	add(t, s, firstRevocation, firstPath)
+
+	head, err := s.Head(context.Background())
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(context.Background())
+	records, done := collectStream(s.Stream(ctx, head, time.Time{}))
+
+	secondRevocation, secondPath := revocationPath(t)
+	add(t, s, secondRevocation, secondPath)
+	require.Equal(t, secondRevocation.Link(), (<-records).Cause.Link())
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
 }
 
 func TestMemoryRevocationStoreStreamBroadcasts(t *testing.T) {
@@ -83,9 +145,9 @@ func TestMemoryRevocationStoreStreamBroadcasts(t *testing.T) {
 	add(t, s, firstRevocation, firstPath)
 
 	firstCtx, firstCancel := context.WithCancel(context.Background())
-	firstRecords, firstDone := collectStream(s.Stream(firstCtx, time.Time{}))
+	firstRecords, firstDone := collectStream(s.Stream(firstCtx, store.Cursor{}, time.Time{}))
 	secondCtx, secondCancel := context.WithCancel(context.Background())
-	secondRecords, secondDone := collectStream(s.Stream(secondCtx, time.Time{}))
+	secondRecords, secondDone := collectStream(s.Stream(secondCtx, store.Cursor{}, time.Time{}))
 	<-firstRecords
 	<-secondRecords
 
@@ -107,7 +169,7 @@ func TestMemoryRevocationStoreStreamCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	for _, err := range s.Stream(ctx, time.Time{}) {
+	for _, err := range s.Stream(ctx, store.Cursor{}, time.Time{}) {
 		require.ErrorIs(t, err, context.Canceled)
 		return
 	}
@@ -124,8 +186,8 @@ func add(t *testing.T, s store.RevocationStore, revocation ucan.Invocation, path
 	require.NoError(t, s.Add(context.Background(), revocation, path))
 }
 
-func collectStream(stream iter.Seq2[store.RevocationRecord, error]) (<-chan store.RevocationRecord, <-chan error) {
-	records := make(chan store.RevocationRecord)
+func collectStream(stream iter.Seq2[store.StreamRecord, error]) (<-chan store.StreamRecord, <-chan error) {
+	records := make(chan store.StreamRecord)
 	done := make(chan error, 1)
 	go func() {
 		for record, err := range stream {

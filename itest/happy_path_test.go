@@ -4,10 +4,12 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -143,7 +145,70 @@ func TestRevocationHappyPath(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, directRecord.Path, 1)
 	require.Equal(t, direct.Link(), directRecord.Path[0].Link())
+
+	// A stream after Now starts at the firehose's head when it connects, so
+	// a revocation published once it has connected is delivered, with a
+	// cursor that resumes after it.
+	connected := make(chan struct{}, 1)
+	followClient, err := swarfclient.New(serviceIssuer.DID(), *serviceURL, swarfclient.WithHTTPClient(&http.Client{
+		Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			response, err := http.DefaultTransport.RoundTrip(request)
+			if err == nil && strings.HasPrefix(request.URL.Path, "/revocations/after/") {
+				select {
+				case connected <- struct{}{}:
+				default:
+				}
+			}
+			return response, err
+		}),
+	}))
+	require.NoError(t, err)
+	followCtx, cancelFollow := context.WithCancel(ctx)
+	defer cancelFollow()
+	events := make(chan swarfclient.Event)
+	go func() {
+		for event, err := range followClient.StreamAfter(followCtx, swarfclient.Now) {
+			if err != nil {
+				return
+			}
+			select {
+			case events <- event:
+			case <-followCtx.Done():
+				return
+			}
+		}
+	}()
+	select {
+	case <-connected:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "timed out connecting the stream after now")
+	}
+	fourth := revocationPath(t, alice, bob, carol)
+	require.NoError(t, client.Publish(ctx, bob, fourth[len(fourth)-1]))
+	var followed swarfclient.Event
+	select {
+	case followed = <-events:
+	case <-time.After(10 * time.Second):
+		require.Fail(t, "timed out waiting for the revocation after now")
+	}
+	require.Equal(t, fourth[len(fourth)-1].Link(), followed.Revocation.Revoke)
+	require.NotEmpty(t, followed.Cursor)
+	cancelFollow()
+
+	fifth := revocationPath(t, alice, bob, carol)
+	require.NoError(t, client.Publish(ctx, bob, fifth[len(fifth)-1]))
+	resumeCtx, cancelResume := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelResume()
+	for event, err := range client.StreamAfter(resumeCtx, followed.Cursor) {
+		require.NoError(t, err)
+		require.Equal(t, fifth[len(fifth)-1].Link(), event.Revocation.Revoke)
+		break
+	}
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
 func revocationPath(t *testing.T, alice, bob, carol ucan.Issuer) []ucan.Delegation {
 	t.Helper()

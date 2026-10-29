@@ -35,19 +35,23 @@ const (
 )
 
 // A Scanner reads events from a server-sent event stream. Successive calls to
-// Scan advance to the next event, whose fields Event and Data then report.
-// Scanning stops at the end of the stream or at the first read error, which
-// Err returns.
+// Scan advance to the next event, whose fields Event and Data then report,
+// and ID reports the last event ID. Scanning stops at the end of the stream or
+// at the first read error, which Err returns.
 //
-// Fields other than event and data -- id, retry, comments -- are ignored, and
-// an event carrying no data is not reported, which is what the event stream
-// format calls for:
+// Fields other than event, data, and id -- retry, comments -- are ignored, and
+// an event carrying no data is not reported, though its id still sets the last
+// event ID, which is what the event stream format calls for:
 // https://html.spec.whatwg.org/multipage/server-sent-events.html#event-stream-interpretation
 type Scanner struct {
 	lines *bufio.Scanner
 	event string
 	data  string
-	err   error
+	// id is the last event ID; idBuffer is the id field most recently read,
+	// which becomes the last event ID when its event is dispatched.
+	id       string
+	idBuffer string
+	err      error
 }
 
 // NewScanner returns a Scanner reading the event stream in r.
@@ -70,6 +74,7 @@ func (s *Scanner) Scan() bool {
 	for s.lines.Scan() {
 		line := s.lines.Text()
 		if line == "" {
+			s.id = s.idBuffer
 			if len(data) > 0 {
 				s.event, s.data = event, strings.Join(data, "\n")
 				return true
@@ -79,6 +84,9 @@ func (s *Scanner) Scan() bool {
 		}
 		if value, ok := strings.CutPrefix(line, "event:"); ok {
 			event = strings.TrimSpace(value)
+		}
+		if value, ok := strings.CutPrefix(line, "id:"); ok && !strings.ContainsRune(value, 0) {
+			s.idBuffer = strings.TrimPrefix(value, " ")
 		}
 		if value, ok := strings.CutPrefix(line, "data:"); ok {
 			value = strings.TrimPrefix(value, " ")
@@ -104,6 +112,12 @@ func (s *Scanner) Event() string { return s.event }
 
 // Data is the data of the event Scan read, its data lines joined by newlines.
 func (s *Scanner) Data() string { return s.data }
+
+// ID is the last event ID: the id the stream most recently set, by the event
+// Scan read or by an event without data before it. It is not cleared when an
+// event names no id, and outlasts the end of the stream, so a client
+// reconnecting can send it as Last-Event-ID.
+func (s *Scanner) ID() string { return s.id }
 
 // Err returns the first read error Scan met, if any. It is ErrEventTooLong
 // when one event exceeded MaxEventBytes.

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"iter"
 	"slices"
-	"sort"
 	"sync"
 	"time"
 
@@ -90,16 +89,29 @@ func (s *Store) Get(ctx context.Context, delegation cid.Cid) (store.RevocationRe
 	return copyRecord(entry.record), nil
 }
 
-// Stream returns matching revocation records and remains open until ctx is canceled.
-func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
+// Head returns the cursor of the last record added.
+func (s *Store) Head(ctx context.Context) (store.Cursor, error) {
+	if err := ctx.Err(); err != nil {
+		return store.Cursor{}, err
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return store.Cursor{Seq: s.nextSeq}, nil
+}
+
+// Stream yields matching revocation records and remains open until ctx is
+// canceled. A record's cursor is the sequence number Add gave it, and Add
+// gives each record its number under the same lock that makes it visible, so
+// no record can appear ahead of one already streamed.
+func (s *Store) Stream(ctx context.Context, after store.Cursor, from time.Time) iter.Seq2[store.StreamRecord, error] {
+	return func(yield func(store.StreamRecord, error) bool) {
 		if err := ctx.Err(); err != nil {
-			yield(store.RevocationRecord{}, err)
+			yield(store.StreamRecord{}, err)
 			return
 		}
 
 		s.mu.Lock()
-		entries, sequence := s.recordsFromLocked(0, from)
+		entries, scanned := s.recordsAfterLocked(after, from)
 		s.nextSubscriber++
 		subscriber := s.nextSubscriber
 		notification := make(chan struct{}, 1)
@@ -117,41 +129,53 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 		for {
 			for _, entry := range entries {
 				if err := ctx.Err(); err != nil {
-					yield(store.RevocationRecord{}, err)
+					yield(store.StreamRecord{}, err)
 					return
 				}
-				if !yield(copyRecord(entry.record), nil) {
+				record := store.StreamRecord{
+					RevocationRecord: copyRecord(entry.record),
+					Cursor:           entry.cursor(),
+				}
+				if !yield(record, nil) {
 					return
 				}
 			}
 
 			select {
 			case <-ctx.Done():
-				yield(store.RevocationRecord{}, ctx.Err())
+				yield(store.StreamRecord{}, ctx.Err())
 				return
 			case <-notification:
 				s.mu.RLock()
-				entries, sequence = s.recordsFromLocked(sequence, from)
+				entries, scanned = s.recordsAfterLocked(scanned, from)
 				s.mu.RUnlock()
 			}
 		}
 	}
 }
 
-func (s *Store) recordsFromLocked(sequence uint64, from time.Time) ([]memoryRecord, uint64) {
+// recordsAfterLocked returns the records after the after cursor and recorded
+// on or after from, in cursor order, and the cursor the next scan starts
+// after: the later of after and the last record added.
+func (s *Store) recordsAfterLocked(after store.Cursor, from time.Time) ([]memoryRecord, store.Cursor) {
 	entries := make([]memoryRecord, 0, len(s.records))
 	for _, entry := range s.records {
-		if entry.seq > sequence && (from.IsZero() || !entry.record.RecordedAt.Before(from)) {
+		if entry.cursor().Compare(after) > 0 && !entry.record.RecordedAt.Before(from) {
 			entries = append(entries, entry)
 		}
 	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].record.RecordedAt.Equal(entries[j].record.RecordedAt) {
-			return entries[i].seq < entries[j].seq
-		}
-		return entries[i].record.RecordedAt.Before(entries[j].record.RecordedAt)
+	slices.SortFunc(entries, func(a, b memoryRecord) int {
+		return a.cursor().Compare(b.cursor())
 	})
-	return entries, s.nextSeq
+	scanned := store.Cursor{Seq: s.nextSeq}
+	if scanned.Compare(after) < 0 {
+		scanned = after
+	}
+	return entries, scanned
+}
+
+func (r memoryRecord) cursor() store.Cursor {
+	return store.Cursor{Seq: r.seq}
 }
 
 func copyRecord(record store.RevocationRecord) store.RevocationRecord {
