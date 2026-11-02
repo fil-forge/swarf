@@ -113,13 +113,13 @@ func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStor
 	return pgstore.New(pool), nil
 }
 
-func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.RevocationStore) (*server.HTTPServer, error) {
+func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.RevocationStore, logger *zap.Logger) (*server.HTTPServer, error) {
 	didResolver, err := newDIDResolver(id, cfg.Server.InsecureDIDResolution, cfg.PLC.Directory)
 	if err != nil {
 		return nil, err
 	}
 	srv := server.NewHTTP(id, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	for _, route := range revokeRoutes(revocations, didResolver) {
+	for _, route := range revokeRoutes(revocations, didResolver, logger) {
 		srv.Handle(route.Command, route.Handler)
 	}
 	return srv, nil
@@ -156,8 +156,8 @@ func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (r
 	}, nil
 }
 
-func revokeRoutes(revocations store.RevocationStore, didResolver resolver.ByMethod) []server.Route {
-	return []server.Route{revokeRoute(revocations, didResolver), revokeBatchRoute(revocations, didResolver)}
+func revokeRoutes(revocations store.RevocationStore, didResolver resolver.ByMethod, logger *zap.Logger) []server.Route {
+	return []server.Route{revokeRoute(revocations, didResolver), revokeBatchRoute(revocations, didResolver, logger)}
 }
 
 func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMethod) server.Route {
@@ -176,24 +176,36 @@ func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMetho
 
 // revokeBatchRoute validates every revocation of the batch and stores them
 // with one write. One invalid revocation rejects the whole batch.
-func revokeBatchRoute(revocations store.RevocationStore, didResolver resolver.ByMethod) server.Route {
+func revokeBatchRoute(revocations store.RevocationStore, didResolver resolver.ByMethod, logger *zap.Logger) server.Route {
 	return ucancmd.RevokeBatch.Route(func(req *binding.Request[*ucancmd.RevokeBatchArguments], res *binding.Response[*ucancmd.RevokeBatchOK]) error {
 		args := req.Task().Arguments()
 		if len(args.Revocations) == 0 {
 			return errors.New("the batch must contain at least one revocation")
 		}
+		log := logger.With(
+			zap.Stringer("issuer", req.Invocation().Issuer()),
+			zap.Stringer("invocation", req.Invocation().Link()),
+			zap.Int("count", len(args.Revocations)),
+		)
 		witnesses := indexDelegations(req.Metadata().Delegations())
 		paths := make([][]ucan.Delegation, len(args.Revocations))
 		for i, revocation := range args.Revocations {
 			path, err := getRevocationPath(req.Context(), req.Invocation().Issuer(), revocation, witnesses, didResolver)
 			if err != nil {
-				return fmt.Errorf("revocation %d of %s: %w", i, revocation.Revoke, err)
+				err = fmt.Errorf("revocation %d of %s: %w", i, revocation.Revoke, err)
+				log.Warn("rejected revocation batch", zap.Error(err))
+				return err
 			}
 			paths[i] = path
 		}
-		if err := revocations.Add(req.Context(), req.Invocation(), paths); err != nil {
+		start := time.Now()
+		err := revocations.Add(req.Context(), req.Invocation(), paths)
+		log = log.With(zap.Duration("duration", time.Since(start)))
+		if err != nil {
+			log.Error("storing revocation batch failed", zap.Error(err))
 			return fmt.Errorf("adding revocations: %w", err)
 		}
+		log.Info("stored revocation batch")
 		return res.SetSuccess(&ucancmd.RevokeBatchOK{})
 	})
 }

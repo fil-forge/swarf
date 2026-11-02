@@ -32,6 +32,7 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func TestEchoPublicRoutes(t *testing.T) {
@@ -325,7 +326,7 @@ func newRevokeExecutor(t *testing.T, service identity.Identity, revocations stor
 	t.Helper()
 	didResolver := resolver.ByMethod{"key": key.Resolver}
 	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	for _, route := range revokeRoutes(revocations, didResolver) {
+	for _, route := range revokeRoutes(revocations, didResolver, zap.NewNop()) {
 		srv.Handle(route.Command, route.Handler)
 	}
 	serviceURL, err := url.Parse("http://swarf.test")
