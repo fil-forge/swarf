@@ -152,6 +152,38 @@ func TestMemoryRevocationStoreAddBatch(t *testing.T) {
 	})
 }
 
+func TestMemoryRevocationStoreAddBatchKeepsStoredRecord(t *testing.T) {
+	s := memory.New()
+	batch := revocationBatch(t, 1)
+	require.NoError(t, s.AddBatch(context.Background(), batch))
+	first, err := s.Get(context.Background(), batch[0].Path[0].Link())
+	require.NoError(t, err)
+
+	require.NoError(t, s.AddBatch(context.Background(), batch))
+	retried, err := s.Get(context.Background(), batch[0].Path[0].Link())
+	require.NoError(t, err)
+	require.Equal(t, first.RecordedAt, retried.RecordedAt)
+}
+
+func TestMemoryRevocationStoreStreamSkipsRetriedRecord(t *testing.T) {
+	s := memory.New()
+	batch := revocationBatch(t, 1)
+	require.NoError(t, s.AddBatch(context.Background(), batch))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	records, done := collectStream(s.Stream(ctx, time.Time{}))
+	<-records
+	require.NoError(t, s.AddBatch(context.Background(), batch))
+
+	select {
+	case record := <-records:
+		require.Failf(t, "stream re-delivered a retried record", "cause: %s", record.Cause.Link())
+	case <-time.After(100 * time.Millisecond):
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
 func TestMemoryRevocationStoreAddBatchRejectsInvalidPath(t *testing.T) {
 	s := memory.New()
 	batch := revocationBatch(t, 2)

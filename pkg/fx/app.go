@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -268,12 +269,29 @@ func (h *ucanHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
+		// The connection-level headers describe the in-process response, not
+		// the one net/http writes to the caller.
+		if _, ok := hopByHopHeaders[k]; ok {
+			continue
 		}
+		w.Header()[k] = slices.Clone(vv)
 	}
 	w.WriteHeader(resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
+}
+
+// hopByHopHeaders are the headers that apply to a single connection, in
+// canonical form (RFC 9110, section 7.6.1).
+var hopByHopHeaders = map[string]struct{}{
+	"Connection":          {},
+	"Keep-Alive":          {},
+	"Proxy-Connection":    {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
 }
 
 func (h *ucanHandler) RoundTrip(r *http.Request) (*http.Response, error) {

@@ -342,21 +342,59 @@ func TestRevokeRouteRequiresUCANHandler(t *testing.T) {
 	require.ErrorContains(t, err, "no revocation batch")
 }
 
+func TestUCANHandlerReplacesResponseHeaders(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	target, err := delegation.Delegate(bob, bob.DID(), bob.DID(), command)
+	require.NoError(t, err)
+
+	handler := newRevokeHandler(service, memory.New())
+	var written http.Header
+	executor := newExecutor(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		recorder := httptest.NewRecorder()
+		// A header set before the handler runs, as a middleware might.
+		recorder.Header().Set(echo.HeaderContentType, "text/plain")
+		handler.ServeHTTP(recorder, r)
+		written = recorder.Header().Clone()
+		return recorder.Result(), nil
+	}))
+	inv := revokeInvocation(t, bob, service.DID(), target.Link())
+	_, err = executor.Execute(execution.NewRequest(t.Context(), inv, execution.WithDelegations(target)))
+	require.NoError(t, err)
+	require.Equal(t, []string{"application/vnd.ipld.dag-cbor"}, written.Values(echo.HeaderContentType))
+}
+
 // newRevokeExecutor returns a UCAN client whose requests are served in process
 // by a server with the revoke route, storing revocations in revocations.
 func newRevokeExecutor(t *testing.T, service identity.Identity, revocations store.RevocationStore) *client.HTTPClient {
 	t.Helper()
+	return newExecutor(t, newRevokeHandler(service, revocations))
+}
+
+func newRevokeHandler(service identity.Identity, revocations store.RevocationStore) *ucanHandler {
 	didResolver := resolver.ByMethod{"key": key.Resolver}
 	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
 	route := revokeRoute(didResolver)
 	srv.Handle(route.Command, route.Handler)
-	handler := &ucanHandler{ucan: srv, revocations: revocations, logger: zap.NewNop()}
+	return &ucanHandler{ucan: srv, revocations: revocations, logger: zap.NewNop()}
+}
+
+func newExecutor(t *testing.T, transport http.RoundTripper) *client.HTTPClient {
+	t.Helper()
 	serviceURL, err := url.Parse("http://swarf.test")
 	require.NoError(t, err)
-	executor, err := client.NewHTTP(serviceURL, client.WithHTTPClient(&http.Client{Transport: handler}))
+	executor, err := client.NewHTTP(serviceURL, client.WithHTTPClient(&http.Client{Transport: transport}))
 	require.NoError(t, err)
 	return executor
 }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func revokeInvocation(t *testing.T, revoker ucan.Issuer, service did.DID, revoked cid.Cid) ucan.Invocation {
 	t.Helper()

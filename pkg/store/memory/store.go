@@ -67,6 +67,11 @@ func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) er
 	}
 	for _, revocation := range revocations {
 		revoked := revocation.Path[len(revocation.Path)-1].Link()
+		// A repeat of the stored revocation keeps its first record, as the
+		// Postgres store does, so a retry is not streamed again.
+		if existing, ok := s.records[revoked]; ok && existing.record.Cause.Link() == revocation.Cause.Link() {
+			continue
+		}
 		s.nextSeq++
 		s.records[revoked] = memoryRecord{
 			record: store.RevocationRecord{
