@@ -36,39 +36,64 @@ func New(pool *pgxpool.Pool) *Store {
 
 var _ store.RevocationStore = (*Store)(nil)
 
-// Add stores revocation and its witness path.
-func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error {
+// Add stores one revocation record per path, all caused by revocation, with a
+// single statement. The statement stores the invocation once, in
+// revocation_cause, and each record links to it.
+func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, paths [][]ucan.Delegation) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if len(path) == 0 {
-		return errors.New("revocation path must contain the revoked delegation")
+	if len(paths) == 0 {
+		return errors.New("at least one revocation path is required")
 	}
 
 	revocationBytes, err := invocation.Encode(revocation)
 	if err != nil {
 		return fmt.Errorf("encoding revocation: %w", err)
 	}
-	pathWitness := make([][]byte, len(path))
-	for i, dlg := range path {
-		pathWitness[i], err = delegation.Encode(dlg)
-		if err != nil {
-			return fmt.Errorf("encoding delegation at path index %d: %w", i, err)
+	// A Postgres array cannot hold rows of different lengths, so the paths go
+	// in as one flat list of delegations plus the bounds of each path in it.
+	// Postgres arrays are 1-based and their slices include both bounds.
+	var witnesses [][]byte
+	revoked := make([]string, len(paths))
+	pathStarts := make([]int32, len(paths))
+	pathEnds := make([]int32, len(paths))
+	for i, path := range paths {
+		if len(path) == 0 {
+			return fmt.Errorf("revocation path %d must contain the revoked delegation", i)
 		}
+		pathStarts[i] = int32(len(witnesses) + 1)
+		for j, dlg := range path {
+			witness, err := delegation.Encode(dlg)
+			if err != nil {
+				return fmt.Errorf("encoding delegation at index %d of revocation path %d: %w", j, i, err)
+			}
+			witnesses = append(witnesses, witness)
+		}
+		pathEnds[i] = int32(len(witnesses))
+		revoked[i] = path[len(path)-1].Link().String()
 	}
 
 	_, err = s.pool.Exec(
 		ctx,
-		`INSERT INTO revocation (id, cause, revoked_delegation, path_witness)
-		 VALUES ($1, $2, $3, $4)
-		 ON CONFLICT (id) DO NOTHING`,
+		`WITH cause AS (
+		   INSERT INTO revocation_cause (id, invocation)
+		   VALUES ($1, $2)
+		   ON CONFLICT (id) DO NOTHING
+		 )
+		 INSERT INTO revocation (cause_id, revoked_delegation, path_witness)
+		 SELECT $1, revoked.delegation, ($3::bytea[])[revoked.path_start:revoked.path_end]
+		 FROM unnest($4::text[], $5::int[], $6::int[]) AS revoked (delegation, path_start, path_end)
+		 ON CONFLICT (cause_id, revoked_delegation) DO NOTHING`,
 		revocation.Link().String(),
 		revocationBytes,
-		path[len(path)-1].Link().String(),
-		pathWitness,
+		witnesses,
+		revoked,
+		pathStarts,
+		pathEnds,
 	)
 	if err != nil {
-		return fmt.Errorf("storing revocation: %w", err)
+		return fmt.Errorf("storing revocations: %w", err)
 	}
 	return nil
 }
@@ -77,10 +102,11 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecord, error) {
 	row := s.pool.QueryRow(
 		ctx,
-		`SELECT cause, revoked_delegation, path_witness, recorded_at
+		`SELECT revocation_cause.invocation, revoked_delegation, path_witness, recorded_at
 		 FROM revocation
+		 JOIN revocation_cause ON revocation_cause.id = revocation.cause_id
 		 WHERE revoked_delegation = $1
-		 ORDER BY recorded_at DESC, id DESC
+		 ORDER BY recorded_at DESC, cause_id DESC
 		 LIMIT 1`,
 		revoked.String(),
 	)
@@ -114,9 +140,9 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 		// recorded_at is the insert transaction's start time, so a concurrent
 		// insert can commit a row at or before timestamps already streamed.
 		// Rows re-read from the unsettled window are deduped by seen, keyed
-		// by cause link with recorded_at kept for pruning.
+		// by cause and revoked delegation with recorded_at kept for pruning.
 		cursor := from
-		seen := map[cid.Cid]time.Time{}
+		seen := map[store.RecordKey]time.Time{}
 		for {
 			if err := ctx.Err(); err != nil {
 				yield(store.RevocationRecord{}, err)
@@ -134,20 +160,20 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 					yield(store.RevocationRecord{}, err)
 					return
 				}
-				link := rec.Cause.Link()
-				if _, ok := seen[link]; ok {
+				key := rec.Key()
+				if _, ok := seen[key]; ok {
 					continue
 				}
 				if !yield(rec, nil) {
 					return
 				}
-				seen[link] = rec.RecordedAt
+				seen[key] = rec.RecordedAt
 			}
 			if horizon := dbNow.Add(-streamSettleWindow); horizon.After(cursor) {
 				cursor = horizon
-				for link, recordedAt := range seen {
+				for key, recordedAt := range seen {
 					if recordedAt.Before(cursor) {
-						delete(seen, link)
+						delete(seen, key)
 					}
 				}
 			}
@@ -170,10 +196,11 @@ func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[sto
 		// everything.
 		rows, err := s.pool.Query(
 			ctx,
-			`SELECT cause, revoked_delegation, path_witness, recorded_at
+			`SELECT revocation_cause.invocation, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
+			 JOIN revocation_cause ON revocation_cause.id = revocation.cause_id
 			 WHERE recorded_at >= $1
-			 ORDER BY recorded_at, id`,
+			 ORDER BY recorded_at, cause_id, revoked_delegation`,
 			cursor,
 		)
 		if err != nil {

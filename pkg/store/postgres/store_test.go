@@ -17,7 +17,10 @@ import (
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
+	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/pressly/goose/v3"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -180,12 +183,110 @@ func TestPostgresRevocationStoreStreamCanceled(t *testing.T) {
 	require.Fail(t, "Stream did not return context.Canceled")
 }
 
+func TestPostgresRevocationStoreAddBatch(t *testing.T) {
+	s, _ := newTestStore(t)
+	revocation, paths := revocationBatch(t)
+
+	require.NoError(t, s.Add(t.Context(), revocation, paths))
+
+	expected := make([]recordSummary, len(paths))
+	stored := make([]recordSummary, len(paths))
+	for i, path := range paths {
+		expected[i] = summarizePath(revocation, path)
+		record, err := s.Get(t.Context(), path[len(path)-1].Link())
+		require.NoError(t, err)
+		stored[i] = summarizeRecord(record)
+	}
+	require.Equal(t, expected, stored)
+}
+
+func TestPostgresRevocationStoreAddBatchAgainStoresNothingNew(t *testing.T) {
+	s, pool := newTestStore(t)
+	revocation, paths := revocationBatch(t)
+	require.NoError(t, s.Add(t.Context(), revocation, paths))
+
+	require.NoError(t, s.Add(t.Context(), revocation, paths))
+
+	var causes, records int
+	require.NoError(t, pool.QueryRow(t.Context(),
+		`SELECT (SELECT count(*) FROM revocation_cause), (SELECT count(*) FROM revocation)`,
+	).Scan(&causes, &records))
+	require.Equal(t, []int{1, len(paths)}, []int{causes, records})
+}
+
+func TestPostgresRevocationStoreStreamDeliversEachRecordOfABatchOnce(t *testing.T) {
+	s, _ := newTestStore(t)
+	revocation, paths := revocationBatch(t)
+	require.NoError(t, s.Add(t.Context(), revocation, paths))
+
+	// The records of a batch share their cause and recorded_at. Collecting
+	// across two polls catches both a record skipped as a duplicate of its
+	// siblings and a record delivered again by the second poll.
+	ctx, cancel := context.WithCancel(t.Context())
+	records, done := collectStream(s.Stream(ctx, time.Time{}))
+	var delivered []cid.Cid
+	timeout := time.After(2500 * time.Millisecond)
+collect:
+	for {
+		select {
+		case record := <-records:
+			delivered = append(delivered, record.Revoke)
+		case <-timeout:
+			break collect
+		}
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+
+	expected := make([]cid.Cid, len(paths))
+	for i, path := range paths {
+		expected[i] = path[len(path)-1].Link()
+	}
+	require.ElementsMatch(t, expected, delivered)
+}
+
+func TestPostgresMigrationMovesCausesToTheirOwnTable(t *testing.T) {
+	pool := newTestPool(t)
+	db := stdlib.OpenDBFromPool(pool)
+	t.Cleanup(func() { _ = db.Close() })
+	goose.SetBaseFS(migrations.FS)
+	require.NoError(t, goose.SetDialect("postgres"))
+	require.NoError(t, goose.UpToContext(t.Context(), db, "sql", 1))
+
+	// A row written before revocation_cause existed, with the invocation in
+	// its own cause column.
+	revocation, path := revocationPath(t)
+	revocationBytes, err := invocation.Encode(revocation)
+	require.NoError(t, err)
+	witness, err := delegation.Encode(path[0])
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(),
+		`INSERT INTO revocation (id, cause, revoked_delegation, path_witness) VALUES ($1, $2, $3, $4)`,
+		revocation.Link().String(), revocationBytes, path[0].Link().String(), [][]byte{witness},
+	)
+	require.NoError(t, err)
+
+	require.NoError(t, migrations.Up(t.Context(), pool, zap.NewNop()))
+
+	record, err := postgres.New(pool).Get(t.Context(), path[0].Link())
+	require.NoError(t, err)
+	require.Equal(t, summarizePath(revocation, path), summarizeRecord(record))
+}
+
 func TestPostgresRevocationStoreAddRejectsInvalidPath(t *testing.T) {
 	err := postgres.New(nil).Add(context.Background(), nil, nil)
 	require.Error(t, err)
 }
 
 func newTestStore(t *testing.T) (*postgres.Store, *pgxpool.Pool) {
+	t.Helper()
+	pool := newTestPool(t)
+	require.NoError(t, migrations.Up(t.Context(), pool, zap.NewNop()))
+	return postgres.New(pool), pool
+}
+
+// newTestPool connects to a new, empty Postgres database.
+func newTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("postgres store test requires Docker")
@@ -217,13 +318,12 @@ func newTestStore(t *testing.T) (*postgres.Store, *pgxpool.Pool) {
 	pool, err := pgxpool.New(ctx, dsn)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
-	require.NoError(t, migrations.Up(ctx, pool, zap.NewNop()))
-	return postgres.New(pool), pool
+	return pool
 }
 
 func add(t *testing.T, s store.RevocationStore, revocation ucan.Invocation, path []ucan.Delegation) {
 	t.Helper()
-	require.NoError(t, s.Add(context.Background(), revocation, path))
+	require.NoError(t, s.Add(context.Background(), revocation, [][]ucan.Delegation{path}))
 }
 
 // insertAt stores a revocation record like Add, but with an explicit
@@ -239,10 +339,16 @@ func insertAt(t *testing.T, pool *pgxpool.Pool, revocation ucan.Invocation, path
 	}
 	_, err = pool.Exec(
 		context.Background(),
-		`INSERT INTO revocation (id, cause, revoked_delegation, path_witness, recorded_at)
-		 VALUES ($1, $2, $3, $4, $5)`,
+		`INSERT INTO revocation_cause (id, invocation) VALUES ($1, $2)`,
 		revocation.Link().String(),
 		revocationBytes,
+	)
+	require.NoError(t, err)
+	_, err = pool.Exec(
+		context.Background(),
+		`INSERT INTO revocation (cause_id, revoked_delegation, path_witness, recorded_at)
+		 VALUES ($1, $2, $3, $4)`,
+		revocation.Link().String(),
 		path[len(path)-1].Link().String(),
 		pathWitness,
 		recordedAt,
@@ -278,4 +384,50 @@ func revocationPath(t *testing.T) (ucan.Invocation, []ucan.Delegation) {
 	revocation, err := invocation.Invoke(issuer, did.Undef, cmd, nil)
 	require.NoError(t, err)
 	return revocation, []ucan.Delegation{delegation}
+}
+
+// revocationBatch returns an invocation revoking three delegations: two
+// directly and one through a witness path of two delegations.
+func revocationBatch(t *testing.T) (ucan.Invocation, [][]ucan.Delegation) {
+	t.Helper()
+
+	alice, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cmd, err := command.Parse("/test/revoke")
+	require.NoError(t, err)
+	delegate := func(issuer ucan.Issuer, audience did.DID) ucan.Delegation {
+		dlg, err := delegation.Delegate(issuer, audience, alice.DID(), cmd)
+		require.NoError(t, err)
+		return dlg
+	}
+	root := delegate(alice, bob.DID())
+	paths := [][]ucan.Delegation{
+		{delegate(alice, alice.DID())},
+		{root, delegate(bob, alice.DID())},
+		{delegate(alice, bob.DID())},
+	}
+	revocation, err := invocation.Invoke(alice, did.Undef, cmd, nil)
+	require.NoError(t, err)
+	return revocation, paths
+}
+
+// recordSummary is the part of a revocation record a test compares.
+type recordSummary struct {
+	Revoke cid.Cid
+	Cause  cid.Cid
+	Path   []cid.Cid
+}
+
+func summarizeRecord(record store.RevocationRecord) recordSummary {
+	return summarizePath(record.Cause, record.Path)
+}
+
+func summarizePath(revocation ucan.Invocation, path []ucan.Delegation) recordSummary {
+	links := make([]cid.Cid, len(path))
+	for i, dlg := range path {
+		links[i] = dlg.Link()
+	}
+	return recordSummary{Revoke: links[len(links)-1], Cause: revocation.Link(), Path: links}
 }

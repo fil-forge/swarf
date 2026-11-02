@@ -104,7 +104,7 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	require.Equal(t, "text/event-stream", response.Header().Get(echo.HeaderContentType))
 	require.Contains(t, response.Body.String(), "event: revocation")
 	require.Equal(t, recordedAt, source.from)
-	data := strings.TrimSuffix(strings.TrimPrefix(response.Body.String(), "id: "+revocation.Link().String()+"\nevent: revocation\ndata: "), "\n\n")
+	data := strings.TrimSuffix(strings.TrimPrefix(response.Body.String(), "id: "+revocation.Link().String()+"/"+witness.Link().String()+"\nevent: revocation\ndata: "), "\n\n")
 	var event api.FirehoseRevocation
 	require.NoError(t, event.UnmarshalDagJSON(strings.NewReader(data)))
 	require.Equal(t, witness.Link(), event.Revoke)
@@ -204,14 +204,7 @@ func TestRevokeRoute(t *testing.T) {
 	require.NoError(t, err)
 
 	revocations := memory.New()
-	didResolver := resolver.ByMethod{"key": key.Resolver}
-	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	route := revokeRoute(revocations, didResolver)
-	srv.Handle(route.Command, route.Handler)
-	serviceURL, err := url.Parse("http://swarf.test")
-	require.NoError(t, err)
-	executor, err := client.NewHTTP(serviceURL, client.WithHTTPClient(&http.Client{Transport: srv}))
-	require.NoError(t, err)
+	executor := newRevokeExecutor(t, service, revocations)
 
 	publish := func(revoker ucan.Issuer, revoked cid.Cid, path []cid.Cid, witnesses ...ucan.Delegation) error {
 		revocation, err := ucancmd.Revoke.Invoke(
@@ -245,6 +238,101 @@ func TestRevokeRoute(t *testing.T) {
 
 	// A witness path proves authority over a delegation the revoker did not issue.
 	require.NoError(t, publish(alice, target.Link(), []cid.Cid{root.Link(), target.Link()}, root, target))
+}
+
+func TestRevokeBatchRoute(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	alice, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	carol, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	root, err := delegation.Delegate(alice, bob.DID(), alice.DID(), command)
+	require.NoError(t, err)
+	// alice revokes direct directly and target through the witness path.
+	direct, err := delegation.Delegate(alice, carol.DID(), alice.DID(), command)
+	require.NoError(t, err)
+	target, err := delegation.Delegate(bob, carol.DID(), alice.DID(), command)
+	require.NoError(t, err)
+	valid := []ucancmd.RevokeArguments{
+		{Revoke: direct.Link()},
+		{Revoke: target.Link(), Path: []cid.Cid{root.Link(), target.Link()}},
+	}
+	witnesses := []ucan.Delegation{root, direct, target}
+
+	publish := func(revocations store.RevocationStore, revoker ucan.Issuer, batch []ucancmd.RevokeArguments) error {
+		revocation, err := ucancmd.RevokeBatch.Invoke(
+			revoker,
+			revoker.DID(),
+			&ucancmd.RevokeBatchArguments{Revocations: batch},
+			invocation.WithAudience(service.DID()),
+			invocation.WithNoExpiration(),
+		)
+		require.NoError(t, err)
+		executor := newRevokeExecutor(t, service, revocations)
+		response, err := executor.Execute(execution.NewRequest(t.Context(), revocation, execution.WithDelegations(witnesses...)))
+		require.NoError(t, err)
+		_, err = ucancmd.RevokeBatch.Unpack(response.Receipt())
+		return err
+	}
+
+	t.Run("stores every revocation of a valid batch", func(t *testing.T) {
+		revocations := memory.New()
+		require.NoError(t, publish(revocations, alice, valid))
+
+		var stored []cid.Cid
+		for _, revoked := range []cid.Cid{direct.Link(), target.Link()} {
+			record, err := revocations.Get(t.Context(), revoked)
+			require.NoError(t, err)
+			for _, dlg := range record.Path {
+				stored = append(stored, dlg.Link())
+			}
+		}
+		require.Equal(t, []cid.Cid{direct.Link(), root.Link(), target.Link()}, stored)
+	})
+
+	t.Run("rejects the whole batch when one revocation is invalid", func(t *testing.T) {
+		revocations := memory.New()
+		// alice did not issue target, so revoking it without a witness path
+		// is invalid.
+		invalid := []ucancmd.RevokeArguments{valid[0], {Revoke: target.Link()}}
+		err := publish(revocations, alice, invalid)
+		require.ErrorContains(t, err, "revocation 1 of "+target.Link().String()+": witness path required")
+	})
+
+	t.Run("stores nothing from a rejected batch", func(t *testing.T) {
+		revocations := memory.New()
+		invalid := []ucancmd.RevokeArguments{valid[0], {Revoke: target.Link()}}
+		require.Error(t, publish(revocations, alice, invalid))
+
+		_, err := revocations.Get(t.Context(), direct.Link())
+		require.ErrorIs(t, err, store.ErrNotFound)
+	})
+
+	t.Run("rejects an empty batch", func(t *testing.T) {
+		err := publish(memory.New(), alice, nil)
+		require.ErrorContains(t, err, "the batch must contain at least one revocation")
+	})
+}
+
+// newRevokeExecutor returns a UCAN executor sending requests to an in-process
+// server with Swarf's revoke routes, storing revocations in revocations.
+func newRevokeExecutor(t *testing.T, service identity.Identity, revocations store.RevocationStore) *client.HTTPClient {
+	t.Helper()
+	didResolver := resolver.ByMethod{"key": key.Resolver}
+	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
+	for _, route := range revokeRoutes(revocations, didResolver) {
+		srv.Handle(route.Command, route.Handler)
+	}
+	serviceURL, err := url.Parse("http://swarf.test")
+	require.NoError(t, err)
+	executor, err := client.NewHTTP(serviceURL, client.WithHTTPClient(&http.Client{Transport: srv}))
+	require.NoError(t, err)
+	return executor
 }
 
 func TestValidateRevocationPath(t *testing.T) {
@@ -295,7 +383,7 @@ type firehoseTestStore struct {
 	from time.Time
 }
 
-func (s *firehoseTestStore) Add(context.Context, ucan.Invocation, []ucan.Delegation) error {
+func (s *firehoseTestStore) Add(context.Context, ucan.Invocation, [][]ucan.Delegation) error {
 	return nil
 }
 

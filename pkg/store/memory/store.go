@@ -3,6 +3,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"iter"
 	"slices"
 	"sort"
@@ -38,21 +39,22 @@ func New() *Store {
 
 var _ store.RevocationStore = (*Store)(nil)
 
-// Add stores a revocation record for the final delegation in path.
-func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error {
+// Add stores one revocation record per path, all caused by revocation and
+// recorded at the same time.
+func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, paths [][]ucan.Delegation) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if len(path) == 0 {
-		return errors.New("revocation path must contain the revoked delegation")
+	if len(paths) == 0 {
+		return errors.New("at least one revocation path is required")
+	}
+	for i, path := range paths {
+		if len(path) == 0 {
+			return fmt.Errorf("revocation path %d must contain the revoked delegation", i)
+		}
 	}
 
-	record := store.RevocationRecord{
-		Revoke:     path[len(path)-1].Link(),
-		Cause:      revocation,
-		Path:       append([]ucan.Delegation(nil), path...),
-		RecordedAt: time.Now(),
-	}
+	recordedAt := time.Now()
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -60,10 +62,18 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 	if s.records == nil {
 		s.records = make(map[cid.Cid]memoryRecord)
 	}
-	s.nextSeq++
-	s.records[path[len(path)-1].Link()] = memoryRecord{
-		record: record,
-		seq:    s.nextSeq,
+	for _, path := range paths {
+		revoked := path[len(path)-1].Link()
+		s.nextSeq++
+		s.records[revoked] = memoryRecord{
+			record: store.RevocationRecord{
+				Revoke:     revoked,
+				Cause:      revocation,
+				Path:       slices.Clone(path),
+				RecordedAt: recordedAt,
+			},
+			seq: s.nextSeq,
+		}
 	}
 	for _, notification := range s.subscribers {
 		select {

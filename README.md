@@ -64,8 +64,9 @@ that time. Press Ctrl+C to stop streaming. Override the service endpoint with
 
 ### `POST /`
 
-The UCAN RPC endpoint. It supports `/ucan/revoke`; the invocation arguments
-identify the revoked delegation and its delegation
+The UCAN RPC endpoint. It supports `/ucan/revoke` and `/ucan/revoke/batch`.
+The `/ucan/revoke` invocation arguments identify the revoked delegation and its
+delegation
 [path witness](https://github.com/ucan-wg/revocation#path-witness). These
 delegations must be included in the invocation metadata. For example:
 
@@ -81,11 +82,23 @@ someone else further down a chain the issuer is involved in, and may be empty
 when the revocation issuer issued the revoked delegation directly. The revoked
 delegation itself must always be included in the invocation metadata.
 
+`/ucan/revoke/batch` revokes several delegations with one invocation. Swarf
+checks each revocation as it checks a `/ucan/revoke` invocation and stores all
+of them with one database write. When any revocation is invalid, Swarf rejects
+the batch and stores none of it.
+
+```ipldsch
+type RevokeBatchArguments struct {
+  revocations [RevokeArguments]
+}
+```
+
 ### `GET /revocation/:cid`
 
 Retrieves the most recent revocation for a delegation. It returns a DAG-JSON
 record containing `revoke` (the delegation CID), `cause` (the CBOR-encoded
-revocation invocation), and CBOR-encoded witness delegation blocks, or `404`
+revocation invocation, which revokes several delegations when it is a
+`/ucan/revoke/batch` invocation), and CBOR-encoded witness delegation blocks, or `404`
 when no revocation exists. For example:
 
 ```json
@@ -107,11 +120,11 @@ revocation invocation CID), and `recorded_at` (the time the record was recorded)
 to stream all stored records, or provide an RFC3339/RFC3339Nano timestamp cursor
 to stream records recorded on or after it. The cursor is inclusive so consumers
 resuming from the `recorded_at` of the last event they received do not miss
-records that share it; deduplicate by the event `id` (the `cause` CID). For
-example:
+records that share it; deduplicate by the event `id` (the `cause` CID and the
+`revoke` CID, joined by `/`). For example:
 
 ```js
-id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm
+id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm/bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4
 event: revocation
 data: {"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"},"path":[{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}],"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"recorded_at":"2026-07-17T09:00:00Z"}
 ```
@@ -132,6 +145,9 @@ err := client.Publish(ctx, revoker, revoked)
 // someone else further down a chain you are involved in.
 err = client.Publish(ctx, revoker, revoked, swarfclient.WithWitnessPath(path...))
 
+// Revoke several delegations you issued directly, with one invocation.
+err = client.PublishBatch(ctx, revoker, revokedDelegations)
+
 record, err := client.Get(ctx, delegationCID)
 
 for event, err := range client.Stream(ctx, time.Time{}) {
@@ -141,7 +157,9 @@ for event, err := range client.Stream(ctx, time.Time{}) {
 
 `Publish` self-signs the revocation invocation with the passed revoker, which
 must be the issuer of the revoked delegation or appear as an issuer in the
-witness path provided with `WithWitnessPath`. `Get` returns a full
+witness path provided with `WithWitnessPath`. `PublishBatch` sends one
+`/ucan/revoke/batch` invocation and requires the revoker to have issued every
+revoked delegation. `Get` returns a full
 `store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
 values.
 

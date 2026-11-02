@@ -28,10 +28,11 @@ type RevocationRecord struct {
 }
 
 type RevocationStore interface {
-	// Add adds a revocation record to the store. The path is the delegation chain
-	// from the root delegation to the revoked delegation. The issuer of the
-	// revocation must appear as a delegation issuer in the path.
-	Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error
+	// Add stores one revocation record per path, all caused by the revocation
+	// invocation, with a single write. Each path is the delegation chain from
+	// the root delegation to a revoked delegation. The issuer of the revocation
+	// must appear as a delegation issuer in every path.
+	Add(ctx context.Context, revocation ucan.Invocation, paths [][]ucan.Delegation) error
 	// Get retrieves a revocation record from the store by revoked delegation CID.
 	// If the record is not found, [ErrNotFound] is returned.
 	Get(ctx context.Context, revoked cid.Cid) (RevocationRecord, error)
@@ -41,4 +42,16 @@ type RevocationStore interface {
 	// timestamp of the last record they received do not miss records that share
 	// it. If from is zero, all records are returned.
 	Stream(ctx context.Context, from time.Time) iter.Seq2[RevocationRecord, error]
+}
+
+// RecordKey identifies a revocation record. One invocation can revoke several
+// delegations, so the cause alone does not identify a record.
+type RecordKey struct {
+	Cause  cid.Cid
+	Revoke cid.Cid
+}
+
+// Key returns the key identifying the record.
+func (r RevocationRecord) Key() RecordKey {
+	return RecordKey{Cause: r.Cause.Link(), Revoke: r.Revoke}
 }

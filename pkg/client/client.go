@@ -21,7 +21,6 @@ import (
 	"github.com/fil-forge/ucantone/client"
 	"github.com/fil-forge/ucantone/did"
 	"github.com/fil-forge/ucantone/execution"
-	"github.com/fil-forge/ucantone/execution/batch"
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
@@ -120,10 +119,10 @@ func (c *Client) Publish(ctx context.Context, revoker ucan.Issuer, revoked ucan.
 	return nil
 }
 
-// PublishBatch submits one /ucan/revoke invocation per revoked delegation,
-// all self-signed by revoker and sent in a single request. The revoker must be
-// the issuer of every revoked delegation; no witness path is carried. Every
-// invocation must succeed, otherwise the first failure is returned. A repeat of
+// PublishBatch submits one /ucan/revoke/batch invocation self-signed by
+// revoker, revoking every delegation in revoked. The revoker must be the
+// issuer of every revoked delegation; no witness path is carried. The service
+// stores all revocations or, when any of them is invalid, none. A repeat of
 // the same delegation is a duplicate the service records once.
 func (c *Client) PublishBatch(ctx context.Context, revoker ucan.Issuer, revoked []ucan.Delegation) error {
 	if revoker == nil {
@@ -132,36 +131,30 @@ func (c *Client) PublishBatch(ctx context.Context, revoker ucan.Issuer, revoked 
 	if len(revoked) == 0 {
 		return nil
 	}
-	invocations := make([]ucan.Invocation, 0, len(revoked))
-	for _, d := range revoked {
+	args := &ucancmd.RevokeBatchArguments{Revocations: make([]ucancmd.RevokeArguments, len(revoked))}
+	for i, d := range revoked {
 		if d == nil {
 			return errors.New("revoked delegation is required")
 		}
-		inv, err := ucancmd.Revoke.Invoke(
-			revoker,
-			revoker.DID(),
-			&ucancmd.RevokeArguments{Revoke: d.Link()},
-			invocation.WithAudience(c.ServiceID),
-			invocation.WithNoNonce(),
-			invocation.WithNoExpiration(),
-		)
-		if err != nil {
-			return fmt.Errorf("creating revoke invocation: %w", err)
-		}
-		invocations = append(invocations, inv)
+		args.Revocations[i] = ucancmd.RevokeArguments{Revoke: d.Link()}
 	}
-	response, err := c.executor.ExecuteBatch(batch.NewRequest(ctx, invocations, batch.WithDelegations(revoked...)))
+	inv, err := ucancmd.RevokeBatch.Invoke(
+		revoker,
+		revoker.DID(),
+		args,
+		invocation.WithAudience(c.ServiceID),
+		invocation.WithNoNonce(),
+		invocation.WithNoExpiration(),
+	)
+	if err != nil {
+		return fmt.Errorf("creating revoke batch invocation: %w", err)
+	}
+	response, err := c.executor.Execute(execution.NewRequest(ctx, inv, execution.WithDelegations(revoked...)))
 	if err != nil {
 		return fmt.Errorf("publishing revocations: %w", err)
 	}
-	for i, inv := range invocations {
-		receipt, ok := response.Receipt(inv.Task().Link())
-		if !ok {
-			return fmt.Errorf("no receipt for the revocation of %s", revoked[i].Link())
-		}
-		if _, err := ucancmd.Revoke.Unpack(receipt); err != nil {
-			return fmt.Errorf("unpacking revoke receipt: %w", err)
-		}
+	if _, err := ucancmd.RevokeBatch.Unpack(response.Receipt()); err != nil {
+		return fmt.Errorf("unpacking revoke batch receipt: %w", err)
 	}
 	return nil
 }
@@ -222,13 +215,14 @@ func (e corruptError) Unwrap() error { return e.err }
 // records sharing that timestamp it already delivered, so a single call
 // yields each revocation once. A new call resuming from the timestamp of the
 // last record a previous call delivered still re-receives records recorded
-// at exactly that time; dedupe those by cause CID.
+// at exactly that time; dedupe those by cause and revoked delegation CIDs,
+// because one invocation can revoke several delegations.
 func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error] {
 	return func(yield func(api.FirehoseRevocation, error) bool) {
 		resume := from
-		// seen holds the cause CIDs of delivered records recorded at exactly
-		// resume, so reconnecting at resume does not re-deliver them.
-		seen := map[cid.Cid]struct{}{}
+		// seen holds the keys of delivered records recorded at exactly resume,
+		// so reconnecting at resume does not re-deliver them.
+		seen := map[store.RecordKey]struct{}{}
 		connected := false
 		bo := backoff.NewExponentialBackOff()
 		bo.InitialInterval = streamMinBackoff
@@ -236,15 +230,16 @@ func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.Fireh
 		for {
 			err := c.streamConn(ctx, resume, func(record api.FirehoseRevocation) bool {
 				recordedAt := record.RecordedAt.Time()
+				key := store.RecordKey{Cause: record.Cause, Revoke: record.Revoke}
 				if recordedAt.Equal(resume) {
-					if _, ok := seen[record.Cause]; ok {
+					if _, ok := seen[key]; ok {
 						return true
 					}
 				} else {
 					resume = recordedAt
 					clear(seen)
 				}
-				seen[record.Cause] = struct{}{}
+				seen[key] = struct{}{}
 				return yield(record, nil)
 			})
 			if errors.Is(err, errStreamStopped) {

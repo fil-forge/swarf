@@ -119,8 +119,9 @@ func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.R
 		return nil, err
 	}
 	srv := server.NewHTTP(id, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	route := revokeRoute(revocations, didResolver)
-	srv.Handle(route.Command, route.Handler)
+	for _, route := range revokeRoutes(revocations, didResolver) {
+		srv.Handle(route.Command, route.Handler)
+	}
 	return srv, nil
 }
 
@@ -155,64 +156,100 @@ func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (r
 	}, nil
 }
 
+func revokeRoutes(revocations store.RevocationStore, didResolver resolver.ByMethod) []server.Route {
+	return []server.Route{revokeRoute(revocations, didResolver), revokeBatchRoute(revocations, didResolver)}
+}
+
 func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMethod) server.Route {
 	return ucancmd.Revoke.Route(func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
-		args := req.Task().Arguments()
-		witnesses := make(map[cid.Cid]ucan.Delegation)
-		for _, delegation := range req.Metadata().Delegations() {
-			witnesses[delegation.Link()] = delegation
+		witnesses := indexDelegations(req.Metadata().Delegations())
+		path, err := getRevocationPath(req.Context(), req.Invocation().Issuer(), *req.Task().Arguments(), witnesses, didResolver)
+		if err != nil {
+			return err
 		}
-		revoked, ok := witnesses[args.Revoke]
-		if !ok {
-			return errors.New("the revoked delegation must be included in request metadata")
-		}
-		var path []ucan.Delegation
-		if len(args.Path) == 0 {
-			// Direct revocation: the issuer of the revoked delegation revokes it
-			// themselves. A witness path is only needed to prove authority over a
-			// delegation issued by someone else further down a chain the revoker
-			// is involved in.
-			if revoked.Issuer() != req.Invocation().Issuer() {
-				return errors.New("witness path required: revocation issuer did not issue the revoked delegation")
-			}
-			if err := validator.ValidateToken(req.Context(), revoked, validator.WithDIDResolver(didResolver)); err != nil {
-				return fmt.Errorf("validating revoked delegation: %w", err)
-			}
-			path = []ucan.Delegation{revoked}
-		} else {
-			path = make([]ucan.Delegation, len(args.Path))
-			for i, link := range args.Path {
-				delegation, ok := witnesses[link]
-				if !ok {
-					return fmt.Errorf("delegation %s at path index %d is not in request metadata", link, i)
-				}
-				path[i] = delegation
-			}
-			if path[len(path)-1].Link() != args.Revoke {
-				return errors.New("revocation path must end with the revoked delegation")
-			}
-			if err := validateRevocationPath(req.Context(), path, didResolver); err != nil {
-				return fmt.Errorf("validating revocation path: %w", err)
-			}
-			// TODO: support delegated revocations, where the revocation issuer is not
-			// the same as the invocation issuer.
-			// See https://github.com/ucan-wg/revocation#delegating-revocation
-			issuerFound := false
-			for _, delegation := range path {
-				if delegation.Issuer() == req.Invocation().Issuer() {
-					issuerFound = true
-					break
-				}
-			}
-			if !issuerFound {
-				return errors.New("revocation issuer is not an issuer in the delegation path")
-			}
-		}
-		if err := revocations.Add(req.Context(), req.Invocation(), path); err != nil {
+		if err := revocations.Add(req.Context(), req.Invocation(), [][]ucan.Delegation{path}); err != nil {
 			return fmt.Errorf("adding revocation: %w", err)
 		}
 		return res.SetSuccess(&ucancmd.RevokeOK{})
 	})
+}
+
+// revokeBatchRoute validates every revocation of the batch and stores them
+// with one write. One invalid revocation rejects the whole batch.
+func revokeBatchRoute(revocations store.RevocationStore, didResolver resolver.ByMethod) server.Route {
+	return ucancmd.RevokeBatch.Route(func(req *binding.Request[*ucancmd.RevokeBatchArguments], res *binding.Response[*ucancmd.RevokeBatchOK]) error {
+		args := req.Task().Arguments()
+		if len(args.Revocations) == 0 {
+			return errors.New("the batch must contain at least one revocation")
+		}
+		witnesses := indexDelegations(req.Metadata().Delegations())
+		paths := make([][]ucan.Delegation, len(args.Revocations))
+		for i, revocation := range args.Revocations {
+			path, err := getRevocationPath(req.Context(), req.Invocation().Issuer(), revocation, witnesses, didResolver)
+			if err != nil {
+				return fmt.Errorf("revocation %d of %s: %w", i, revocation.Revoke, err)
+			}
+			paths[i] = path
+		}
+		if err := revocations.Add(req.Context(), req.Invocation(), paths); err != nil {
+			return fmt.Errorf("adding revocations: %w", err)
+		}
+		return res.SetSuccess(&ucancmd.RevokeBatchOK{})
+	})
+}
+
+func indexDelegations(delegations []ucan.Delegation) map[cid.Cid]ucan.Delegation {
+	index := make(map[cid.Cid]ucan.Delegation, len(delegations))
+	for _, delegation := range delegations {
+		index[delegation.Link()] = delegation
+	}
+	return index
+}
+
+// getRevocationPath checks that issuer may revoke args.Revoke and returns the
+// delegation path from the root delegation to the revoked one. The revoked
+// delegation and every delegation of the path must be among witnesses.
+func getRevocationPath(ctx context.Context, issuer did.DID, args ucancmd.RevokeArguments, witnesses map[cid.Cid]ucan.Delegation, didResolver resolver.ByMethod) ([]ucan.Delegation, error) {
+	revoked, ok := witnesses[args.Revoke]
+	if !ok {
+		return nil, errors.New("the revoked delegation must be included in request metadata")
+	}
+	if len(args.Path) == 0 {
+		// Direct revocation: the issuer of the revoked delegation revokes it
+		// themselves. A witness path is only needed to prove authority over a
+		// delegation issued by someone else further down a chain the revoker
+		// is involved in.
+		if revoked.Issuer() != issuer {
+			return nil, errors.New("witness path required: revocation issuer did not issue the revoked delegation")
+		}
+		if err := validator.ValidateToken(ctx, revoked, validator.WithDIDResolver(didResolver)); err != nil {
+			return nil, fmt.Errorf("validating revoked delegation: %w", err)
+		}
+		return []ucan.Delegation{revoked}, nil
+	}
+	path := make([]ucan.Delegation, len(args.Path))
+	for i, link := range args.Path {
+		delegation, ok := witnesses[link]
+		if !ok {
+			return nil, fmt.Errorf("delegation %s at path index %d is not in request metadata", link, i)
+		}
+		path[i] = delegation
+	}
+	if path[len(path)-1].Link() != args.Revoke {
+		return nil, errors.New("revocation path must end with the revoked delegation")
+	}
+	if err := validateRevocationPath(ctx, path, didResolver); err != nil {
+		return nil, fmt.Errorf("validating revocation path: %w", err)
+	}
+	// TODO: support delegated revocations, where the revocation issuer is not
+	// the same as the invocation issuer.
+	// See https://github.com/ucan-wg/revocation#delegating-revocation
+	for _, delegation := range path {
+		if delegation.Issuer() == issuer {
+			return path, nil
+		}
+	}
+	return nil, errors.New("revocation issuer is not an issuer in the delegation path")
 }
 
 func validateRevocationPath(ctx context.Context, path []ucan.Delegation, didResolver resolver.ByMethod) error {
@@ -382,7 +419,9 @@ func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(response, "id: %s\nevent: revocation\ndata: %s\n\n", record.Cause.Link(), data); err != nil {
+	// One invocation can revoke several delegations, so the event id names
+	// both the cause and the revoked delegation.
+	if _, err := fmt.Fprintf(response, "id: %s/%s\nevent: revocation\ndata: %s\n\n", record.Cause.Link(), record.Revoke, data); err != nil {
 		return fmt.Errorf("writing revocation event: %w", err)
 	}
 	response.Flush()

@@ -14,6 +14,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
+	"github.com/ipfs/go-cid"
 	"github.com/stretchr/testify/require"
 )
 
@@ -114,6 +115,22 @@ func TestMemoryRevocationStoreStreamCanceled(t *testing.T) {
 	require.Fail(t, "Stream did not return context.Canceled")
 }
 
+func TestMemoryRevocationStoreAddBatch(t *testing.T) {
+	s := memory.New()
+	revocation, first := revocationPath(t)
+	_, second := revocationPath(t)
+
+	require.NoError(t, s.Add(t.Context(), revocation, [][]ucan.Delegation{first, second}))
+
+	var stored []cid.Cid
+	for _, path := range [][]ucan.Delegation{first, second} {
+		record, err := s.Get(t.Context(), path[0].Link())
+		require.NoError(t, err)
+		stored = append(stored, record.Revoke, record.Cause.Link())
+	}
+	require.Equal(t, []cid.Cid{first[0].Link(), revocation.Link(), second[0].Link(), revocation.Link()}, stored)
+}
+
 func TestMemoryRevocationStoreAddRejectsInvalidPath(t *testing.T) {
 	err := memory.New().Add(context.Background(), nil, nil)
 	require.Error(t, err)
@@ -121,7 +138,7 @@ func TestMemoryRevocationStoreAddRejectsInvalidPath(t *testing.T) {
 
 func add(t *testing.T, s store.RevocationStore, revocation ucan.Invocation, path []ucan.Delegation) {
 	t.Helper()
-	require.NoError(t, s.Add(context.Background(), revocation, path))
+	require.NoError(t, s.Add(context.Background(), revocation, [][]ucan.Delegation{path}))
 }
 
 func collectStream(stream iter.Seq2[store.RevocationRecord, error]) (<-chan store.RevocationRecord, <-chan error) {

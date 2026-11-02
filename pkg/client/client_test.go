@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -121,17 +122,12 @@ func TestPublishBatch(t *testing.T) {
 	require.NoError(t, err)
 
 	var requests int
-	// The server runs a batch's invocations concurrently, so the handler
-	// appends under a lock.
-	var mu sync.Mutex
-	var revoked []cid.Cid
+	var revoked []ucancmd.RevokeArguments
 	srv := server.NewHTTP(service)
-	srv.Handle(ucancmd.Revoke.Command, ucancmd.Revoke.Handler(
-		func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
-			mu.Lock()
-			defer mu.Unlock()
-			revoked = append(revoked, req.Task().Arguments().Revoke)
-			return res.SetSuccess(&ucancmd.RevokeOK{})
+	srv.Handle(ucancmd.RevokeBatch.Command, ucancmd.RevokeBatch.Handler(
+		func(req *binding.Request[*ucancmd.RevokeBatchArguments], res *binding.Response[*ucancmd.RevokeBatchOK]) error {
+			revoked = append(revoked, req.Task().Arguments().Revocations...)
+			return res.SetSuccess(&ucancmd.RevokeBatchOK{})
 		}))
 	transport := http.RoundTripper(roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		requests++
@@ -143,9 +139,13 @@ func TestPublishBatch(t *testing.T) {
 	client, err := New(service.DID(), *serviceURL, WithHTTPClient(&http.Client{Transport: transport}))
 	require.NoError(t, err)
 
-	require.NoError(t, client.PublishBatch(context.Background(), alice, []ucan.Delegation{first, second}))
-	require.Equal(t, 1, requests, "one request carries every revocation")
-	require.ElementsMatch(t, []cid.Cid{first.Link(), second.Link()}, revoked)
+	t.Run("revokes every delegation with one invocation", func(t *testing.T) {
+		requests, revoked = 0, nil
+		require.NoError(t, client.PublishBatch(context.Background(), alice, []ucan.Delegation{first, second}))
+		require.Equal(t,
+			[]any{1, []ucancmd.RevokeArguments{{Revoke: first.Link()}, {Revoke: second.Link()}}},
+			[]any{requests, revoked})
+	})
 
 	t.Run("publishes nothing for no delegations", func(t *testing.T) {
 		requests = 0
@@ -153,18 +153,16 @@ func TestPublishBatch(t *testing.T) {
 		require.Equal(t, 0, requests)
 	})
 
-	t.Run("fails when a revocation is refused", func(t *testing.T) {
+	t.Run("fails when the batch is refused", func(t *testing.T) {
 		refusing := server.NewHTTP(service)
-		refusing.Handle(ucancmd.Revoke.Command, ucancmd.Revoke.Handler(
-			func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
-				if req.Task().Arguments().Revoke == second.Link() {
-					return res.SetFailure(errors.New("refused"))
-				}
-				return res.SetSuccess(&ucancmd.RevokeOK{})
+		refusing.Handle(ucancmd.RevokeBatch.Command, ucancmd.RevokeBatch.Handler(
+			func(req *binding.Request[*ucancmd.RevokeBatchArguments], res *binding.Response[*ucancmd.RevokeBatchOK]) error {
+				return res.SetFailure(errors.New("refused"))
 			}))
 		client, err := New(service.DID(), *serviceURL, WithHTTPClient(&http.Client{Transport: refusing}))
 		require.NoError(t, err)
-		require.Error(t, client.PublishBatch(context.Background(), alice, []ucan.Delegation{first, second}))
+		err = client.PublishBatch(context.Background(), alice, []ucan.Delegation{first, second})
+		require.ErrorContains(t, err, "refused")
 	})
 }
 
@@ -288,6 +286,62 @@ func TestStreamReconnectDedupes(t *testing.T) {
 	require.GreaterOrEqual(t, len(requests), 2)
 	require.Equal(t, "/revocations/0", requests[0])
 	require.Equal(t, "/revocations/"+boundary.Format(time.RFC3339Nano), requests[1])
+}
+
+func TestStreamReconnectMidBatchDeliversEachRecordOnce(t *testing.T) {
+	// The records of one batch share their cause and recorded_at. The stream
+	// drops after part of the batch and resumes at its timestamp, where the
+	// server sends the whole batch again.
+	recordedAt := time.Now().UTC().Truncate(time.Second)
+	batch := make([]api.FirehoseRevocation, 4)
+	for i := range batch {
+		batch[i] = firehoseRecord(t, recordedAt)
+		batch[i].Cause = batch[0].Cause
+	}
+	next := firehoseRecord(t, recordedAt.Add(time.Second))
+
+	var mu sync.Mutex
+	connections := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		connections++
+		connection := connections
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "text/event-stream")
+		switch connection {
+		case 1:
+			for _, record := range batch[:2] {
+				_, _ = io.WriteString(writer, sseEvent(t, record))
+			}
+		case 2:
+			for _, record := range append(slices.Clone(batch), next) {
+				_, _ = io.WriteString(writer, sseEvent(t, record))
+			}
+		default:
+			<-request.Context().Done()
+		}
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	// Stopping at the record after the batch catches both a batch record
+	// skipped as a duplicate of its siblings and one delivered twice.
+	var received []cid.Cid
+	for record, err := range client.Stream(context.Background(), time.Time{}) {
+		require.NoError(t, err)
+		received = append(received, record.Revoke)
+		if record.Revoke == next.Revoke {
+			break
+		}
+	}
+	expected := []cid.Cid{batch[0].Revoke, batch[1].Revoke, batch[2].Revoke, batch[3].Revoke, next.Revoke}
+	require.Equal(t, expected, received)
 }
 
 func TestStreamReconnectCanceled(t *testing.T) {
