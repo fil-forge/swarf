@@ -119,6 +119,49 @@ func TestMemoryRevocationStoreAddRejectsInvalidPath(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestMemoryRevocationStoreAddBatch(t *testing.T) {
+	s := memory.New()
+	batch := revocationBatch(t, 5)
+	require.NoError(t, s.AddBatch(context.Background(), batch))
+
+	first, err := s.Get(context.Background(), batch[0].Path[0].Link())
+	require.NoError(t, err)
+
+	t.Run("records share one timestamp", func(t *testing.T) {
+		for _, revocation := range batch {
+			record, err := s.Get(context.Background(), revocation.Path[0].Link())
+			require.NoError(t, err)
+			require.Equal(t, first.RecordedAt, record.RecordedAt)
+		}
+	})
+
+	t.Run("stream delivers each record once", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		records, done := collectStream(s.Stream(ctx, first.RecordedAt))
+		delivered := map[string]int{}
+		for range batch {
+			delivered[(<-records).Cause.Link().String()]++
+		}
+		expected := map[string]int{}
+		for _, revocation := range batch {
+			expected[revocation.Cause.Link().String()] = 1
+		}
+		require.Equal(t, expected, delivered)
+		cancel()
+		require.ErrorIs(t, <-done, context.Canceled)
+	})
+}
+
+func TestMemoryRevocationStoreAddBatchRejectsInvalidPath(t *testing.T) {
+	s := memory.New()
+	batch := revocationBatch(t, 2)
+	batch[1].Path = nil
+	require.ErrorContains(t, s.AddBatch(context.Background(), batch), "batch index 1")
+
+	_, err := s.Get(context.Background(), batch[0].Path[0].Link())
+	require.ErrorIs(t, err, store.ErrNotFound, "a rejected batch stores nothing")
+}
+
 func add(t *testing.T, s store.RevocationStore, revocation ucan.Invocation, path []ucan.Delegation) {
 	t.Helper()
 	require.NoError(t, s.Add(context.Background(), revocation, path))
@@ -152,4 +195,14 @@ func revocationPath(t *testing.T) (ucan.Invocation, []ucan.Delegation) {
 	revocation, err := invocation.Invoke(issuer, did.Undef, cmd, nil)
 	require.NoError(t, err)
 	return revocation, []ucan.Delegation{delegation}
+}
+
+func revocationBatch(t *testing.T, size int) []store.Revocation {
+	t.Helper()
+	batch := make([]store.Revocation, size)
+	for i := range batch {
+		revocation, path := revocationPath(t)
+		batch[i] = store.Revocation{Cause: revocation, Path: path}
+	}
+	return batch
 }

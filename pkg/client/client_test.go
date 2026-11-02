@@ -290,6 +290,63 @@ func TestStreamReconnectDedupes(t *testing.T) {
 	require.Equal(t, "/revocations/"+boundary.Format(time.RFC3339Nano), requests[1])
 }
 
+func TestStreamReconnectMidBatchDedupes(t *testing.T) {
+	// Revocations stored by one batch write share recorded_at. The stream
+	// drops after delivering part of such a batch and resumes at its
+	// timestamp, where the server sends the whole batch again.
+	recordedAt := time.Now().UTC().Truncate(time.Second)
+	batch := make([]api.FirehoseRevocation, 5)
+	for i := range batch {
+		batch[i] = firehoseRecord(t, recordedAt)
+	}
+
+	var mu sync.Mutex
+	connections := 0
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		connections++
+		connection := connections
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "text/event-stream")
+		switch connection {
+		case 1:
+			for _, record := range batch[:3] {
+				_, _ = io.WriteString(writer, sseEvent(t, record))
+			}
+		case 2:
+			for _, record := range batch {
+				_, _ = io.WriteString(writer, sseEvent(t, record))
+			}
+		default:
+			<-request.Context().Done()
+		}
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	// A record re-delivered on reconnect would take one of the five places
+	// the remaining records of the batch need.
+	var received []cid.Cid
+	for record, err := range client.Stream(context.Background(), time.Time{}) {
+		require.NoError(t, err)
+		received = append(received, record.Cause)
+		if len(received) == len(batch) {
+			break
+		}
+	}
+	expected := make([]cid.Cid, len(batch))
+	for i, record := range batch {
+		expected[i] = record.Cause
+	}
+	require.Equal(t, expected, received)
+}
+
 func TestStreamReconnectCanceled(t *testing.T) {
 	record := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
