@@ -2,8 +2,11 @@ package postgres_test
 
 import (
 	"context"
+	"fmt"
 	"iter"
 	"runtime"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -17,6 +20,8 @@ import (
 	"github.com/fil-forge/ucantone/ucan/command"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
+	"github.com/ipfs/go-cid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
@@ -185,7 +190,105 @@ func TestPostgresRevocationStoreAddRejectsInvalidPath(t *testing.T) {
 	require.Error(t, err)
 }
 
-func newTestStore(t *testing.T) (*postgres.Store, *pgxpool.Pool) {
+func TestPostgresRevocationStoreAddBatch(t *testing.T) {
+	s, _ := newTestStore(t)
+	// Paths of different lengths check that each row gets its own slice of
+	// the witnesses sent for the whole batch.
+	batch := []store.Revocation{
+		revocationWithPathLength(t, 1),
+		revocationWithPathLength(t, 3),
+		revocationWithPathLength(t, 2),
+	}
+	require.NoError(t, s.AddBatch(context.Background(), batch))
+
+	first, err := s.Get(context.Background(), revokedLink(batch[0]))
+	require.NoError(t, err)
+
+	for i, revocation := range batch {
+		t.Run(fmt.Sprintf("stores revocation %d with its own path and the shared timestamp", i), func(t *testing.T) {
+			record, err := s.Get(context.Background(), revokedLink(revocation))
+			require.NoError(t, err)
+			require.Equal(t, storedRevocation{
+				Revoke:     revokedLink(revocation),
+				Cause:      revocation.Cause.Link(),
+				Path:       pathLinks(revocation.Path),
+				RecordedAt: first.RecordedAt,
+			}, storedRevocation{
+				Revoke:     record.Revoke,
+				Cause:      record.Cause.Link(),
+				Path:       pathLinks(record.Path),
+				RecordedAt: record.RecordedAt,
+			})
+		})
+	}
+}
+
+func TestPostgresRevocationStoreAddBatchIssuesOneInsert(t *testing.T) {
+	tracer := &statementTracer{}
+	s, _ := newTestStore(t, func(cfg *pgxpool.Config) { cfg.ConnConfig.Tracer = tracer })
+	batch := make([]store.Revocation, 50)
+	for i := range batch {
+		batch[i] = revocationWithPathLength(t, 1)
+	}
+	tracer.reset()
+
+	require.NoError(t, s.AddBatch(context.Background(), batch))
+	require.Equal(t, 1, tracer.count("INSERT"))
+}
+
+func TestPostgresRevocationStoreAddBatchDuplicates(t *testing.T) {
+	s, _ := newTestStore(t)
+	stored := revocationWithPathLength(t, 1)
+	add(t, s, stored.Cause, stored.Path)
+	repeated := revocationWithPathLength(t, 1)
+
+	// A revocation repeated within the batch, and one already stored, are
+	// each stored once.
+	require.NoError(t, s.AddBatch(context.Background(), []store.Revocation{stored, repeated, repeated}))
+	_, err := s.Get(context.Background(), revokedLink(repeated))
+	require.NoError(t, err)
+}
+
+func TestPostgresRevocationStoreAddBatchRejectsInvalidPath(t *testing.T) {
+	batch := []store.Revocation{revocationWithPathLength(t, 1), {Cause: revocationWithPathLength(t, 1).Cause}}
+	err := postgres.New(nil).AddBatch(context.Background(), batch)
+	require.ErrorContains(t, err, "batch index 1")
+}
+
+func TestPostgresRevocationStoreStreamBatch(t *testing.T) {
+	s, _ := newTestStore(t)
+	batch := make([]store.Revocation, 5)
+	for i := range batch {
+		batch[i] = revocationWithPathLength(t, 1)
+	}
+	require.NoError(t, s.AddBatch(context.Background(), batch))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	records, done := collectStream(s.Stream(ctx, time.Time{}))
+
+	// Every record of the batch shares recorded_at: each must arrive exactly
+	// once, in any order.
+	delivered := map[string]int{}
+	for range batch {
+		delivered[(<-records).Cause.Link().String()]++
+	}
+	expected := map[string]int{}
+	for _, revocation := range batch {
+		expected[revocation.Cause.Link().String()] = 1
+	}
+	require.Equal(t, expected, delivered)
+
+	// Hold the stream open past a poll interval: nothing is re-delivered.
+	select {
+	case record := <-records:
+		require.Failf(t, "stream re-delivered a record", "cause: %s", record.Cause.Link())
+	case <-time.After(2 * time.Second):
+	}
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
+}
+
+func newTestStore(t *testing.T, configure ...func(*pgxpool.Config)) (*postgres.Store, *pgxpool.Pool) {
 	t.Helper()
 	if testing.Short() {
 		t.Skip("postgres store test requires Docker")
@@ -214,7 +317,12 @@ func newTestStore(t *testing.T) (*postgres.Store, *pgxpool.Pool) {
 	testcontainers.CleanupContainer(t, container)
 	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
 	require.NoError(t, err)
-	pool, err := pgxpool.New(ctx, dsn)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	require.NoError(t, err)
+	for _, fn := range configure {
+		fn(cfg)
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 	require.NoError(t, migrations.Up(ctx, pool, zap.NewNop()))
@@ -278,4 +386,71 @@ func revocationPath(t *testing.T) (ucan.Invocation, []ucan.Delegation) {
 	revocation, err := invocation.Invoke(issuer, did.Undef, cmd, nil)
 	require.NoError(t, err)
 	return revocation, []ucan.Delegation{delegation}
+}
+
+// revocationWithPathLength returns a revocation whose path holds length
+// delegations. The store does not validate the chain, so the delegations are
+// unrelated.
+func revocationWithPathLength(t *testing.T, length int) store.Revocation {
+	t.Helper()
+	revocation, path := revocationPath(t)
+	for len(path) < length {
+		_, more := revocationPath(t)
+		path = append(more, path...)
+	}
+	return store.Revocation{Cause: revocation, Path: path}
+}
+
+func revokedLink(revocation store.Revocation) cid.Cid {
+	return revocation.Path[len(revocation.Path)-1].Link()
+}
+
+func pathLinks(path []ucan.Delegation) []cid.Cid {
+	links := make([]cid.Cid, len(path))
+	for i, dlg := range path {
+		links[i] = dlg.Link()
+	}
+	return links
+}
+
+// storedRevocation is the comparable part of a [store.RevocationRecord].
+type storedRevocation struct {
+	Revoke     cid.Cid
+	Cause      cid.Cid
+	Path       []cid.Cid
+	RecordedAt time.Time
+}
+
+// statementTracer records the SQL of every query run through the pool.
+type statementTracer struct {
+	mu  sync.Mutex
+	sql []string
+}
+
+func (s *statementTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sql = append(s.sql, data.SQL)
+	return ctx
+}
+
+func (s *statementTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+func (s *statementTracer) reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sql = nil
+}
+
+// count returns how many recorded statements start with keyword.
+func (s *statementTracer) count(keyword string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, sql := range s.sql {
+		if strings.HasPrefix(strings.TrimSpace(sql), keyword) {
+			n++
+		}
+	}
+	return n
 }

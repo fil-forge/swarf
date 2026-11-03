@@ -81,6 +81,12 @@ someone else further down a chain the issuer is involved in, and may be empty
 when the revocation issuer issued the revoked delegation directly. The revoked
 delegation itself must always be included in the invocation metadata.
 
+A request may carry several `/ucan/revoke` invocations. Each one is validated
+on its own and gets its own receipt, and the valid ones are stored together
+with one database write once every invocation has run, so they share the same
+`recorded_at`. If that write fails, the whole request fails with HTTP 500 and
+no receipts; retrying it is safe.
+
 ### `GET /revocation/:cid`
 
 Retrieves the most recent revocation for a delegation. It returns a DAG-JSON

@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	jsg "github.com/alanshaw/dag-json-gen"
@@ -113,13 +116,13 @@ func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStor
 	return pgstore.New(pool), nil
 }
 
-func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.RevocationStore) (*server.HTTPServer, error) {
+func newUCANServer(id identity.Identity, cfg *config.Config) (*server.HTTPServer, error) {
 	didResolver, err := newDIDResolver(id, cfg.Server.InsecureDIDResolution, cfg.PLC.Directory)
 	if err != nil {
 		return nil, err
 	}
 	srv := server.NewHTTP(id, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	route := revokeRoute(revocations, didResolver)
+	route := revokeRoute(didResolver)
 	srv.Handle(route.Command, route.Handler)
 	return srv, nil
 }
@@ -155,8 +158,15 @@ func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (r
 	}, nil
 }
 
-func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMethod) server.Route {
+// revokeRoute validates a revocation and adds it to the request's
+// [revocationBatch], which [ucanHandler] stores once every invocation of the
+// request has run.
+func revokeRoute(didResolver resolver.ByMethod) server.Route {
 	return ucancmd.Revoke.Route(func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
+		batch, ok := req.Context().Value(revocationBatchKey{}).(*revocationBatch)
+		if !ok {
+			return errors.New("no revocation batch in the request context: the UCAN server must be served through ucanHandler")
+		}
 		args := req.Task().Arguments()
 		witnesses := make(map[cid.Cid]ucan.Delegation)
 		for _, delegation := range req.Metadata().Delegations() {
@@ -208,10 +218,11 @@ func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMetho
 				return errors.New("revocation issuer is not an issuer in the delegation path")
 			}
 		}
-		if err := revocations.Add(req.Context(), req.Invocation(), path); err != nil {
-			return fmt.Errorf("adding revocation: %w", err)
+		if err := res.SetSuccess(&ucancmd.RevokeOK{}); err != nil {
+			return err
 		}
-		return res.SetSuccess(&ucancmd.RevokeOK{})
+		batch.add(store.Revocation{Cause: req.Invocation(), Path: path})
+		return nil
 	})
 }
 
@@ -240,7 +251,96 @@ func validateRevocationPath(ctx context.Context, path []ucan.Delegation, didReso
 	return nil
 }
 
-func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocations store.RevocationStore) *echo.Echo {
+// ucanHandler serves UCAN requests and stores the revocations of each request
+// with a single store write, once every invocation of the request has run.
+// Receipts reach the caller only after that write succeeds; when it fails,
+// the whole request fails and no receipt is sent.
+type ucanHandler struct {
+	ucan        *server.HTTPServer
+	revocations store.RevocationStore
+	logger      *zap.Logger
+}
+
+func (h *ucanHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	resp, err := h.RoundTrip(r)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("handling request: %v", err), http.StatusInternalServerError)
+		return
+	}
+	defer resp.Body.Close()
+	for k, vv := range resp.Header {
+		// The connection-level headers describe the in-process response, not
+		// the one net/http writes to the caller.
+		if _, ok := hopByHopHeaders[k]; ok {
+			continue
+		}
+		w.Header()[k] = slices.Clone(vv)
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
+}
+
+// hopByHopHeaders are the headers that apply to a single connection, in
+// canonical form (RFC 9110, section 7.6.1).
+var hopByHopHeaders = map[string]struct{}{
+	"Connection":          {},
+	"Keep-Alive":          {},
+	"Proxy-Connection":    {},
+	"Proxy-Authenticate":  {},
+	"Proxy-Authorization": {},
+	"Te":                  {},
+	"Trailer":             {},
+	"Transfer-Encoding":   {},
+	"Upgrade":             {},
+}
+
+func (h *ucanHandler) RoundTrip(r *http.Request) (*http.Response, error) {
+	batch := &revocationBatch{}
+	resp, err := h.ucan.RoundTrip(r.WithContext(context.WithValue(r.Context(), revocationBatchKey{}, batch)))
+	if err != nil {
+		return nil, err
+	}
+	if err := h.store(r.Context(), batch.revocations); err != nil {
+		resp.Body.Close()
+		return nil, err
+	}
+	return resp, nil
+}
+
+func (h *ucanHandler) store(ctx context.Context, revocations []store.Revocation) error {
+	if len(revocations) == 0 {
+		return nil
+	}
+	start := time.Now()
+	err := h.revocations.AddBatch(ctx, revocations)
+	duration := time.Since(start)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			h.logger.Error("storing revocations failed",
+				zap.Int("count", len(revocations)), zap.Duration("duration", duration), zap.Error(err))
+		}
+		return fmt.Errorf("storing revocations: %w", err)
+	}
+	h.logger.Info("stored revocations", zap.Int("count", len(revocations)), zap.Duration("duration", duration))
+	return nil
+}
+
+type revocationBatchKey struct{}
+
+// revocationBatch collects the revocations validated by the handlers of one
+// request. The handlers of a batch request run concurrently.
+type revocationBatch struct {
+	mu          sync.Mutex
+	revocations []store.Revocation
+}
+
+func (b *revocationBatch) add(revocation store.Revocation) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.revocations = append(b.revocations, revocation)
+}
+
+func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocations store.RevocationStore, logger *zap.Logger) *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 	// Outermost middleware: a handler panic becomes a 500 rather than a
@@ -256,7 +356,7 @@ func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocati
 	e.GET("/.well-known/did.json", didDocumentHandler(id))
 	e.GET("/revocation/:cid", revocationHandler(revocations))
 	e.GET("/revocations/:from", firehoseHandler(revocations))
-	e.POST("/", echo.WrapHandler(ucanServer))
+	e.POST("/", echo.WrapHandler(&ucanHandler{ucan: ucanServer, revocations: revocations, logger: logger}))
 	return e
 }
 

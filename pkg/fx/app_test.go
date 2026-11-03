@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,7 @@ import (
 	"github.com/fil-forge/ucantone/did/key"
 	"github.com/fil-forge/ucantone/did/resolver"
 	"github.com/fil-forge/ucantone/execution"
+	"github.com/fil-forge/ucantone/execution/batch"
 	"github.com/fil-forge/ucantone/multikey/ed25519"
 	"github.com/fil-forge/ucantone/server"
 	"github.com/fil-forge/ucantone/ucan"
@@ -32,12 +34,13 @@ import (
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
 	"github.com/stretchr/testify/require"
+	"go.uber.org/zap"
 )
 
 func TestEchoPublicRoutes(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
-	e := newEchoServer(id, server.NewHTTP(id), memory.New())
+	e := newEchoServer(id, server.NewHTTP(id), memory.New(), zap.NewNop())
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	response := httptest.NewRecorder()
@@ -64,7 +67,7 @@ func TestEchoPublicRoutes(t *testing.T) {
 func TestAHandlerPanicBecomesAServerError(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
-	e := newEchoServer(id, server.NewHTTP(id), memory.New())
+	e := newEchoServer(id, server.NewHTTP(id), memory.New(), zap.NewNop())
 	e.GET("/panic", func(echo.Context) error { panic("handler exploded") })
 
 	response := httptest.NewRecorder()
@@ -95,7 +98,7 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	source := &firehoseTestStore{
 		record: store.RevocationRecord{Revoke: witness.Link(), Cause: revocation, Path: []ucan.Delegation{witness}, RecordedAt: recordedAt},
 	}
-	e := newEchoServer(id, server.NewHTTP(id), source)
+	e := newEchoServer(id, server.NewHTTP(id), source, zap.NewNop())
 	request := httptest.NewRequest(http.MethodGet, "/revocations/"+recordedAt.Format(time.RFC3339Nano), nil)
 	response := httptest.NewRecorder()
 	e.ServeHTTP(response, request)
@@ -123,7 +126,7 @@ func TestFirehoseRouteReportsAStoreFailure(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
 	source := &firehoseTestStore{err: errors.New("getting revocations: connection refused")}
-	e := newEchoServer(id, server.NewHTTP(id), source)
+	e := newEchoServer(id, server.NewHTTP(id), source, zap.NewNop())
 	logged := observeRequests(e)
 
 	response := httptest.NewRecorder()
@@ -143,7 +146,7 @@ func TestFirehoseRouteDoesNotReportACanceledRequest(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
 	source := &firehoseTestStore{err: context.Canceled}
-	e := newEchoServer(id, server.NewHTTP(id), source)
+	e := newEchoServer(id, server.NewHTTP(id), source, zap.NewNop())
 	logged := observeRequests(e)
 
 	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/revocations/0", nil))
@@ -175,7 +178,7 @@ func TestRevocationRouteReturnsDAGJSON(t *testing.T) {
 	revocation, err := invocation.Invoke(id, did.Undef, command, nil)
 	require.NoError(t, err)
 	source := &firehoseTestStore{record: store.RevocationRecord{Revoke: revocation.Link(), Cause: revocation}}
-	e := newEchoServer(id, server.NewHTTP(id), source)
+	e := newEchoServer(id, server.NewHTTP(id), source, zap.NewNop())
 	request := httptest.NewRequest(http.MethodGet, "/revocation/"+revocation.Link().String(), nil)
 	response := httptest.NewRecorder()
 	e.ServeHTTP(response, request)
@@ -204,14 +207,7 @@ func TestRevokeRoute(t *testing.T) {
 	require.NoError(t, err)
 
 	revocations := memory.New()
-	didResolver := resolver.ByMethod{"key": key.Resolver}
-	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	route := revokeRoute(revocations, didResolver)
-	srv.Handle(route.Command, route.Handler)
-	serviceURL, err := url.Parse("http://swarf.test")
-	require.NoError(t, err)
-	executor, err := client.NewHTTP(serviceURL, client.WithHTTPClient(&http.Client{Transport: srv}))
-	require.NoError(t, err)
+	executor := newRevokeExecutor(t, service, revocations)
 
 	publish := func(revoker ucan.Issuer, revoked cid.Cid, path []cid.Cid, witnesses ...ucan.Delegation) error {
 		revocation, err := ucancmd.Revoke.Invoke(
@@ -245,6 +241,201 @@ func TestRevokeRoute(t *testing.T) {
 
 	// A witness path proves authority over a delegation the revoker did not issue.
 	require.NoError(t, publish(alice, target.Link(), []cid.Cid{root.Link(), target.Link()}, root, target))
+}
+
+func TestRevokeRouteBatch(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	carol, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+
+	const validCount = 5
+	var delegations []ucan.Delegation
+	var invocations []ucan.Invocation
+	for range validCount {
+		target, err := delegation.Delegate(bob, carol.DID(), bob.DID(), command)
+		require.NoError(t, err)
+		delegations = append(delegations, target)
+		invocations = append(invocations, revokeInvocation(t, bob, service.DID(), target.Link()))
+	}
+	// carol did not issue the delegation she revokes, so her revocation is
+	// rejected while the rest of the batch is stored.
+	rejected := revokeInvocation(t, carol, service.DID(), delegations[0].Link())
+	invocations = append(invocations, rejected)
+
+	revocations := &countingStore{RevocationStore: memory.New()}
+	executor := newRevokeExecutor(t, service, revocations)
+	response, err := executor.ExecuteBatch(batch.NewRequest(t.Context(), invocations, batch.WithDelegations(delegations...)))
+	require.NoError(t, err)
+
+	t.Run("each valid revocation gets a success receipt", func(t *testing.T) {
+		for _, inv := range invocations[:validCount] {
+			receipt, ok := response.Receipt(inv.Task().Link())
+			require.True(t, ok)
+			_, err := ucancmd.Revoke.Unpack(receipt)
+			require.NoError(t, err)
+		}
+	})
+
+	t.Run("the invalid revocation gets an error receipt", func(t *testing.T) {
+		receipt, ok := response.Receipt(rejected.Task().Link())
+		require.True(t, ok)
+		_, err := ucancmd.Revoke.Unpack(receipt)
+		require.ErrorContains(t, err, "witness path required")
+	})
+
+	t.Run("the valid revocations are stored with one write", func(t *testing.T) {
+		stored := make([]cid.Cid, 0, validCount)
+		for _, batch := range revocations.batches {
+			for _, revocation := range batch {
+				stored = append(stored, revocation.Cause.Link())
+			}
+		}
+		expected := make([]cid.Cid, 0, validCount)
+		for _, inv := range invocations[:validCount] {
+			expected = append(expected, inv.Link())
+		}
+		require.Equal(t, []int{validCount}, revocations.batchSizes())
+		require.ElementsMatch(t, expected, stored)
+	})
+}
+
+func TestRevokeRouteStoreFailure(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	target, err := delegation.Delegate(bob, bob.DID(), bob.DID(), command)
+	require.NoError(t, err)
+
+	revocations := &countingStore{RevocationStore: memory.New(), err: errors.New("database is down")}
+	executor := newRevokeExecutor(t, service, revocations)
+	inv := revokeInvocation(t, bob, service.DID(), target.Link())
+	_, err = executor.ExecuteBatch(batch.NewRequest(t.Context(), []ucan.Invocation{inv}, batch.WithDelegations(target)))
+	require.ErrorContains(t, err, "storing revocations: database is down")
+}
+
+func TestRevokeRouteRequiresUCANHandler(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	target, err := delegation.Delegate(bob, bob.DID(), bob.DID(), command)
+	require.NoError(t, err)
+
+	didResolver := resolver.ByMethod{"key": key.Resolver}
+	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
+	route := revokeRoute(didResolver)
+	srv.Handle(route.Command, route.Handler)
+	inv := revokeInvocation(t, bob, service.DID(), target.Link())
+	response, err := srv.Execute(execution.NewRequest(t.Context(), inv, execution.WithDelegations(target)))
+	require.NoError(t, err)
+	_, err = ucancmd.Revoke.Unpack(response.Receipt())
+	require.ErrorContains(t, err, "no revocation batch")
+}
+
+func TestUCANHandlerReplacesResponseHeaders(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	target, err := delegation.Delegate(bob, bob.DID(), bob.DID(), command)
+	require.NoError(t, err)
+
+	handler := newRevokeHandler(service, memory.New())
+	var written http.Header
+	executor := newExecutor(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		recorder := httptest.NewRecorder()
+		// A header set before the handler runs, as a middleware might.
+		recorder.Header().Set(echo.HeaderContentType, "text/plain")
+		handler.ServeHTTP(recorder, r)
+		written = recorder.Header().Clone()
+		return recorder.Result(), nil
+	}))
+	inv := revokeInvocation(t, bob, service.DID(), target.Link())
+	_, err = executor.Execute(execution.NewRequest(t.Context(), inv, execution.WithDelegations(target)))
+	require.NoError(t, err)
+	require.Equal(t, []string{"application/vnd.ipld.dag-cbor"}, written.Values(echo.HeaderContentType))
+}
+
+// newRevokeExecutor returns a UCAN client whose requests are served in process
+// by a server with the revoke route, storing revocations in revocations.
+func newRevokeExecutor(t *testing.T, service identity.Identity, revocations store.RevocationStore) *client.HTTPClient {
+	t.Helper()
+	return newExecutor(t, newRevokeHandler(service, revocations))
+}
+
+func newRevokeHandler(service identity.Identity, revocations store.RevocationStore) *ucanHandler {
+	didResolver := resolver.ByMethod{"key": key.Resolver}
+	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
+	route := revokeRoute(didResolver)
+	srv.Handle(route.Command, route.Handler)
+	return &ucanHandler{ucan: srv, revocations: revocations, logger: zap.NewNop()}
+}
+
+func newExecutor(t *testing.T, transport http.RoundTripper) *client.HTTPClient {
+	t.Helper()
+	serviceURL, err := url.Parse("http://swarf.test")
+	require.NoError(t, err)
+	executor, err := client.NewHTTP(serviceURL, client.WithHTTPClient(&http.Client{Transport: transport}))
+	require.NoError(t, err)
+	return executor
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func revokeInvocation(t *testing.T, revoker ucan.Issuer, service did.DID, revoked cid.Cid) ucan.Invocation {
+	t.Helper()
+	inv, err := ucancmd.Revoke.Invoke(
+		revoker,
+		revoker.DID(),
+		&ucancmd.RevokeArguments{Revoke: revoked},
+		invocation.WithAudience(service),
+		invocation.WithNoNonce(),
+		invocation.WithNoExpiration(),
+	)
+	require.NoError(t, err)
+	return inv
+}
+
+// countingStore records every AddBatch call, failing each with err when set.
+type countingStore struct {
+	store.RevocationStore
+	err     error
+	mu      sync.Mutex
+	batches [][]store.Revocation
+}
+
+func (s *countingStore) AddBatch(ctx context.Context, revocations []store.Revocation) error {
+	s.mu.Lock()
+	s.batches = append(s.batches, revocations)
+	s.mu.Unlock()
+	if s.err != nil {
+		return s.err
+	}
+	return s.RevocationStore.AddBatch(ctx, revocations)
+}
+
+func (s *countingStore) batchSizes() []int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sizes := make([]int, len(s.batches))
+	for i, batch := range s.batches {
+		sizes[i] = len(batch)
+	}
+	return sizes
 }
 
 func TestValidateRevocationPath(t *testing.T) {
@@ -296,6 +487,10 @@ type firehoseTestStore struct {
 }
 
 func (s *firehoseTestStore) Add(context.Context, ucan.Invocation, []ucan.Delegation) error {
+	return nil
+}
+
+func (s *firehoseTestStore) AddBatch(context.Context, []store.Revocation) error {
 	return nil
 }
 
