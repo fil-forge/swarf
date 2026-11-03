@@ -128,6 +128,11 @@ func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.R
 	return srv, nil
 }
 
+// webDIDCacheTTL is how long a resolved did:web document is reused. Revocation
+// paths name the same few did:web issuers again and again, and each
+// resolution is otherwise an HTTP request; a failed resolution is not cached.
+const webDIDCacheTTL = time.Hour
+
 func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (resolver.ByMethod, error) {
 	webOptions := []web.Option{}
 	if insecure {
@@ -154,7 +159,7 @@ func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (r
 	}
 	return resolver.ByMethod{
 		"key": key.Resolver,
-		"web": resolver.Tiered{resolver.WellKnown{id.DID(): document}, webResolver},
+		"web": resolver.Tiered{resolver.WellKnown{id.DID(): document}, resolver.NewCached(webResolver, webDIDCacheTTL)},
 		"plc": resolver.NewCached(plcResolver, time.Hour*3),
 	}, nil
 }
@@ -168,7 +173,7 @@ func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (r
 // CONFLICT DO NOTHING makes safe.
 func revokeRoute(executor ucan.Issuer, revocations store.RevocationStore, didResolver did.Resolver, logger *zap.Logger) server.Route {
 	return ucancmd.Revoke.BatchRoute(func(items []binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK]) error {
-		paths, errs := revocationPaths(items, didResolver)
+		paths, errs := revocationPaths(items, didResolver, logger)
 		valid := make([]binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK], 0, len(items))
 		batch := make([]store.Revocation, 0, len(items))
 		for i, item := range items {
@@ -205,7 +210,7 @@ const maxConcurrentValidations = 16
 // revocationPaths validates every item with [revocationPath], at most
 // [maxConcurrentValidations] at a time, and returns the paths and errors in
 // item order.
-func revocationPaths(items []binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK], didResolver did.Resolver) ([][]ucan.Delegation, []error) {
+func revocationPaths(items []binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK], didResolver did.Resolver, logger *zap.Logger) ([][]ucan.Delegation, []error) {
 	paths := make([][]ucan.Delegation, len(items))
 	errs := make([]error, len(items))
 	slots := make(chan struct{}, maxConcurrentValidations)
@@ -214,11 +219,39 @@ func revocationPaths(items []binding.Batch[*ucancmd.RevokeArguments, *ucancmd.Re
 		slots <- struct{}{}
 		wg.Go(func() {
 			defer func() { <-slots }()
-			paths[i], errs[i] = revocationPath(item.Request, didResolver)
+			paths[i], errs[i] = recoverRevocationPath(item.Request, didResolver, logger)
 		})
 	}
 	wg.Wait()
 	return paths, errs
+}
+
+// errValidationPanicked is the failure a revocation gets when validating it
+// panicked. It says nothing about the panic, since it reaches the client; the
+// value and stack go to the log.
+var errValidationPanicked = errors.New("validating revocation failed")
+
+// recoverRevocationPath runs [revocationPath], turning a panic, such as one in
+// a DID resolver, into [errValidationPanicked] for that revocation alone. The
+// validations run on goroutines of their own, outside the dispatcher's
+// recovery boundary, so without this a panic would end the process.
+func recoverRevocationPath(req *binding.Request[*ucancmd.RevokeArguments], didResolver did.Resolver, logger *zap.Logger) (path []ucan.Delegation, err error) {
+	// recover() alone cannot tell a normal return from panic(nil), so the flag
+	// is what says whether revocationPath returned.
+	returned := false
+	defer func() {
+		if returned {
+			return
+		}
+		logger.Error("panic validating revocation",
+			zap.Stringer("task", req.Invocation().Task().Link()),
+			zap.Any("panic", recover()),
+			zap.Stack("stack"))
+		path, err = nil, errValidationPanicked
+	}()
+	path, err = revocationPath(req, didResolver)
+	returned = true
+	return path, err
 }
 
 // revocationFailureTTL is how long the receipt for a revocation that failed

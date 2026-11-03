@@ -356,6 +356,31 @@ func TestRevokeRouteValidatesConcurrently(t *testing.T) {
 	}
 }
 
+func TestRevokeRouteRecoversAValidationPanic(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	carol, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+	target, err := delegation.Delegate(bob, carol.DID(), bob.DID(), command)
+	require.NoError(t, err)
+
+	panicking := did.ResolverFunc(func(context.Context, did.DID) (did.Document, error) {
+		panic("resolver exploded")
+	})
+	executor := newExecutor(t, newRevokeHandlerWithPathResolver(service, memory.New(), panicking))
+	inv := revokeInvocation(t, bob, service.DID(), target.Link())
+	response, err := executor.Execute(execution.NewRequest(t.Context(), inv, execution.WithDelegations(target)))
+	require.NoError(t, err)
+	_, err = ucancmd.Revoke.Unpack(response.Receipt())
+	require.ErrorContains(t, err, "validating revocation failed")
+	require.NotContains(t, err.Error(), "resolver exploded")
+	require.NotNil(t, response.Receipt().Expiration())
+}
+
 func TestRevokeRouteStoreFailure(t *testing.T) {
 	service, err := identity.New("", "")
 	require.NoError(t, err)
