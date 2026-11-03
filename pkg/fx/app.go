@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	jsg "github.com/alanshaw/dag-json-gen"
@@ -29,6 +30,9 @@ import (
 	"github.com/fil-forge/ucantone/did/plc"
 	"github.com/fil-forge/ucantone/did/resolver"
 	"github.com/fil-forge/ucantone/did/web"
+	edm "github.com/fil-forge/ucantone/errors/datamodel"
+	"github.com/fil-forge/ucantone/execution"
+	"github.com/fil-forge/ucantone/execution/dispatcher"
 
 	// Registers the secp256k1 verifier decoder: did:plc issuers carry
 	// secp256k1 verification methods.
@@ -37,6 +41,7 @@ import (
 	"github.com/fil-forge/ucantone/ucan"
 	"github.com/fil-forge/ucantone/ucan/delegation"
 	"github.com/fil-forge/ucantone/ucan/invocation"
+	"github.com/fil-forge/ucantone/ucan/receipt"
 	"github.com/fil-forge/ucantone/validator"
 	"github.com/ipfs/go-cid"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -119,7 +124,7 @@ func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.R
 		return nil, err
 	}
 	srv := server.NewHTTP(id, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	srv.HandleRoute(revokeRoute(revocations, didResolver, logger))
+	srv.HandleRoute(revokeRoute(id, revocations, didResolver, logger))
 	return srv, nil
 }
 
@@ -154,25 +159,27 @@ func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (r
 	}, nil
 }
 
-// revokeRoute serves /ucan/revoke with a batch handler: it validates each
-// revocation of a request on its own and stores the valid ones with a single
-// store write. An invalid revocation gets its own failure receipt. A failed
-// write fails every revocation of the request with a short-lived receipt, so
-// the caller retries, which ON CONFLICT DO NOTHING makes safe.
-func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMethod, logger *zap.Logger) server.Route {
+// revokeRoute serves /ucan/revoke with a batch handler: it validates the
+// revocations of a request concurrently and stores the valid ones with a
+// single store write. An invalid revocation gets its own short-lived failure
+// receipt, since validation can fail for a reason that passes, such as a DID
+// that did not resolve. A failed write fails every valid revocation of the
+// request with a short-lived receipt too, so the caller retries, which ON
+// CONFLICT DO NOTHING makes safe.
+func revokeRoute(executor ucan.Issuer, revocations store.RevocationStore, didResolver did.Resolver, logger *zap.Logger) server.Route {
 	return ucancmd.Revoke.BatchRoute(func(items []binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK]) error {
+		paths, errs := revocationPaths(items, didResolver)
 		valid := make([]binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK], 0, len(items))
 		batch := make([]store.Revocation, 0, len(items))
-		for _, item := range items {
-			path, err := revocationPath(item.Request, didResolver)
-			if err != nil {
-				if err := item.Response.SetFailure(err); err != nil {
+		for i, item := range items {
+			if errs[i] != nil {
+				if err := setTransientFailure(executor, item.Request.Invocation(), item.Response, errs[i]); err != nil {
 					return err
 				}
 				continue
 			}
 			valid = append(valid, item)
-			batch = append(batch, store.Revocation{Cause: item.Request.Invocation(), Path: path})
+			batch = append(batch, store.Revocation{Cause: item.Request.Invocation(), Path: paths[i]})
 		}
 		if len(batch) == 0 {
 			return nil
@@ -190,9 +197,54 @@ func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMetho
 	})
 }
 
+// maxConcurrentValidations caps how many revocations of one request are
+// validated at the same time. Validation resolves DIDs, which for did:web is
+// an uncached HTTP request.
+const maxConcurrentValidations = 16
+
+// revocationPaths validates every item with [revocationPath], at most
+// [maxConcurrentValidations] at a time, and returns the paths and errors in
+// item order.
+func revocationPaths(items []binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK], didResolver did.Resolver) ([][]ucan.Delegation, []error) {
+	paths := make([][]ucan.Delegation, len(items))
+	errs := make([]error, len(items))
+	slots := make(chan struct{}, maxConcurrentValidations)
+	var wg sync.WaitGroup
+	for i, item := range items {
+		slots <- struct{}{}
+		wg.Go(func() {
+			defer func() { <-slots }()
+			paths[i], errs[i] = revocationPath(item.Request, didResolver)
+		})
+	}
+	wg.Wait()
+	return paths, errs
+}
+
+// revocationFailureTTL is how long the receipt for a revocation that failed
+// validation stays valid: the dispatcher's TTL for a handler error, which is
+// what these failures produced before revocations were batched.
+const revocationFailureTTL = dispatcher.DefaultHandlerErrorReceiptTTL
+
+// setTransientFailure sets a failure receipt on the response that expires
+// after [revocationFailureTTL], so a client retries the revocation rather than
+// caching the failure.
+func setTransientFailure(executor ucan.Issuer, inv ucan.Invocation, res *binding.Response[*ucancmd.RevokeOK], cause error) error {
+	failure := edm.ErrorModel{
+		ErrorName: execution.HandlerExecutionErrorName,
+		Message:   fmt.Sprintf("%q handler execution error: %s", inv.Command(), cause),
+	}
+	exp := ucan.Now() + ucan.UnixTimestamp(revocationFailureTTL.Seconds())
+	rcpt, err := receipt.IssueErr(executor, inv.Task().Link(), &failure, receipt.WithExpiration(exp))
+	if err != nil {
+		return fmt.Errorf("issuing failure receipt: %w", err)
+	}
+	return res.SetReceipt(rcpt)
+}
+
 // revocationPath checks that the invocation may revoke the delegation it names
 // and returns the delegation path to store with it.
-func revocationPath(req *binding.Request[*ucancmd.RevokeArguments], didResolver resolver.ByMethod) ([]ucan.Delegation, error) {
+func revocationPath(req *binding.Request[*ucancmd.RevokeArguments], didResolver did.Resolver) ([]ucan.Delegation, error) {
 	args := req.Task().Arguments()
 	witnesses := make(map[cid.Cid]ucan.Delegation)
 	for _, delegation := range req.Metadata().Delegations() {
@@ -264,7 +316,7 @@ func storeRevocations(ctx context.Context, revocations store.RevocationStore, ba
 	return nil
 }
 
-func validateRevocationPath(ctx context.Context, path []ucan.Delegation, didResolver resolver.ByMethod) error {
+func validateRevocationPath(ctx context.Context, path []ucan.Delegation, didResolver did.Resolver) error {
 	if len(path) == 0 {
 		return errors.New("revocation path must not be empty")
 	}

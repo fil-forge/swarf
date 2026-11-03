@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -281,11 +282,14 @@ func TestRevokeRouteBatch(t *testing.T) {
 		}
 	})
 
-	t.Run("the invalid revocation gets an error receipt", func(t *testing.T) {
+	t.Run("the invalid revocation gets a short-lived error receipt", func(t *testing.T) {
 		receipt, ok := response.Receipt(rejected.Task().Link())
 		require.True(t, ok)
 		_, err := ucancmd.Revoke.Unpack(receipt)
 		require.ErrorContains(t, err, "witness path required")
+		// Validation can fail for a reason that passes, such as a DID that did
+		// not resolve, so the client retries rather than caches the failure.
+		require.NotNil(t, receipt.Expiration())
 	})
 
 	t.Run("the valid revocations are stored with one write", func(t *testing.T) {
@@ -302,6 +306,54 @@ func TestRevokeRouteBatch(t *testing.T) {
 		require.Equal(t, []int{validCount}, revocations.batchSizes())
 		require.ElementsMatch(t, expected, stored)
 	})
+}
+
+func TestRevokeRouteValidatesConcurrently(t *testing.T) {
+	service, err := identity.New("", "")
+	require.NoError(t, err)
+	bob, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	carol, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/invoke")
+	require.NoError(t, err)
+
+	const count = 4
+	var delegations []ucan.Delegation
+	var invocations []ucan.Invocation
+	for range count {
+		target, err := delegation.Delegate(bob, carol.DID(), bob.DID(), command)
+		require.NoError(t, err)
+		delegations = append(delegations, target)
+		invocations = append(invocations, revokeInvocation(t, bob, service.DID(), target.Link()))
+	}
+
+	// Each resolution waits until count of them are in flight at once, so the
+	// request completes only when the revocations are validated concurrently.
+	var entered atomic.Int32
+	release := make(chan struct{})
+	barrier := did.ResolverFunc(func(ctx context.Context, id did.DID) (did.Document, error) {
+		if entered.Add(1) == count {
+			close(release)
+		}
+		select {
+		case <-release:
+			return key.Resolver.Resolve(ctx, id)
+		case <-time.After(5 * time.Second):
+			return did.Document{}, errors.New("timed out waiting for concurrent validations")
+		}
+	})
+
+	revocations := memory.New()
+	executor := newExecutor(t, newRevokeHandlerWithPathResolver(service, revocations, barrier))
+	response, err := executor.ExecuteBatch(batch.NewRequest(t.Context(), invocations, batch.WithDelegations(delegations...)))
+	require.NoError(t, err)
+	for _, inv := range invocations {
+		receipt, ok := response.Receipt(inv.Task().Link())
+		require.True(t, ok)
+		_, err := ucancmd.Revoke.Unpack(receipt)
+		require.NoError(t, err)
+	}
 }
 
 func TestRevokeRouteStoreFailure(t *testing.T) {
@@ -333,9 +385,14 @@ func newRevokeExecutor(t *testing.T, service identity.Identity, revocations stor
 }
 
 func newRevokeHandler(service identity.Identity, revocations store.RevocationStore) *server.HTTPServer {
-	didResolver := resolver.ByMethod{"key": key.Resolver}
-	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	srv.HandleRoute(revokeRoute(revocations, didResolver, zap.NewNop()))
+	return newRevokeHandlerWithPathResolver(service, revocations, resolver.ByMethod{"key": key.Resolver})
+}
+
+// newRevokeHandlerWithPathResolver serves the revoke route, validating
+// revocation paths with pathResolver and invocations with did:key resolution.
+func newRevokeHandlerWithPathResolver(service identity.Identity, revocations store.RevocationStore, pathResolver did.Resolver) *server.HTTPServer {
+	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(resolver.ByMethod{"key": key.Resolver})))
+	srv.HandleRoute(revokeRoute(service, revocations, pathResolver, zap.NewNop()))
 	return srv
 }
 
