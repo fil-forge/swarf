@@ -7,13 +7,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
-	"sync"
 	"time"
 
 	jsg "github.com/alanshaw/dag-json-gen"
@@ -116,14 +113,13 @@ func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStor
 	return pgstore.New(pool), nil
 }
 
-func newUCANServer(id identity.Identity, cfg *config.Config) (*server.HTTPServer, error) {
+func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.RevocationStore, logger *zap.Logger) (*server.HTTPServer, error) {
 	didResolver, err := newDIDResolver(id, cfg.Server.InsecureDIDResolution, cfg.PLC.Directory)
 	if err != nil {
 		return nil, err
 	}
 	srv := server.NewHTTP(id, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	route := revokeRoute(didResolver)
-	srv.Handle(route.Command, route.Handler)
+	srv.HandleRoute(revokeRoute(revocations, didResolver, logger))
 	return srv, nil
 }
 
@@ -158,72 +154,114 @@ func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (r
 	}, nil
 }
 
-// revokeRoute validates a revocation and adds it to the request's
-// [revocationBatch], which [ucanHandler] stores once every invocation of the
-// request has run.
-func revokeRoute(didResolver resolver.ByMethod) server.Route {
-	return ucancmd.Revoke.Route(func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
-		batch, ok := req.Context().Value(revocationBatchKey{}).(*revocationBatch)
-		if !ok {
-			return errors.New("no revocation batch in the request context: the UCAN server must be served through ucanHandler")
-		}
-		args := req.Task().Arguments()
-		witnesses := make(map[cid.Cid]ucan.Delegation)
-		for _, delegation := range req.Metadata().Delegations() {
-			witnesses[delegation.Link()] = delegation
-		}
-		revoked, ok := witnesses[args.Revoke]
-		if !ok {
-			return errors.New("the revoked delegation must be included in request metadata")
-		}
-		var path []ucan.Delegation
-		if len(args.Path) == 0 {
-			// Direct revocation: the issuer of the revoked delegation revokes it
-			// themselves. A witness path is only needed to prove authority over a
-			// delegation issued by someone else further down a chain the revoker
-			// is involved in.
-			if revoked.Issuer() != req.Invocation().Issuer() {
-				return errors.New("witness path required: revocation issuer did not issue the revoked delegation")
-			}
-			if err := validator.ValidateToken(req.Context(), revoked, validator.WithDIDResolver(didResolver)); err != nil {
-				return fmt.Errorf("validating revoked delegation: %w", err)
-			}
-			path = []ucan.Delegation{revoked}
-		} else {
-			path = make([]ucan.Delegation, len(args.Path))
-			for i, link := range args.Path {
-				delegation, ok := witnesses[link]
-				if !ok {
-					return fmt.Errorf("delegation %s at path index %d is not in request metadata", link, i)
+// revokeRoute serves /ucan/revoke with a batch handler: it validates each
+// revocation of a request on its own and stores the valid ones with a single
+// store write. An invalid revocation gets its own failure receipt. A failed
+// write fails every revocation of the request with a short-lived receipt, so
+// the caller retries, which ON CONFLICT DO NOTHING makes safe.
+func revokeRoute(revocations store.RevocationStore, didResolver resolver.ByMethod, logger *zap.Logger) server.Route {
+	return ucancmd.Revoke.BatchRoute(func(items []binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK]) error {
+		valid := make([]binding.Batch[*ucancmd.RevokeArguments, *ucancmd.RevokeOK], 0, len(items))
+		batch := make([]store.Revocation, 0, len(items))
+		for _, item := range items {
+			path, err := revocationPath(item.Request, didResolver)
+			if err != nil {
+				if err := item.Response.SetFailure(err); err != nil {
+					return err
 				}
-				path[i] = delegation
+				continue
 			}
-			if path[len(path)-1].Link() != args.Revoke {
-				return errors.New("revocation path must end with the revoked delegation")
-			}
-			if err := validateRevocationPath(req.Context(), path, didResolver); err != nil {
-				return fmt.Errorf("validating revocation path: %w", err)
-			}
-			// TODO: support delegated revocations, where the revocation issuer is not
-			// the same as the invocation issuer.
-			// See https://github.com/ucan-wg/revocation#delegating-revocation
-			issuerFound := false
-			for _, delegation := range path {
-				if delegation.Issuer() == req.Invocation().Issuer() {
-					issuerFound = true
-					break
-				}
-			}
-			if !issuerFound {
-				return errors.New("revocation issuer is not an issuer in the delegation path")
-			}
+			valid = append(valid, item)
+			batch = append(batch, store.Revocation{Cause: item.Request.Invocation(), Path: path})
 		}
-		if err := res.SetSuccess(&ucancmd.RevokeOK{}); err != nil {
+		if len(batch) == 0 {
+			return nil
+		}
+		// Every invocation of a request carries the request context.
+		if err := storeRevocations(items[0].Request.Context(), revocations, batch, logger); err != nil {
 			return err
 		}
-		batch.add(store.Revocation{Cause: req.Invocation(), Path: path})
+		for _, item := range valid {
+			if err := item.Response.SetSuccess(&ucancmd.RevokeOK{}); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
+}
+
+// revocationPath checks that the invocation may revoke the delegation it names
+// and returns the delegation path to store with it.
+func revocationPath(req *binding.Request[*ucancmd.RevokeArguments], didResolver resolver.ByMethod) ([]ucan.Delegation, error) {
+	args := req.Task().Arguments()
+	witnesses := make(map[cid.Cid]ucan.Delegation)
+	for _, delegation := range req.Metadata().Delegations() {
+		witnesses[delegation.Link()] = delegation
+	}
+	revoked, ok := witnesses[args.Revoke]
+	if !ok {
+		return nil, errors.New("the revoked delegation must be included in request metadata")
+	}
+	var path []ucan.Delegation
+	if len(args.Path) == 0 {
+		// Direct revocation: the issuer of the revoked delegation revokes it
+		// themselves. A witness path is only needed to prove authority over a
+		// delegation issued by someone else further down a chain the revoker
+		// is involved in.
+		if revoked.Issuer() != req.Invocation().Issuer() {
+			return nil, errors.New("witness path required: revocation issuer did not issue the revoked delegation")
+		}
+		if err := validator.ValidateToken(req.Context(), revoked, validator.WithDIDResolver(didResolver)); err != nil {
+			return nil, fmt.Errorf("validating revoked delegation: %w", err)
+		}
+		path = []ucan.Delegation{revoked}
+	} else {
+		path = make([]ucan.Delegation, len(args.Path))
+		for i, link := range args.Path {
+			delegation, ok := witnesses[link]
+			if !ok {
+				return nil, fmt.Errorf("delegation %s at path index %d is not in request metadata", link, i)
+			}
+			path[i] = delegation
+		}
+		if path[len(path)-1].Link() != args.Revoke {
+			return nil, errors.New("revocation path must end with the revoked delegation")
+		}
+		if err := validateRevocationPath(req.Context(), path, didResolver); err != nil {
+			return nil, fmt.Errorf("validating revocation path: %w", err)
+		}
+		// TODO: support delegated revocations, where the revocation issuer is not
+		// the same as the invocation issuer.
+		// See https://github.com/ucan-wg/revocation#delegating-revocation
+		issuerFound := false
+		for _, delegation := range path {
+			if delegation.Issuer() == req.Invocation().Issuer() {
+				issuerFound = true
+				break
+			}
+		}
+		if !issuerFound {
+			return nil, errors.New("revocation issuer is not an issuer in the delegation path")
+		}
+	}
+	return path, nil
+}
+
+// storeRevocations writes the revocations of one request with a single store
+// write and logs its outcome.
+func storeRevocations(ctx context.Context, revocations store.RevocationStore, batch []store.Revocation, logger *zap.Logger) error {
+	start := time.Now()
+	err := revocations.AddBatch(ctx, batch)
+	duration := time.Since(start)
+	if err != nil {
+		if !errors.Is(err, context.Canceled) {
+			logger.Error("storing revocations failed",
+				zap.Int("count", len(batch)), zap.Duration("duration", duration), zap.Error(err))
+		}
+		return fmt.Errorf("storing revocations: %w", err)
+	}
+	logger.Info("stored revocations", zap.Int("count", len(batch)), zap.Duration("duration", duration))
+	return nil
 }
 
 func validateRevocationPath(ctx context.Context, path []ucan.Delegation, didResolver resolver.ByMethod) error {
@@ -251,96 +289,7 @@ func validateRevocationPath(ctx context.Context, path []ucan.Delegation, didReso
 	return nil
 }
 
-// ucanHandler serves UCAN requests and stores the revocations of each request
-// with a single store write, once every invocation of the request has run.
-// Receipts reach the caller only after that write succeeds; when it fails,
-// the whole request fails and no receipt is sent.
-type ucanHandler struct {
-	ucan        *server.HTTPServer
-	revocations store.RevocationStore
-	logger      *zap.Logger
-}
-
-func (h *ucanHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	resp, err := h.RoundTrip(r)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("handling request: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-	for k, vv := range resp.Header {
-		// The connection-level headers describe the in-process response, not
-		// the one net/http writes to the caller.
-		if _, ok := hopByHopHeaders[k]; ok {
-			continue
-		}
-		w.Header()[k] = slices.Clone(vv)
-	}
-	w.WriteHeader(resp.StatusCode)
-	_, _ = io.Copy(w, resp.Body)
-}
-
-// hopByHopHeaders are the headers that apply to a single connection, in
-// canonical form (RFC 9110, section 7.6.1).
-var hopByHopHeaders = map[string]struct{}{
-	"Connection":          {},
-	"Keep-Alive":          {},
-	"Proxy-Connection":    {},
-	"Proxy-Authenticate":  {},
-	"Proxy-Authorization": {},
-	"Te":                  {},
-	"Trailer":             {},
-	"Transfer-Encoding":   {},
-	"Upgrade":             {},
-}
-
-func (h *ucanHandler) RoundTrip(r *http.Request) (*http.Response, error) {
-	batch := &revocationBatch{}
-	resp, err := h.ucan.RoundTrip(r.WithContext(context.WithValue(r.Context(), revocationBatchKey{}, batch)))
-	if err != nil {
-		return nil, err
-	}
-	if err := h.store(r.Context(), batch.revocations); err != nil {
-		resp.Body.Close()
-		return nil, err
-	}
-	return resp, nil
-}
-
-func (h *ucanHandler) store(ctx context.Context, revocations []store.Revocation) error {
-	if len(revocations) == 0 {
-		return nil
-	}
-	start := time.Now()
-	err := h.revocations.AddBatch(ctx, revocations)
-	duration := time.Since(start)
-	if err != nil {
-		if !errors.Is(err, context.Canceled) {
-			h.logger.Error("storing revocations failed",
-				zap.Int("count", len(revocations)), zap.Duration("duration", duration), zap.Error(err))
-		}
-		return fmt.Errorf("storing revocations: %w", err)
-	}
-	h.logger.Info("stored revocations", zap.Int("count", len(revocations)), zap.Duration("duration", duration))
-	return nil
-}
-
-type revocationBatchKey struct{}
-
-// revocationBatch collects the revocations validated by the handlers of one
-// request. The handlers of a batch request run concurrently.
-type revocationBatch struct {
-	mu          sync.Mutex
-	revocations []store.Revocation
-}
-
-func (b *revocationBatch) add(revocation store.Revocation) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.revocations = append(b.revocations, revocation)
-}
-
-func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocations store.RevocationStore, logger *zap.Logger) *echo.Echo {
+func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocations store.RevocationStore) *echo.Echo {
 	e := echo.New()
 	e.HideBanner = true
 	// Outermost middleware: a handler panic becomes a 500 rather than a
@@ -356,7 +305,7 @@ func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocati
 	e.GET("/.well-known/did.json", didDocumentHandler(id))
 	e.GET("/revocation/:cid", revocationHandler(revocations))
 	e.GET("/revocations/:from", firehoseHandler(revocations))
-	e.POST("/", echo.WrapHandler(&ucanHandler{ucan: ucanServer, revocations: revocations, logger: logger}))
+	e.POST("/", echo.WrapHandler(ucanServer))
 	return e
 }
 

@@ -83,9 +83,9 @@ delegation itself must always be included in the invocation metadata.
 
 A request may carry several `/ucan/revoke` invocations. Each one is validated
 on its own and gets its own receipt, and the valid ones are stored together
-with one database write once every invocation has run, so they share the same
-`recorded_at`. If that write fails, the whole request fails with HTTP 500 and
-no receipts; retrying it is safe.
+with one database write, so they share the same `recorded_at`. If that write
+fails, every revocation of the request gets a short-lived error receipt;
+retrying is safe.
 
 ### `GET /revocation/:cid`
 

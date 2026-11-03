@@ -40,7 +40,7 @@ import (
 func TestEchoPublicRoutes(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
-	e := newEchoServer(id, server.NewHTTP(id), memory.New(), zap.NewNop())
+	e := newEchoServer(id, server.NewHTTP(id), memory.New())
 
 	request := httptest.NewRequest(http.MethodGet, "/", nil)
 	response := httptest.NewRecorder()
@@ -67,7 +67,7 @@ func TestEchoPublicRoutes(t *testing.T) {
 func TestAHandlerPanicBecomesAServerError(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
-	e := newEchoServer(id, server.NewHTTP(id), memory.New(), zap.NewNop())
+	e := newEchoServer(id, server.NewHTTP(id), memory.New())
 	e.GET("/panic", func(echo.Context) error { panic("handler exploded") })
 
 	response := httptest.NewRecorder()
@@ -98,7 +98,7 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	source := &firehoseTestStore{
 		record: store.RevocationRecord{Revoke: witness.Link(), Cause: revocation, Path: []ucan.Delegation{witness}, RecordedAt: recordedAt},
 	}
-	e := newEchoServer(id, server.NewHTTP(id), source, zap.NewNop())
+	e := newEchoServer(id, server.NewHTTP(id), source)
 	request := httptest.NewRequest(http.MethodGet, "/revocations/"+recordedAt.Format(time.RFC3339Nano), nil)
 	response := httptest.NewRecorder()
 	e.ServeHTTP(response, request)
@@ -126,7 +126,7 @@ func TestFirehoseRouteReportsAStoreFailure(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
 	source := &firehoseTestStore{err: errors.New("getting revocations: connection refused")}
-	e := newEchoServer(id, server.NewHTTP(id), source, zap.NewNop())
+	e := newEchoServer(id, server.NewHTTP(id), source)
 	logged := observeRequests(e)
 
 	response := httptest.NewRecorder()
@@ -146,7 +146,7 @@ func TestFirehoseRouteDoesNotReportACanceledRequest(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
 	source := &firehoseTestStore{err: context.Canceled}
-	e := newEchoServer(id, server.NewHTTP(id), source, zap.NewNop())
+	e := newEchoServer(id, server.NewHTTP(id), source)
 	logged := observeRequests(e)
 
 	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/revocations/0", nil))
@@ -178,7 +178,7 @@ func TestRevocationRouteReturnsDAGJSON(t *testing.T) {
 	revocation, err := invocation.Invoke(id, did.Undef, command, nil)
 	require.NoError(t, err)
 	source := &firehoseTestStore{record: store.RevocationRecord{Revoke: revocation.Link(), Cause: revocation}}
-	e := newEchoServer(id, server.NewHTTP(id), source, zap.NewNop())
+	e := newEchoServer(id, server.NewHTTP(id), source)
 	request := httptest.NewRequest(http.MethodGet, "/revocation/"+revocation.Link().String(), nil)
 	response := httptest.NewRecorder()
 	e.ServeHTTP(response, request)
@@ -317,55 +317,12 @@ func TestRevokeRouteStoreFailure(t *testing.T) {
 	revocations := &countingStore{RevocationStore: memory.New(), err: errors.New("database is down")}
 	executor := newRevokeExecutor(t, service, revocations)
 	inv := revokeInvocation(t, bob, service.DID(), target.Link())
-	_, err = executor.ExecuteBatch(batch.NewRequest(t.Context(), []ucan.Invocation{inv}, batch.WithDelegations(target)))
-	require.ErrorContains(t, err, "storing revocations: database is down")
-}
-
-func TestRevokeRouteRequiresUCANHandler(t *testing.T) {
-	service, err := identity.New("", "")
-	require.NoError(t, err)
-	bob, err := ed25519.GenerateIssuer()
-	require.NoError(t, err)
-	command, err := command.Parse("/test/invoke")
-	require.NoError(t, err)
-	target, err := delegation.Delegate(bob, bob.DID(), bob.DID(), command)
-	require.NoError(t, err)
-
-	didResolver := resolver.ByMethod{"key": key.Resolver}
-	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	route := revokeRoute(didResolver)
-	srv.Handle(route.Command, route.Handler)
-	inv := revokeInvocation(t, bob, service.DID(), target.Link())
-	response, err := srv.Execute(execution.NewRequest(t.Context(), inv, execution.WithDelegations(target)))
+	response, err := executor.Execute(execution.NewRequest(t.Context(), inv, execution.WithDelegations(target)))
 	require.NoError(t, err)
 	_, err = ucancmd.Revoke.Unpack(response.Receipt())
-	require.ErrorContains(t, err, "no revocation batch")
-}
-
-func TestUCANHandlerReplacesResponseHeaders(t *testing.T) {
-	service, err := identity.New("", "")
-	require.NoError(t, err)
-	bob, err := ed25519.GenerateIssuer()
-	require.NoError(t, err)
-	command, err := command.Parse("/test/invoke")
-	require.NoError(t, err)
-	target, err := delegation.Delegate(bob, bob.DID(), bob.DID(), command)
-	require.NoError(t, err)
-
-	handler := newRevokeHandler(service, memory.New())
-	var written http.Header
-	executor := newExecutor(t, roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		recorder := httptest.NewRecorder()
-		// A header set before the handler runs, as a middleware might.
-		recorder.Header().Set(echo.HeaderContentType, "text/plain")
-		handler.ServeHTTP(recorder, r)
-		written = recorder.Header().Clone()
-		return recorder.Result(), nil
-	}))
-	inv := revokeInvocation(t, bob, service.DID(), target.Link())
-	_, err = executor.Execute(execution.NewRequest(t.Context(), inv, execution.WithDelegations(target)))
-	require.NoError(t, err)
-	require.Equal(t, []string{"application/vnd.ipld.dag-cbor"}, written.Values(echo.HeaderContentType))
+	require.ErrorContains(t, err, "storing revocations: database is down")
+	// The receipt is short-lived, so the caller retries rather than caches it.
+	require.NotNil(t, response.Receipt().Expiration())
 }
 
 // newRevokeExecutor returns a UCAN client whose requests are served in process
@@ -375,12 +332,11 @@ func newRevokeExecutor(t *testing.T, service identity.Identity, revocations stor
 	return newExecutor(t, newRevokeHandler(service, revocations))
 }
 
-func newRevokeHandler(service identity.Identity, revocations store.RevocationStore) *ucanHandler {
+func newRevokeHandler(service identity.Identity, revocations store.RevocationStore) *server.HTTPServer {
 	didResolver := resolver.ByMethod{"key": key.Resolver}
 	srv := server.NewHTTP(service, server.WithValidationOptions(validator.WithDIDResolver(didResolver)))
-	route := revokeRoute(didResolver)
-	srv.Handle(route.Command, route.Handler)
-	return &ucanHandler{ucan: srv, revocations: revocations, logger: zap.NewNop()}
+	srv.HandleRoute(revokeRoute(revocations, didResolver, zap.NewNop()))
+	return srv
 }
 
 func newExecutor(t *testing.T, transport http.RoundTripper) *client.HTTPClient {
@@ -391,10 +347,6 @@ func newExecutor(t *testing.T, transport http.RoundTripper) *client.HTTPClient {
 	require.NoError(t, err)
 	return executor
 }
-
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
 func revokeInvocation(t *testing.T, revoker ucan.Issuer, service did.DID, revoked cid.Cid) ucan.Invocation {
 	t.Helper()
