@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -121,10 +122,15 @@ func TestPublishBatch(t *testing.T) {
 	require.NoError(t, err)
 
 	var requests int
+	// The server runs a batch's invocations concurrently, so the handler
+	// appends under a lock.
+	var mu sync.Mutex
 	var revoked []cid.Cid
 	srv := server.NewHTTP(service)
 	srv.Handle(ucancmd.Revoke.Command, ucancmd.Revoke.Handler(
 		func(req *binding.Request[*ucancmd.RevokeArguments], res *binding.Response[*ucancmd.RevokeOK]) error {
+			mu.Lock()
+			defer mu.Unlock()
 			revoked = append(revoked, req.Task().Arguments().Revoke)
 			return res.SetSuccess(&ucancmd.RevokeOK{})
 		}))
@@ -455,6 +461,71 @@ func TestStreamEndsWhenAReconnectIsRefused(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Equal(t, 4, connections)
+}
+
+func TestStreamReconnectMidBatchResumesAfterLastEvent(t *testing.T) {
+	// Revocations stored by one batch write share recorded_at, so only their
+	// cursors tell them apart. The stream drops after delivering part of such
+	// a batch, and the reconnect resumes after the last event's cursor, not at
+	// the batch's timestamp, so each record arrives once.
+	recordedAt := time.Now().UTC().Truncate(time.Second)
+	batch := make([]api.FirehoseRevocation, 5)
+	for i := range batch {
+		batch[i] = firehoseRecord(t, recordedAt)
+	}
+
+	var mu sync.Mutex
+	var lastEventIDs []string
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		mu.Lock()
+		lastEventIDs = append(lastEventIDs, request.Header.Get("Last-Event-ID"))
+		connection := len(lastEventIDs)
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "text/event-stream")
+		switch connection {
+		case 1:
+			for i, record := range batch[:3] {
+				_, _ = io.WriteString(writer, sseEventWithID(t, strconv.Itoa(i+1), record))
+			}
+		case 2:
+			// As Swarf does, send only the records after Last-Event-ID.
+			after, err := strconv.Atoi(request.Header.Get("Last-Event-ID"))
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusBadRequest)
+				return
+			}
+			for i, record := range batch[after:] {
+				_, _ = io.WriteString(writer, sseEventWithID(t, strconv.Itoa(after+i+1), record))
+			}
+		default:
+			<-request.Context().Done()
+		}
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	var received []cid.Cid
+	for record, err := range client.Stream(context.Background(), time.Time{}) {
+		require.NoError(t, err)
+		received = append(received, record.Cause)
+		if len(received) == len(batch) {
+			break
+		}
+	}
+	expected := make([]cid.Cid, len(batch))
+	for i, record := range batch {
+		expected[i] = record.Cause
+	}
+	require.Equal(t, expected, received)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"", "3"}, lastEventIDs[:2])
 }
 
 func TestStreamReconnectCanceled(t *testing.T) {

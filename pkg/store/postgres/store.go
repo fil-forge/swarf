@@ -33,37 +33,73 @@ var _ store.RevocationStore = (*Store)(nil)
 
 // Add stores revocation and its witness path.
 func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error {
+	return s.AddBatch(ctx, []store.Revocation{{Cause: revocation, Path: path}})
+}
+
+// AddBatch stores revocations and their witness paths with one INSERT
+// statement. A revocation repeated in the batch is stored once.
+func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if len(path) == 0 {
-		return errors.New("revocation path must contain the revoked delegation")
+	if len(revocations) == 0 {
+		return nil
 	}
 
-	revocationBytes, err := invocation.Encode(revocation)
-	if err != nil {
-		return fmt.Errorf("encoding revocation: %w", err)
-	}
-	pathWitness := make([][]byte, len(path))
-	for i, dlg := range path {
-		pathWitness[i], err = delegation.Encode(dlg)
-		if err != nil {
-			return fmt.Errorf("encoding delegation at path index %d: %w", i, err)
+	// path_witness holds a bytea[] per row, and Postgres arrays cannot be
+	// ragged, so every row's witnesses travel in one flat array and each row
+	// takes its slice of it, bounded by 1-based path_start and path_end.
+	ids := make([]string, 0, len(revocations))
+	causes := make([][]byte, 0, len(revocations))
+	revoked := make([]string, 0, len(revocations))
+	pathStarts := make([]int32, 0, len(revocations))
+	pathEnds := make([]int32, 0, len(revocations))
+	var witnesses [][]byte
+	added := make(map[cid.Cid]struct{}, len(revocations))
+	for i, revocation := range revocations {
+		if len(revocation.Path) == 0 {
+			return fmt.Errorf("revocation at batch index %d: revocation path must contain the revoked delegation", i)
 		}
+		link := revocation.Cause.Link()
+		if _, ok := added[link]; ok {
+			continue
+		}
+		added[link] = struct{}{}
+
+		causeBytes, err := invocation.Encode(revocation.Cause)
+		if err != nil {
+			return fmt.Errorf("encoding revocation at batch index %d: %w", i, err)
+		}
+		ids = append(ids, link.String())
+		causes = append(causes, causeBytes)
+		revoked = append(revoked, revocation.Path[len(revocation.Path)-1].Link().String())
+		pathStarts = append(pathStarts, int32(len(witnesses)+1))
+		for j, dlg := range revocation.Path {
+			witness, err := delegation.Encode(dlg)
+			if err != nil {
+				return fmt.Errorf("encoding delegation at path index %d of revocation at batch index %d: %w", j, i, err)
+			}
+			witnesses = append(witnesses, witness)
+		}
+		pathEnds = append(pathEnds, int32(len(witnesses)))
 	}
 
-	_, err = s.pool.Exec(
+	_, err := s.pool.Exec(
 		ctx,
 		`INSERT INTO revocation (id, cause, revoked_delegation, path_witness)
-		 VALUES ($1, $2, $3, $4)
+		 SELECT r.id, r.cause, r.revoked_delegation, ($4::bytea[])[r.path_start:r.path_end]
+		 FROM unnest($1::text[], $2::bytea[], $3::text[], $5::int[], $6::int[])
+		   AS r(id, cause, revoked_delegation, path_start, path_end)
 		 ON CONFLICT (id) DO NOTHING`,
-		revocation.Link().String(),
-		revocationBytes,
-		path[len(path)-1].Link().String(),
-		pathWitness,
+		ids,
+		causes,
+		revoked,
+		witnesses,
+		pathStarts,
+		pathEnds,
 	)
 	if err != nil {
-		return fmt.Errorf("storing revocation: %w", err)
+		return fmt.Errorf("storing revocations: %w", err)
 	}
 	return nil
 }

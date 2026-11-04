@@ -76,11 +76,25 @@ type StreamRecord struct {
 	Cursor Cursor
 }
 
+// Revocation is a revocation to store with [RevocationStore.AddBatch].
+type Revocation struct {
+	// Cause is the invocation that revoked the delegation.
+	Cause ucan.Invocation
+	// Path is the delegation chain from the root delegation to the revoked
+	// delegation.
+	Path []ucan.Delegation
+}
+
 type RevocationStore interface {
 	// Add adds a revocation record to the store. The path is the delegation chain
 	// from the root delegation to the revoked delegation. The issuer of the
 	// revocation must appear as a delegation issuer in the path.
 	Add(ctx context.Context, revocation ucan.Invocation, path []ucan.Delegation) error
+	// AddBatch adds several revocation records with a single write, as [Add]
+	// does for one. A revocation already stored, or repeated within the batch,
+	// is stored once and keeps its first record. The records the batch adds
+	// share the same RecordedAt. When the write fails, none of them is stored.
+	AddBatch(ctx context.Context, revocations []Revocation) error
 	// Get retrieves a revocation record from the store by revoked delegation CID.
 	// If the record is not found, [ErrNotFound] is returned.
 	Get(ctx context.Context, revoked cid.Cid) (RevocationRecord, error)
