@@ -50,6 +50,21 @@ func TestPostgresRevocationStoreGet(t *testing.T) {
 	require.False(t, record.RecordedAt.IsZero())
 }
 
+// A delegation revoked more than once gets the record stored last, in commit
+// order, even when an earlier one has a later recorded_at.
+func TestPostgresRevocationStoreGetReturnsTheLastStored(t *testing.T) {
+	s, pool := newTestStore(t)
+	firstRevocation, path := revocationPath(t)
+	secondRevocation, _ := revocationPath(t)
+	recordedAt := time.Now().UTC().Truncate(time.Microsecond)
+	insertAt(t, pool, firstRevocation, path, recordedAt)
+	insertAt(t, pool, secondRevocation, path, recordedAt.Add(-time.Hour))
+
+	record, err := s.Get(context.Background(), path[len(path)-1].Link())
+	require.NoError(t, err)
+	require.Equal(t, secondRevocation.Link(), record.Cause.Link())
+}
+
 func TestPostgresRevocationStoreGetNotFound(t *testing.T) {
 	s, _ := newTestStore(t)
 	_, path := revocationPath(t)
@@ -412,7 +427,16 @@ func TestPostgresRevocationStoreAddBatchIssuesOneInsert(t *testing.T) {
 	require.NoError(t, s.AddBatch(context.Background(), batch))
 	require.Equal(t, 1, tracer.count("INSERT"))
 	require.Equal(t, 1, tracer.count("SELECT pg_advisory_xact_lock"), "the write takes the write lock")
-	require.Equal(t, 1, tracer.count("SET LOCAL idle_in_transaction_session_timeout"), "the write bounds how long it holds the lock while idle")
+
+	// The write bounds how long it can hold the lock while idle, from before
+	// it takes it. Postgres reads a bare number as milliseconds, which would
+	// end ordinary writes, so the timeout has to carry a unit.
+	setTimeout := "SET LOCAL idle_in_transaction_session_timeout = '" + postgres.WriteIdleTimeout + "'"
+	require.Equal(t, 1, tracer.count(setTimeout))
+	require.Less(t, tracer.index(setTimeout), tracer.index("SELECT pg_advisory_xact_lock"))
+	timeout, err := time.ParseDuration(postgres.WriteIdleTimeout)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, timeout, time.Second)
 }
 
 func TestPostgresRevocationStoreAddBatchDuplicates(t *testing.T) {
@@ -741,6 +765,19 @@ func (s *statementTracer) reset() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.sql = nil
+}
+
+// index returns the position of the first recorded statement that starts
+// with keyword, or -1 when none does.
+func (s *statementTracer) index(keyword string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, sql := range s.sql {
+		if strings.HasPrefix(strings.TrimSpace(sql), keyword) {
+			return i
+		}
+	}
+	return -1
 }
 
 // count returns how many recorded statements start with keyword.
