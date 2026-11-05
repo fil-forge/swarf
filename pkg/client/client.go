@@ -223,11 +223,11 @@ func (c *Client) Head(ctx context.Context) (Cursor, error) {
 	if len(body) > maxHeadBytes {
 		return "", fmt.Errorf("revocation stream head exceeds %d bytes", maxHeadBytes)
 	}
-	head := Cursor(strings.TrimSuffix(string(body), "\n"))
-	if head == "" {
-		return "", errors.New("revocation stream head is empty")
+	head, err := store.ParseCursor(strings.TrimSuffix(string(body), "\n"))
+	if err != nil {
+		return "", fmt.Errorf("revocation stream head is not a cursor: %w", err)
 	}
-	return head, nil
+	return Cursor(head.String()), nil
 }
 
 // maxHeadBytes bounds the head response Head reads. A cursor is far shorter.

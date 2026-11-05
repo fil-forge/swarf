@@ -230,7 +230,17 @@ func TestPostgresRevocationStoreWritesInCommitOrder(t *testing.T) {
 	slowRevocation, slowPath := revocationPath(t)
 	insertLocked(t, tx, slowRevocation, slowPath)
 
-	// The fast writer waits for the lock.
+	// The fast writer waits for the lock without drawing a number: a number
+	// drawn before the lock could be lower than one a writer that commits
+	// first drew.
+	lastDrawn := func() int64 {
+		var n int64
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT pg_sequence_last_value(pg_get_serial_sequence('revocation', 'seq')::regclass)`,
+		).Scan(&n))
+		return n
+	}
+	drawn := lastDrawn()
 	fast := revocationWithPathLength(t, 1)
 	added := make(chan error, 1)
 	go func() { added <- s.AddBatch(ctx, []store.Revocation{fast}) }()
@@ -241,6 +251,7 @@ func TestPostgresRevocationStoreWritesInCommitOrder(t *testing.T) {
 		).Scan(&waiting)
 		return err == nil && waiting == 1
 	}, 10*time.Second, 10*time.Millisecond, "AddBatch did not wait for the write lock")
+	require.Equal(t, drawn, lastDrawn(), "AddBatch drew a number before taking the write lock")
 
 	// Hold past a poll interval: the fast write is still blocked, and the
 	// stream yields neither record.
@@ -401,6 +412,7 @@ func TestPostgresRevocationStoreAddBatchIssuesOneInsert(t *testing.T) {
 	require.NoError(t, s.AddBatch(context.Background(), batch))
 	require.Equal(t, 1, tracer.count("INSERT"))
 	require.Equal(t, 1, tracer.count("SELECT pg_advisory_xact_lock"), "the write takes the write lock")
+	require.Equal(t, 1, tracer.count("SET LOCAL idle_in_transaction_session_timeout"), "the write bounds how long it holds the lock while idle")
 }
 
 func TestPostgresRevocationStoreAddBatchDuplicates(t *testing.T) {

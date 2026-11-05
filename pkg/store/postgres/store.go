@@ -30,6 +30,14 @@ const streamPollInterval = time.Second
 // commit order. Every writer must take it; AddBatch is the only one.
 const writeLockKey int64 = 0x7377617266726576 // "swarfrev" in ASCII
 
+// writeIdleTimeout ends a write's database session if the write goes idle
+// inside its transaction for this long. A write holds the write lock across
+// round trips to Swarf, so a Swarf host that dies or loses its network
+// mid-write would otherwise keep the lock, and block every other write, until
+// Postgres noticed the dead connection, which can take hours. A write is idle
+// only between its statements, for a round trip.
+const writeIdleTimeout = "30s"
+
 // Store persists revocation records in PostgreSQL.
 type Store struct {
 	pool *pgxpool.Pool
@@ -101,6 +109,9 @@ func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) er
 		return fmt.Errorf("beginning revocation write: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL idle_in_transaction_session_timeout = '`+writeIdleTimeout+`'`); err != nil {
+		return fmt.Errorf("bounding the revocation write's idle time: %w", err)
+	}
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, writeLockKey); err != nil {
 		return fmt.Errorf("taking the revocation write lock: %w", err)
 	}
@@ -136,7 +147,7 @@ func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecor
 		`SELECT cause, revoked_delegation, path_witness, recorded_at
 		 FROM revocation
 		 WHERE revoked_delegation = $1
-		 ORDER BY recorded_at DESC, id DESC
+		 ORDER BY seq DESC
 		 LIMIT 1`,
 		revoked.String(),
 	)

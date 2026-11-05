@@ -274,7 +274,7 @@ func TestHead(t *testing.T) {
 	})
 
 	t.Run("rejects a body that is not a cursor", func(t *testing.T) {
-		for _, body := range []string{"", strings.Repeat("1", maxHeadBytes+1)} {
+		for _, body := range []string{"", "now", "<html></html>", strings.Repeat("1", maxHeadBytes+1)} {
 			client := newClient(t, func(writer http.ResponseWriter, _ *http.Request) {
 				_, _ = io.WriteString(writer, body)
 			})

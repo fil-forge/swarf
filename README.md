@@ -184,7 +184,8 @@ open across the move. Upgrading in place with `pg_upgrade`, or failing over to
 a physical replica that is caught up, keeps them too.
 
 Logical replication copies every row's `seq`, but not the sequence's position.
-Before the new server takes writes, set the sequence past the highest `seq`:
+Once the old server takes no more writes and replication has caught up, and
+before the new server takes writes, set the sequence past the highest `seq`:
 
 ```sql
 SELECT setval(pg_get_serial_sequence('revocation', 'seq'), coalesce(max(seq), 0) + 1, false)
