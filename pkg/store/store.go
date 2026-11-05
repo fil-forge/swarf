@@ -1,8 +1,11 @@
 package store
 
 import (
+	"cmp"
 	"context"
+	"fmt"
 	"iter"
+	"strconv"
 	"time"
 
 	"github.com/fil-forge/ucantone/errors"
@@ -27,6 +30,44 @@ type RevocationRecord struct {
 	RecordedAt time.Time
 }
 
+// Cursor is a position in the revocation stream. A stream yields records in
+// Seq order, each with its own cursor, and a stream that starts after a cursor
+// yields only the records whose Seq is greater. The store numbers its records,
+// so a cursor means something only to the store that issued it. Outside Swarf
+// a cursor travels as its String form.
+//
+// The zero Cursor is ordered before every record.
+type Cursor struct {
+	Seq uint64
+}
+
+// Compare returns -1, 0, or +1 as c is ordered before, at, or after other.
+func (c Cursor) Compare(other Cursor) int {
+	return cmp.Compare(c.Seq, other.Seq)
+}
+
+// String encodes c as Seq in decimal.
+func (c Cursor) String() string {
+	return strconv.FormatUint(c.Seq, 10)
+}
+
+// ParseCursor decodes a cursor from its String form: a decimal number with no
+// sign, in the range of a uint64.
+func ParseCursor(s string) (Cursor, error) {
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err != nil {
+		return Cursor{}, fmt.Errorf("invalid cursor %q", s)
+	}
+	return Cursor{Seq: n}, nil
+}
+
+// StreamRecord is a revocation record as a stream yields it.
+type StreamRecord struct {
+	RevocationRecord
+	// Cursor is the record's position in the stream.
+	Cursor Cursor
+}
+
 // Revocation is a revocation to store with [RevocationStore.AddBatch].
 type Revocation struct {
 	// Cause is the invocation that revoked the delegation.
@@ -49,10 +90,18 @@ type RevocationStore interface {
 	// Get retrieves a revocation record from the store by revoked delegation CID.
 	// If the record is not found, [ErrNotFound] is returned.
 	Get(ctx context.Context, revoked cid.Cid) (RevocationRecord, error)
-	// Stream streams all revocation records from the store and remains open until
-	// the context is canceled. The from parameter filters records to those
-	// recorded on or after the given time, so consumers resuming from the
-	// timestamp of the last record they received do not miss records that share
-	// it. If from is zero, all records are returned.
-	Stream(ctx context.Context, from time.Time) iter.Seq2[RevocationRecord, error]
+	// Head returns the cursor at the head of the stream, that of the last
+	// record to reach it, or the zero cursor when no record has. A stream
+	// after it yields every record that reaches the stream from then on,
+	// including any whose write was still in progress when Head was called.
+	// Every cursor the store has issued is at or before its head.
+	Head(ctx context.Context) (Cursor, error)
+	// Stream yields the records after the after cursor, in cursor order, and
+	// remains open until the context is canceled. The zero cursor starts at
+	// the beginning of the stream.
+	//
+	// A record reaches the stream only once no record can be added ahead of
+	// it, so a stream started after the cursor of the last record another
+	// stream yielded misses nothing.
+	Stream(ctx context.Context, after Cursor) iter.Seq2[StreamRecord, error]
 }

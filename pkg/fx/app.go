@@ -389,7 +389,8 @@ func newEchoServer(id identity.Identity, ucanServer *server.HTTPServer, revocati
 	e.GET("/health", healthHandler)
 	e.GET("/.well-known/did.json", didDocumentHandler(id))
 	e.GET("/revocation/:cid", revocationHandler(revocations))
-	e.GET("/revocations/:from", firehoseHandler(revocations))
+	e.GET("/revocations/head", firehoseHeadHandler(revocations))
+	e.GET("/revocations/after/:cursor", firehoseAfterHandler(revocations))
 	e.POST("/", echo.WrapHandler(ucanServer))
 	return e
 }
@@ -437,36 +438,121 @@ func didDocumentHandler(id identity.Identity) echo.HandlerFunc {
 	}
 }
 
-func firehoseHandler(revocations store.RevocationStore) echo.HandlerFunc {
+// firehoseHeadHandler responds with the cursor at the head of the stream, so
+// a consumer can store a position to start from before any record arrives.
+func firehoseHeadHandler(revocations store.RevocationStore) echo.HandlerFunc {
 	return func(c echo.Context) error {
-		from, err := parseFrom(c.Param("from"))
+		head, err := revocations.Head(c.Request().Context())
 		if err != nil {
-			return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+			return fmt.Errorf("reading the revocation stream head: %w", err)
 		}
-		response := c.Response()
-		response.Header().Set(echo.HeaderContentType, "text/event-stream")
-		response.Header().Set(echo.HeaderCacheControl, "no-cache")
-		response.Header().Set(echo.HeaderConnection, "keep-alive")
-		response.WriteHeader(http.StatusOK)
-
-		for record, err := range revocations.Stream(c.Request().Context(), from) {
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return nil
-				}
-				writeFirehoseError(response, err)
-				// The response committed 200 before the stream began, so the
-				// status cannot carry this. Returning the error is the only
-				// thing an error handler or request logger ever sees; on nil
-				// a failed stream is indistinguishable from a clean one.
-				return fmt.Errorf("streaming revocations: %w", err)
-			}
-			if err := writeFirehoseRecord(response, record); err != nil {
-				return err
-			}
-		}
-		return nil
+		c.Response().Header().Set(echo.HeaderCacheControl, "no-store")
+		return c.String(http.StatusOK, head.String())
 	}
+}
+
+// firehoseAfterHandler streams the records after :cursor, which is either a
+// cursor an earlier stream sent as an event's id, or "now", the head of the
+// stream when the request arrives. A reconnect that sends Last-Event-ID
+// resumes after that event instead, since it is the later position.
+//
+// Every cursor the store issues is at or before its head, so a cursor ahead
+// of it came from somewhere else: another database, such as one restored from
+// an older backup, or the memory store before it restarted. Streaming after it
+// would skip every record up to it, so the request is refused instead. A
+// Last-Event-ID ahead of the head is refused too: it shows the store changed
+// since the stream began, so :cursor, from the same stream, is no position in
+// this store either.
+func firehoseAfterHandler(revocations store.RevocationStore) echo.HandlerFunc {
+	return func(c echo.Context) error {
+		var after store.Cursor
+		now := c.Param("cursor") == "now"
+		if !now {
+			var err error
+			if after, err = store.ParseCursor(c.Param("cursor")); err != nil {
+				return echo.NewHTTPError(http.StatusBadRequest, err.Error())
+			}
+		}
+		head, err := revocations.Head(c.Request().Context())
+		if err != nil {
+			return fmt.Errorf("reading the revocation stream head: %w", err)
+		}
+		if after.Compare(head) > 0 {
+			return errCursorAhead
+		}
+		if resumed, ok := lastEventID(c.Request()); ok {
+			if resumed.Compare(head) > 0 {
+				return errCursorAhead
+			}
+			after, now = resumed, false
+		}
+		if now {
+			after = head
+		}
+		return streamFirehose(c, revocations, after, now)
+	}
+}
+
+// errCursorAhead refuses a cursor ahead of the stream's head.
+var errCursorAhead = echo.NewHTTPError(http.StatusConflict,
+	"cursor is ahead of the revocation stream; it was not issued by this stream's database")
+
+// headerLastEventID is the header an SSE client sends when it reconnects: the
+// id of the last event it received.
+const headerLastEventID = "Last-Event-ID"
+
+// lastEventID returns the cursor in a request's Last-Event-ID header, if it
+// holds one. A header that does not is ignored, and the stream starts where
+// the request's URL says.
+func lastEventID(request *http.Request) (store.Cursor, bool) {
+	value := request.Header.Get(headerLastEventID)
+	if value == "" {
+		return store.Cursor{}, false
+	}
+	cursor, err := store.ParseCursor(value)
+	if err != nil {
+		return store.Cursor{}, false
+	}
+	return cursor, true
+}
+
+// streamFirehose writes the records after the after cursor as server-sent
+// events, each with its cursor as its id. With announce, it first sends the
+// after cursor alone.
+func streamFirehose(c echo.Context, revocations store.RevocationStore, after store.Cursor, announce bool) error {
+	response := c.Response()
+	response.Header().Set(echo.HeaderContentType, "text/event-stream")
+	response.Header().Set(echo.HeaderCacheControl, "no-cache")
+	response.Header().Set(echo.HeaderConnection, "keep-alive")
+	response.WriteHeader(http.StatusOK)
+
+	if announce {
+		// An event with only an id sets the client's last event ID without
+		// dispatching anything, so a client that reconnects before the first
+		// record resumes from here rather than from a later head.
+		if _, err := fmt.Fprintf(response, "id: %s\n\n", after); err != nil {
+			return fmt.Errorf("writing stream head: %w", err)
+		}
+		response.Flush()
+	}
+
+	for record, err := range revocations.Stream(c.Request().Context(), after) {
+		if err != nil {
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			writeFirehoseError(response, err)
+			// The response committed 200 before the stream began, so the
+			// status cannot carry this. Returning the error is the only
+			// thing an error handler or request logger ever sees; on nil
+			// a failed stream is indistinguishable from a clean one.
+			return fmt.Errorf("streaming revocations: %w", err)
+		}
+		if err := writeFirehoseRecord(response, record); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func revocationHandler(revocations store.RevocationStore) echo.HandlerFunc {
@@ -491,18 +577,7 @@ func revocationHandler(revocations store.RevocationStore) echo.HandlerFunc {
 	}
 }
 
-func parseFrom(value string) (time.Time, error) {
-	if value == "0" {
-		return time.Time{}, nil
-	}
-	from, err := time.Parse(time.RFC3339Nano, value)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid from timestamp: %w", err)
-	}
-	return from, nil
-}
-
-func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord) error {
+func writeFirehoseRecord(response *echo.Response, record store.StreamRecord) error {
 	path := make([]cid.Cid, len(record.Path))
 	for i, delegation := range record.Path {
 		path[i] = delegation.Link()
@@ -516,7 +591,7 @@ func writeFirehoseRecord(response *echo.Response, record store.RevocationRecord)
 	if err != nil {
 		return err
 	}
-	if _, err := fmt.Fprintf(response, "id: %s\nevent: revocation\ndata: %s\n\n", record.Cause.Link(), data); err != nil {
+	if _, err := fmt.Fprintf(response, "id: %s\nevent: revocation\ndata: %s\n\n", record.Cursor, data); err != nil {
 		return fmt.Errorf("writing revocation event: %w", err)
 	}
 	response.Flush()

@@ -5,8 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
-	"time"
 
 	"github.com/fil-forge/swarf/internal/sse"
 	"github.com/spf13/cobra"
@@ -14,16 +14,19 @@ import (
 
 func newStreamCommand() *cobra.Command {
 	var serviceURL string
-	var from string
+	var after string
 	command := &cobra.Command{
 		Use:   "stream",
 		Short: "Stream revocations",
-		Args:  cobra.NoArgs,
+		Long: `Stream revocations as they arrive, printing each as a DAG-JSON record.
+
+By default the stream starts at the head of the revocation stream, so it
+prints only the revocations that arrive from then on. Pass --after with a
+cursor to start after that position instead, or --after 0 to stream every
+revocation.`,
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			if from == "" {
-				from = time.Now().UTC().Format(time.RFC3339Nano)
-			}
-			if err := validateFrom(from); err != nil {
+			if err := validateAfter(after); err != nil {
 				return err
 			}
 			endpoint, err := url.Parse(serviceURL)
@@ -33,7 +36,7 @@ func newStreamCommand() *cobra.Command {
 			if !endpoint.IsAbs() || endpoint.Host == "" {
 				return fmt.Errorf("service URL must be absolute: %q", serviceURL)
 			}
-			requestURL := strings.TrimRight(endpoint.String(), "/") + "/revocations/" + url.PathEscape(from)
+			requestURL := strings.TrimRight(endpoint.String(), "/") + "/revocations/after/" + url.PathEscape(after)
 			request, err := http.NewRequestWithContext(cmd.Context(), http.MethodGet, requestURL, nil)
 			if err != nil {
 				return fmt.Errorf("creating revocation stream request: %w", err)
@@ -60,16 +63,17 @@ func newStreamCommand() *cobra.Command {
 		},
 	}
 	command.Flags().StringVar(&serviceURL, "service-url", defaultServiceURL, "Swarf service URL")
-	command.Flags().StringVar(&from, "from", "", "stream revocations recorded on or after this time: 0, RFC3339, or RFC3339Nano (default: now)")
+	command.Flags().StringVar(&after, "after", "now", "stream revocations after this cursor, or after the head of the stream with now")
 	return command
 }
 
-func validateFrom(value string) error {
-	if value == "0" {
+// validateAfter accepts a cursor, which is a decimal number, or now.
+func validateAfter(value string) error {
+	if value == "now" {
 		return nil
 	}
-	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
-		return fmt.Errorf("invalid from timestamp: %w", err)
+	if _, err := strconv.ParseUint(value, 10, 64); err != nil {
+		return fmt.Errorf("invalid --after %q: want a cursor or now", value)
 	}
 	return nil
 }
