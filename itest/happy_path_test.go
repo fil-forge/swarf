@@ -94,6 +94,12 @@ func TestRevocationHappyPath(t *testing.T) {
 	client, err := swarfclient.New(serviceIssuer.DID(), *serviceURL)
 	require.NoError(t, err)
 
+	// A consumer can store the head before any revocation arrives, and later
+	// stream after it without missing one.
+	start, err := client.Head(ctx)
+	require.NoError(t, err)
+	require.Equal(t, swarfclient.Cursor("0"), start)
+
 	first := revocationPath(t, alice, bob, carol)
 	require.NoError(t, client.Publish(ctx, bob, first[len(first)-1], swarfclient.WithWitnessPath(first[:len(first)-1]...)))
 	record, err := client.Get(ctx, first[len(first)-1].Link())
@@ -109,17 +115,16 @@ func TestRevocationHappyPath(t *testing.T) {
 	defer cancelStream()
 	records := make(chan error, 1)
 	go func() {
-		// The from cursor is inclusive, so the stream re-delivers the first
-		// revocation (recorded at exactly from) before the second, and must
-		// not deliver anything else.
+		// The stream after the stored head delivers the first revocation,
+		// published since, then the second, and nothing else.
 		expecting := []cid.Cid{record.Revoke, expected}
-		for streamed, err := range client.Stream(streamCtx, record.RecordedAt) {
+		for event, err := range client.StreamAfter(streamCtx, start) {
 			if err != nil {
 				records <- err
 				return
 			}
-			if streamed.Revoke != expecting[0] {
-				records <- fmt.Errorf("stream returned an unexpected revocation: %s", streamed.Revoke)
+			if event.Revocation.Revoke != expecting[0] {
+				records <- fmt.Errorf("stream returned an unexpected revocation: %s", event.Revocation.Revoke)
 				return
 			}
 			expecting = expecting[1:]
@@ -199,11 +204,18 @@ func TestRevocationHappyPath(t *testing.T) {
 	require.NoError(t, client.Publish(ctx, bob, fifth[len(fifth)-1]))
 	resumeCtx, cancelResume := context.WithTimeout(ctx, 10*time.Second)
 	defer cancelResume()
+	var resumed int
 	for event, err := range client.StreamAfter(resumeCtx, followed.Cursor) {
 		require.NoError(t, err)
 		require.Equal(t, fifth[len(fifth)-1].Link(), event.Revocation.Revoke)
+		// The fifth revocation is the last one, so its cursor is the head.
+		head, err := client.Head(ctx)
+		require.NoError(t, err)
+		require.Equal(t, event.Cursor, head)
+		resumed++
 		break
 	}
+	require.Equal(t, 1, resumed)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

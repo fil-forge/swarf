@@ -107,7 +107,8 @@ func (s *Store) Get(ctx context.Context, delegation cid.Cid) (store.RevocationRe
 	return copyRecord(entry.record), nil
 }
 
-// Head returns the cursor of the last record added.
+// Head returns the cursor of the last record added, or the zero cursor when
+// none has been.
 func (s *Store) Head(ctx context.Context) (store.Cursor, error) {
 	if err := ctx.Err(); err != nil {
 		return store.Cursor{}, err
@@ -117,11 +118,12 @@ func (s *Store) Head(ctx context.Context) (store.Cursor, error) {
 	return store.Cursor{Seq: s.nextSeq}, nil
 }
 
-// Stream yields matching revocation records and remains open until ctx is
-// canceled. A record's cursor is the sequence number AddBatch gave it, and
-// AddBatch gives each record its number under the same lock that makes it
-// visible, so no record can appear ahead of one already streamed.
-func (s *Store) Stream(ctx context.Context, after store.Cursor, from time.Time) iter.Seq2[store.StreamRecord, error] {
+// Stream yields the revocation records after the after cursor, in cursor
+// order, and remains open until ctx is canceled. A record's cursor is the
+// sequence number AddBatch gave it, and AddBatch gives each record its number
+// under the same lock that makes it visible, so no record can appear behind
+// one already streamed.
+func (s *Store) Stream(ctx context.Context, after store.Cursor) iter.Seq2[store.StreamRecord, error] {
 	return func(yield func(store.StreamRecord, error) bool) {
 		if err := ctx.Err(); err != nil {
 			yield(store.StreamRecord{}, err)
@@ -129,7 +131,7 @@ func (s *Store) Stream(ctx context.Context, after store.Cursor, from time.Time) 
 		}
 
 		s.mu.Lock()
-		entries, scanned := s.recordsAfterLocked(after, from)
+		entries, scanned := s.recordsAfterLocked(after)
 		s.nextSubscriber++
 		subscriber := s.nextSubscriber
 		notification := make(chan struct{}, 1)
@@ -165,20 +167,20 @@ func (s *Store) Stream(ctx context.Context, after store.Cursor, from time.Time) 
 				return
 			case <-notification:
 				s.mu.RLock()
-				entries, scanned = s.recordsAfterLocked(scanned, from)
+				entries, scanned = s.recordsAfterLocked(scanned)
 				s.mu.RUnlock()
 			}
 		}
 	}
 }
 
-// recordsAfterLocked returns the records after the after cursor and recorded
-// on or after from, in cursor order, and the cursor the next scan starts
-// after: the later of after and the last record added.
-func (s *Store) recordsAfterLocked(after store.Cursor, from time.Time) ([]memoryRecord, store.Cursor) {
+// recordsAfterLocked returns the records after the after cursor, in cursor
+// order, and the cursor the next scan starts after: the later of after and the
+// last record added.
+func (s *Store) recordsAfterLocked(after store.Cursor) ([]memoryRecord, store.Cursor) {
 	entries := make([]memoryRecord, 0, len(s.records))
 	for _, entry := range s.records {
-		if entry.cursor().Compare(after) > 0 && !entry.record.RecordedAt.Before(from) {
+		if entry.cursor().Compare(after) > 0 {
 			entries = append(entries, entry)
 		}
 	}

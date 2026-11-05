@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"iter"
 	"net/http"
 	"net/url"
@@ -191,13 +192,46 @@ func (c *Client) Get(ctx context.Context, delegationCID cid.Cid) (store.Revocati
 }
 
 // Cursor is a position in the revocation firehose, which the service sends
-// with each revocation. Its form is the service's own and opaque: store one,
-// and pass it back to StreamAfter to resume after that revocation.
+// with each revocation. Store one, and pass it back to StreamAfter to resume
+// after that revocation.
 type Cursor string
 
 // Now is the cursor at the head of the firehose, as the service sees it when
 // the stream opens.
 const Now Cursor = "now"
+
+// Head returns the cursor at the head of the firehose. A consumer that stores
+// it before any revocation arrives can later start with StreamAfter from that
+// position, rather than from Now, and miss nothing in between.
+func (c *Client) Head(ctx context.Context) (Cursor, error) {
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, c.endpoint("revocations", "head"), nil)
+	if err != nil {
+		return "", fmt.Errorf("creating revocation stream head request: %w", err)
+	}
+	response, err := c.httpClient.Do(request)
+	if err != nil {
+		return "", fmt.Errorf("getting revocation stream head: %w", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("getting revocation stream head: unexpected status %s", response.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(response.Body, maxHeadBytes+1))
+	if err != nil {
+		return "", fmt.Errorf("reading revocation stream head: %w", err)
+	}
+	if len(body) > maxHeadBytes {
+		return "", fmt.Errorf("revocation stream head exceeds %d bytes", maxHeadBytes)
+	}
+	head := Cursor(strings.TrimSuffix(string(body), "\n"))
+	if head == "" {
+		return "", errors.New("revocation stream head is empty")
+	}
+	return head, nil
+}
+
+// maxHeadBytes bounds the head response Head reads. A cursor is far shorter.
+const maxHeadBytes = 1024
 
 // Event is a firehose revocation and the cursor that resumes the firehose
 // after it.
@@ -220,8 +254,8 @@ var errStreamStopped = errors.New("revocation stream stopped")
 
 // ErrCursorRefused reports that the service refused a stream's cursor as one
 // it cannot have issued, because it is ahead of the service's head: a cursor
-// from before the service's database moved to another server, say. Resuming
-// after it again cannot succeed.
+// from a database the service no longer uses, say. Resuming after it again
+// cannot succeed.
 var ErrCursorRefused = errors.New("revocation service refused the stream cursor")
 
 // connectError reports a stream connection that was never established.
@@ -237,58 +271,24 @@ type corruptError struct{ err error }
 func (e corruptError) Error() string { return e.err.Error() }
 func (e corruptError) Unwrap() error { return e.err }
 
-// Stream yields firehose revocations recorded on or after from, or every
-// revocation if from is zero, and remains open until ctx is canceled,
-// reconnecting with capped exponential backoff when the stream is
-// interrupted. A reconnect resumes after the last revocation the call
-// delivered, so a call yields each revocation once, and never one recorded
-// before from. Moving the service's database with a dump and restore, or
-// with logical replication, voids that position, though: a call open across
-// the move can then repeat or skip revocations, and has to be started over
-// (see Swarf's README).
-//
-// Revocations do not reach the firehose in recorded_at order, so a new call
-// from the timestamp of the last revocation a previous call delivered can miss
-// revocations recorded earlier that reached the firehose later. To resume
-// across calls, use StreamAfter.
-func (c *Client) Stream(ctx context.Context, from time.Time) iter.Seq2[api.FirehoseRevocation, error] {
-	return func(yield func(api.FirehoseRevocation, error) bool) {
-		for event, err := range c.StreamEvents(ctx, from) {
-			if !yield(event.Revocation, err) {
-				return
-			}
-		}
-	}
-}
-
-// StreamEvents is Stream, yielding each revocation with its cursor, so a
-// consumer that starts with a time query can resume with StreamAfter.
-func (c *Client) StreamEvents(ctx context.Context, from time.Time) iter.Seq2[Event, error] {
-	position := "0"
-	if !from.IsZero() {
-		position = from.UTC().Format(time.RFC3339Nano)
-	}
-	return c.stream(ctx, c.endpoint("revocations", position))
-}
-
 // StreamAfter yields the firehose revocations after cursor, each with its own
-// cursor, and remains open until ctx is canceled, reconnecting as Stream
-// does. Pass the cursor of an Event a previous call yielded to resume after
-// that revocation, or Now to start at the head of the firehose.
+// cursor, and remains open until ctx is canceled, reconnecting with capped
+// exponential backoff when the stream is interrupted. Pass the cursor of an
+// Event a previous call yielded to resume after that revocation, Now to start
+// at the head of the firehose, or a cursor from Head.
 //
-// A call yields each revocation once, and a call resuming after the cursor of
-// the last revocation a consumer applied misses nothing. A consumer that
-// stores its cursor less often than it applies revocations has some
-// re-delivered when it resumes; dedupe those by Cause.
+// A reconnect resumes after the last event the service sent, so a call yields
+// each revocation once, and a call resuming after the cursor of the last
+// revocation a consumer applied misses nothing. A consumer that stores its
+// cursor less often than it applies revocations has some re-delivered when it
+// resumes; dedupe those by Cause.
 //
 // The service refuses a cursor ahead of its head, which it cannot have
 // issued, and the stream then ends with an error wrapping ErrCursorRefused.
-// Not every cursor from before a dump and restore, or a logical replication,
-// of the service's database is ahead of the head, though, so such a move still
-// calls for resetting every consumer, a call open across the move included
-// (see Swarf's README). Starting over from Now skips the revocations that
-// reached the firehose after the consumer's last one; StreamEvents from a time
-// well before that one's RecordedAt, or from zero, deduped by Cause, does not.
+// To start over after a refusal, or after the service's database moves, call
+// StreamAfter again with Now, accepting that it skips the revocations since
+// the last one applied, or with a cursor from Head taken earlier, deduping
+// the revocations it repeats by Cause.
 func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event, error] {
 	if after == "" {
 		return func(yield func(Event, error) bool) {
@@ -301,8 +301,8 @@ func (c *Client) StreamAfter(ctx context.Context, after Cursor) iter.Seq2[Event,
 // stream follows the firehose at endpoint until ctx is canceled, reconnecting
 // with capped exponential backoff when it is interrupted. Each reconnect sends
 // the id of the last event the service sent as Last-Event-ID, so the service
-// resumes after it, still serving only what endpoint selects. It ends with an
-// error when the first connection fails or the service refuses the cursor.
+// resumes after it. It ends with an error when the first connection fails or
+// the service refuses the cursor.
 func (c *Client) stream(ctx context.Context, endpoint string) iter.Seq2[Event, error] {
 	return func(yield func(Event, error) bool) {
 		var lastEventID Cursor
@@ -400,7 +400,7 @@ func (c *Client) streamConn(ctx context.Context, endpoint string, lastEventID *C
 	// reconnects. An oversized event is not that: it is still there at the same
 	// cursor, so reconnecting hits it again forever -- the record is never
 	// yielded and no error is ever returned, which presents as a hang rather
-	// than a failure. Report it as corrupt so Stream surfaces it and stops.
+	// than a failure. Report it as corrupt so the stream surfaces it and stops.
 	if err := events.Err(); errors.Is(err, sse.ErrEventTooLong) {
 		return corruptError{fmt.Errorf("streamed revocation exceeds %d bytes", sse.MaxEventBytes)}
 	}

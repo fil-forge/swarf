@@ -1,10 +1,12 @@
 package postgres_test
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"iter"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -60,14 +62,11 @@ func TestPostgresRevocationStoreStream(t *testing.T) {
 	s, _ := newTestStore(t)
 	firstRevocation, firstPath := revocationPath(t)
 	add(t, s, firstRevocation, firstPath)
-	first, err := s.Get(context.Background(), firstPath[len(firstPath)-1].Link())
-	require.NoError(t, err)
-
 	secondRevocation, secondPath := revocationPath(t)
 	add(t, s, secondRevocation, secondPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	records, done := collectStream(s.Stream(ctx, store.Cursor{}, time.Time{}))
+	records, done := collectStream(ctx, s.Stream(ctx, store.Cursor{}))
 	require.Equal(t, firstRevocation.Link(), (<-records).Cause.Link())
 	require.Equal(t, secondRevocation.Link(), (<-records).Cause.Link())
 
@@ -76,49 +75,11 @@ func TestPostgresRevocationStoreStream(t *testing.T) {
 	require.Equal(t, thirdRevocation.Link(), (<-records).Cause.Link())
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
-
-	// The from filter is inclusive: the record recorded at exactly from is
-	// re-delivered.
-	filteredCtx, filteredCancel := context.WithCancel(context.Background())
-	filtered, filteredDone := collectStream(s.Stream(filteredCtx, store.Cursor{}, first.RecordedAt))
-	require.Equal(t, firstRevocation.Link(), (<-filtered).Cause.Link())
-	require.Equal(t, secondRevocation.Link(), (<-filtered).Cause.Link())
-	require.Equal(t, thirdRevocation.Link(), (<-filtered).Cause.Link())
-	filteredCancel()
-	require.ErrorIs(t, <-filteredDone, context.Canceled)
 }
 
-func TestPostgresRevocationStoreStreamSameTimestamp(t *testing.T) {
-	s, pool := newTestStore(t)
-	recordedAt := time.Now().UTC().Truncate(time.Microsecond)
-
-	firstRevocation, firstPath := revocationPath(t)
-	insertAt(t, pool, firstRevocation, firstPath, recordedAt)
-	secondRevocation, secondPath := revocationPath(t)
-	insertAt(t, pool, secondRevocation, secondPath, recordedAt)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	records, done := collectStream(s.Stream(ctx, store.Cursor{}, recordedAt))
-
-	// Records sharing recorded_at are ordered by id, so delivery order is not
-	// deterministic: both must arrive, exactly once each.
-	delivered := map[string]int{}
-	delivered[(<-records).Cause.Link().String()]++
-	delivered[(<-records).Cause.Link().String()]++
-	require.Equal(t, 1, delivered[firstRevocation.Link().String()])
-	require.Equal(t, 1, delivered[secondRevocation.Link().String()])
-
-	// Hold the stream open past a poll interval: records sharing the from
-	// timestamp must not be re-delivered.
-	select {
-	case record := <-records:
-		require.Failf(t, "stream re-delivered a record", "cause: %s", record.Cause.Link())
-	case <-time.After(2 * time.Second):
-	}
-	cancel()
-	require.ErrorIs(t, <-done, context.Canceled)
-}
-
+// The stream is ordered by seq, not recorded_at, so a row that commits with a
+// recorded_at the stream has already passed, sharing the last record's or
+// earlier, is still delivered, exactly once.
 func TestPostgresRevocationStoreStreamLateArrivals(t *testing.T) {
 	s, pool := newTestStore(t)
 	recordedAt := time.Now().UTC().Truncate(time.Microsecond)
@@ -127,22 +88,16 @@ func TestPostgresRevocationStoreStreamLateArrivals(t *testing.T) {
 	insertAt(t, pool, firstRevocation, firstPath, recordedAt)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	records, done := collectStream(s.Stream(ctx, store.Cursor{}, time.Time{}))
+	records, done := collectStream(ctx, s.Stream(ctx, store.Cursor{}))
 	require.Equal(t, firstRevocation.Link(), (<-records).Cause.Link())
 
-	// A row can commit with a recorded_at the stream has already passed:
-	// sharing the first record's, or earlier. Both must still be delivered,
-	// exactly once each.
 	sameTsRevocation, sameTsPath := revocationPath(t)
 	insertAt(t, pool, sameTsRevocation, sameTsPath, recordedAt)
 	earlierRevocation, earlierPath := revocationPath(t)
 	insertAt(t, pool, earlierRevocation, earlierPath, recordedAt.Add(-time.Second))
 
-	delivered := map[string]int{}
-	delivered[(<-records).Cause.Link().String()]++
-	delivered[(<-records).Cause.Link().String()]++
-	require.Equal(t, 1, delivered[sameTsRevocation.Link().String()])
-	require.Equal(t, 1, delivered[earlierRevocation.Link().String()])
+	require.Equal(t, sameTsRevocation.Link(), (<-records).Cause.Link())
+	require.Equal(t, earlierRevocation.Link(), (<-records).Cause.Link())
 
 	// Hold the stream open past a poll interval: nothing is re-delivered.
 	select {
@@ -162,13 +117,13 @@ func TestPostgresRevocationStoreStreamAfterCursor(t *testing.T) {
 	add(t, s, secondRevocation, secondPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	records, done := collectStream(s.Stream(ctx, store.Cursor{}, time.Time{}))
+	records, done := collectStream(ctx, s.Stream(ctx, store.Cursor{}))
 	first := <-records
 	require.Equal(t, firstRevocation.Link(), first.Cause.Link())
-	require.Equal(t, firstRevocation.Link().String(), first.Cursor.ID)
+	require.Equal(t, store.Cursor{Seq: 1}, first.Cursor)
 	second := <-records
 	require.Equal(t, secondRevocation.Link(), second.Cause.Link())
-	require.Positive(t, second.Cursor.Compare(first.Cursor))
+	require.Equal(t, store.Cursor{Seq: 2}, second.Cursor)
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
 
@@ -181,7 +136,7 @@ func TestPostgresRevocationStoreStreamAfterCursor(t *testing.T) {
 	// A stream after the first record's cursor starts at the second, and
 	// carries on with records added later.
 	resumedCtx, resumedCancel := context.WithCancel(context.Background())
-	resumed, resumedDone := collectStream(s.Stream(resumedCtx, first.Cursor, time.Time{}))
+	resumed, resumedDone := collectStream(resumedCtx, s.Stream(resumedCtx, first.Cursor))
 	require.Equal(t, secondRevocation.Link(), (<-resumed).Cause.Link())
 	thirdRevocation, thirdPath := revocationPath(t)
 	add(t, s, thirdRevocation, thirdPath)
@@ -190,23 +145,50 @@ func TestPostgresRevocationStoreStreamAfterCursor(t *testing.T) {
 	require.ErrorIs(t, <-resumedDone, context.Canceled)
 }
 
+func TestPostgresRevocationStoreHead(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	head, err := s.Head(ctx)
+	require.NoError(t, err)
+	require.Equal(t, store.Cursor{}, head, "an empty store's head is the zero cursor")
+
+	batch := []store.Revocation{revocationWithPathLength(t, 1), revocationWithPathLength(t, 1), revocationWithPathLength(t, 1)}
+	require.NoError(t, s.AddBatch(ctx, batch))
+	streamed := streamN(t, s, store.Cursor{}, len(batch))
+	head, err = s.Head(ctx)
+	require.NoError(t, err)
+	require.Equal(t, streamed[len(streamed)-1].Cursor, head, "the head is the highest seq")
+
+	// A batch that stores nothing new can still use up numbers, leaving a gap
+	// in seq. The head stays at the highest stored seq, and the next record
+	// streams after it.
+	require.NoError(t, s.AddBatch(ctx, batch[:1]))
+	next := revocationWithPathLength(t, 1)
+	require.NoError(t, s.AddBatch(ctx, []store.Revocation{next}))
+	after := streamN(t, s, head, 1)
+	require.Equal(t, next.Cause.Link(), after[0].Cause.Link())
+	head, err = s.Head(ctx)
+	require.NoError(t, err)
+	require.Equal(t, after[0].Cursor, head)
+}
+
 func TestPostgresRevocationStoreStreamAfterHead(t *testing.T) {
 	s, pool := newTestStore(t)
 	ctx := context.Background()
 	committedRevocation, committedPath := revocationPath(t)
 	add(t, s, committedRevocation, committedPath)
 
-	// An insert still in progress when Head is read is after the head.
+	// A write still in progress when Head is read is after the head.
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback(ctx) }()
 	inFlightRevocation, inFlightPath := revocationPath(t)
-	insert(t, tx, inFlightRevocation, inFlightPath)
+	insertLocked(t, tx, inFlightRevocation, inFlightPath)
 
 	head, err := s.Head(ctx)
 	require.NoError(t, err)
 	streamCtx, cancel := context.WithCancel(ctx)
-	records, done := collectStream(s.Stream(streamCtx, head, time.Time{}))
+	records, done := collectStream(streamCtx, s.Stream(streamCtx, head))
 
 	require.NoError(t, tx.Commit(ctx))
 	require.Equal(t, inFlightRevocation.Link(), (<-records).Cause.Link())
@@ -224,78 +206,68 @@ func TestPostgresRevocationStoreStreamAfterHead(t *testing.T) {
 	require.ErrorIs(t, <-done, context.Canceled)
 }
 
-// recorded_at is the time an insert's transaction started, so a transaction
-// that started first can commit after one that started later. A consumer that
-// resumed from the recorded_at of the last record it received therefore
-// missed such a row on every reconnect. The stream holds later rows back
-// until the earlier transaction ends, so a resumed stream delivers it.
-func TestPostgresRevocationStoreStreamWaitsForOpenTransactions(t *testing.T) {
+// seq is handed out at insert, not at commit, so without the write lock a
+// writer that inserted first could commit after one that inserted later, and
+// a stream that had yielded the later row would never yield the earlier one.
+// The lock makes the second writer wait until the first has committed before
+// it takes its numbers.
+func TestPostgresRevocationStoreWritesInCommitOrder(t *testing.T) {
 	s, pool := newTestStore(t)
 	ctx := context.Background()
 	firstRevocation, firstPath := revocationPath(t)
 	add(t, s, firstRevocation, firstPath)
 
 	streamCtx, cancel := context.WithCancel(ctx)
-	records, done := collectStream(s.Stream(streamCtx, store.Cursor{}, time.Time{}))
+	defer cancel()
+	records, done := collectStream(streamCtx, s.Stream(streamCtx, store.Cursor{}))
 	first := <-records
 	require.Equal(t, firstRevocation.Link(), first.Cause.Link())
 
-	// The slow insert's transaction starts first and stays open while the
-	// fast insert commits.
+	// The slow writer takes the lock and inserts, and stays open.
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
 	defer func() { _ = tx.Rollback(ctx) }()
 	slowRevocation, slowPath := revocationPath(t)
-	insert(t, tx, slowRevocation, slowPath)
-	fastRevocation, fastPath := revocationPath(t)
-	add(t, s, fastRevocation, fastPath)
+	insertLocked(t, tx, slowRevocation, slowPath)
 
-	// Delivering the fast record now would let a consumer resume past the
-	// slow one.
+	// The fast writer waits for the lock.
+	fast := revocationWithPathLength(t, 1)
+	added := make(chan error, 1)
+	go func() { added <- s.AddBatch(ctx, []store.Revocation{fast}) }()
+	require.Eventually(t, func() bool {
+		var waiting int
+		err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
+		).Scan(&waiting)
+		return err == nil && waiting == 1
+	}, 10*time.Second, 10*time.Millisecond, "AddBatch did not wait for the write lock")
+
+	// Hold past a poll interval: the fast write is still blocked, and the
+	// stream yields neither record.
 	select {
+	case err := <-added:
+		require.Failf(t, "AddBatch did not wait for the write lock", "err: %v", err)
 	case record := <-records:
-		require.Failf(t, "stream delivered a record ahead of an open transaction", "cause: %s", record.Cause.Link())
+		require.Failf(t, "stream yielded a record before its write committed", "cause: %s", record.Cause.Link())
 	case <-time.After(2 * time.Second):
 	}
-	cancel()
-	require.ErrorIs(t, <-done, context.Canceled)
 
 	require.NoError(t, tx.Commit(ctx))
-	slow, err := s.Get(ctx, slowPath[len(slowPath)-1].Link())
-	require.NoError(t, err)
-	fast, err := s.Get(ctx, fastPath[len(fastPath)-1].Link())
-	require.NoError(t, err)
-	require.True(t, slow.RecordedAt.Before(fast.RecordedAt), "the slow record must be recorded first")
+	require.NoError(t, <-added)
 
-	// Resumed after the last record the first stream delivered, the stream
-	// delivers the slow record, then the fast one.
-	resumedCtx, resumedCancel := context.WithCancel(ctx)
-	resumed, resumedDone := collectStream(s.Stream(resumedCtx, first.Cursor, time.Time{}))
-	require.Equal(t, slowRevocation.Link(), (<-resumed).Cause.Link())
-	require.Equal(t, fastRevocation.Link(), (<-resumed).Cause.Link())
-	resumedCancel()
-	require.ErrorIs(t, <-resumedDone, context.Canceled)
-
-	// A time query from the fast record's recorded_at never returns the slow
-	// record, recorded before it, whether it starts afresh or resumes after a
-	// cursor the slow record follows.
-	for _, after := range []store.Cursor{{}, first.Cursor} {
-		timedCtx, timedCancel := context.WithCancel(ctx)
-		timed, timedDone := collectStream(s.Stream(timedCtx, after, fast.RecordedAt))
-		require.Equal(t, fastRevocation.Link(), (<-timed).Cause.Link())
-		select {
-		case record := <-timed:
-			require.Failf(t, "time query delivered a record from before its floor", "cause: %s", record.Cause.Link())
-		case <-time.After(2 * time.Second):
-		}
-		timedCancel()
-		require.ErrorIs(t, <-timedDone, context.Canceled)
-	}
+	// Both arrive, in the order they committed.
+	slow := <-records
+	require.Equal(t, slowRevocation.Link(), slow.Cause.Link())
+	fastRecord := <-records
+	require.Equal(t, fast.Cause.Link(), fastRecord.Cause.Link())
+	require.Positive(t, fastRecord.Cursor.Compare(slow.Cursor))
+	cancel()
+	require.ErrorIs(t, <-done, context.Canceled)
 }
 
-// Rows stored before the transaction ID column existed share one transaction
-// ID that streams before every later row.
-func TestPostgresRevocationStoreStreamsRowsFromBeforeTransactionIDs(t *testing.T) {
+// Migration 00002 numbers the rows already stored in (recorded_at, id) order,
+// with id ordered bytewise, and rows added afterwards are numbered after them.
+func TestPostgresRevocationStoreNumbersRowsFromBeforeSeq(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := t.Context()
 	db := stdlib.OpenDBFromPool(pool)
@@ -303,28 +275,46 @@ func TestPostgresRevocationStoreStreamsRowsFromBeforeTransactionIDs(t *testing.T
 	goose.SetBaseFS(migrations.FS)
 	require.NoError(t, goose.SetDialect("postgres"))
 	require.NoError(t, goose.UpToContext(ctx, db, "sql", 1))
-	legacyRevocation, legacyPath := revocationPath(t)
-	insert(t, pool, legacyRevocation, legacyPath)
+
+	// Insert in an order that matches neither recorded_at nor id, two rows
+	// sharing a recorded_at so that id breaks the tie.
+	base := time.Now().UTC().Truncate(time.Microsecond)
+	type legacyRow struct {
+		revocation ucan.Invocation
+		recordedAt time.Time
+	}
+	var legacy []legacyRow
+	for _, offset := range []time.Duration{3 * time.Second, 0, time.Second, time.Second, 2 * time.Second} {
+		revocation, path := revocationPath(t)
+		insertAt(t, pool, revocation, path, base.Add(offset))
+		legacy = append(legacy, legacyRow{revocation: revocation, recordedAt: base.Add(offset)})
+	}
 	require.NoError(t, migrations.Up(ctx, pool, zap.NewNop()))
 	s := postgres.New(pool)
 
+	slices.SortFunc(legacy, func(a, b legacyRow) int {
+		return cmp.Or(a.recordedAt.Compare(b.recordedAt), strings.Compare(a.revocation.Link().String(), b.revocation.Link().String()))
+	})
+	streamed := streamN(t, s, store.Cursor{}, len(legacy))
+	for i, row := range legacy {
+		require.Equal(t, row.revocation.Link(), streamed[i].Cause.Link(), "row %d", i)
+		require.Equal(t, store.Cursor{Seq: uint64(i + 1)}, streamed[i].Cursor, "row %d", i)
+	}
+
 	newRevocation, newPath := revocationPath(t)
 	add(t, s, newRevocation, newPath)
+	resumed := streamN(t, s, streamed[len(streamed)-1].Cursor, 1)
+	require.Equal(t, newRevocation.Link(), resumed[0].Cause.Link())
+	require.Equal(t, store.Cursor{Seq: uint64(len(legacy) + 1)}, resumed[0].Cursor)
+}
 
-	streamCtx, cancel := context.WithCancel(ctx)
-	records, done := collectStream(s.Stream(streamCtx, store.Cursor{}, time.Time{}))
-	legacy := <-records
-	require.Equal(t, legacyRevocation.Link(), legacy.Cause.Link())
-	require.Zero(t, legacy.Cursor.Seq)
-	require.Equal(t, newRevocation.Link(), (<-records).Cause.Link())
-	cancel()
-	require.ErrorIs(t, <-done, context.Canceled)
-
-	resumedCtx, resumedCancel := context.WithCancel(ctx)
-	resumed, resumedDone := collectStream(s.Stream(resumedCtx, legacy.Cursor, time.Time{}))
-	require.Equal(t, newRevocation.Link(), (<-resumed).Cause.Link())
-	resumedCancel()
-	require.ErrorIs(t, <-resumedDone, context.Canceled)
+// A table with no rows when migration 00002 runs numbers from 1.
+func TestPostgresRevocationStoreNumbersFromOne(t *testing.T) {
+	s, _ := newTestStore(t)
+	revocation, path := revocationPath(t)
+	add(t, s, revocation, path)
+	streamed := streamN(t, s, store.Cursor{}, 1)
+	require.Equal(t, store.Cursor{Seq: 1}, streamed[0].Cursor)
 }
 
 func TestPostgresRevocationStoreStreamBroadcasts(t *testing.T) {
@@ -333,9 +323,9 @@ func TestPostgresRevocationStoreStreamBroadcasts(t *testing.T) {
 	add(t, s, firstRevocation, firstPath)
 
 	firstCtx, firstCancel := context.WithCancel(context.Background())
-	firstRecords, firstDone := collectStream(s.Stream(firstCtx, store.Cursor{}, time.Time{}))
+	firstRecords, firstDone := collectStream(firstCtx, s.Stream(firstCtx, store.Cursor{}))
 	secondCtx, secondCancel := context.WithCancel(context.Background())
-	secondRecords, secondDone := collectStream(s.Stream(secondCtx, store.Cursor{}, time.Time{}))
+	secondRecords, secondDone := collectStream(secondCtx, s.Stream(secondCtx, store.Cursor{}))
 	<-firstRecords
 	<-secondRecords
 
@@ -354,7 +344,7 @@ func TestPostgresRevocationStoreStreamCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	for _, err := range postgres.New(nil).Stream(ctx, store.Cursor{}, time.Time{}) {
+	for _, err := range postgres.New(nil).Stream(ctx, store.Cursor{}) {
 		require.ErrorIs(t, err, context.Canceled)
 		return
 	}
@@ -410,6 +400,7 @@ func TestPostgresRevocationStoreAddBatchIssuesOneInsert(t *testing.T) {
 
 	require.NoError(t, s.AddBatch(context.Background(), batch))
 	require.Equal(t, 1, tracer.count("INSERT"))
+	require.Equal(t, 1, tracer.count("SELECT pg_advisory_xact_lock"), "the write takes the write lock")
 }
 
 func TestPostgresRevocationStoreAddBatchDuplicates(t *testing.T) {
@@ -440,10 +431,11 @@ func TestPostgresRevocationStoreStreamBatch(t *testing.T) {
 	require.NoError(t, s.AddBatch(context.Background(), batch))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	records, done := collectStream(s.Stream(ctx, store.Cursor{}, time.Time{}))
+	records, done := collectStream(ctx, s.Stream(ctx, store.Cursor{}))
 
 	// Every record of the batch shares recorded_at: each must arrive exactly
-	// once, in any order.
+	// once. The order of a batch's rows is the order the INSERT numbered them
+	// in, which SQL leaves open.
 	delivered := map[string]int{}
 	for range batch {
 		delivered[(<-records).Cause.Link().String()]++
@@ -465,8 +457,8 @@ func TestPostgresRevocationStoreStreamBatch(t *testing.T) {
 }
 
 // TestPostgresRevocationStoreStreamAfterCursorMidBatch resumes a stream after
-// a record in the middle of a batch. A batch's rows share their transaction ID
-// and recorded_at, so only the cursor's ID orders them.
+// a record in the middle of a batch. A batch's rows share recorded_at, but
+// each has a seq of its own.
 func TestPostgresRevocationStoreStreamAfterCursorMidBatch(t *testing.T) {
 	s, _ := newTestStore(t)
 	batch := make([]store.Revocation, 5)
@@ -476,19 +468,19 @@ func TestPostgresRevocationStoreStreamAfterCursorMidBatch(t *testing.T) {
 	require.NoError(t, s.AddBatch(context.Background(), batch))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	records, done := collectStream(s.Stream(ctx, store.Cursor{}, time.Time{}))
+	records, done := collectStream(ctx, s.Stream(ctx, store.Cursor{}))
 	streamed := make([]store.StreamRecord, len(batch))
 	for i := range streamed {
 		streamed[i] = <-records
 	}
 	cancel()
 	require.ErrorIs(t, <-done, context.Canceled)
-	for _, record := range streamed[1:] {
-		require.Equal(t, streamed[0].Cursor.Seq, record.Cursor.Seq, "a batch's rows share their transaction ID")
+	for i, record := range streamed {
+		require.Equal(t, store.Cursor{Seq: streamed[0].Cursor.Seq + uint64(i)}, record.Cursor, "a batch's rows get consecutive seqs")
 	}
 
 	resumedCtx, resumedCancel := context.WithCancel(context.Background())
-	resumed, resumedDone := collectStream(s.Stream(resumedCtx, streamed[2].Cursor, time.Time{}))
+	resumed, resumedDone := collectStream(resumedCtx, s.Stream(resumedCtx, streamed[2].Cursor))
 	for _, want := range streamed[3:] {
 		require.Equal(t, want.Cause.Link(), (<-resumed).Cause.Link())
 	}
@@ -585,6 +577,15 @@ func insert(t *testing.T, db execer, revocation ucan.Invocation, path []ucan.Del
 	require.NoError(t, err)
 }
 
+// insertLocked takes the write lock in tx, as AddBatch does, and inserts a
+// revocation record through it. The lock is held until tx ends.
+func insertLocked(t *testing.T, tx pgx.Tx, revocation ucan.Invocation, path []ucan.Delegation) {
+	t.Helper()
+	_, err := tx.Exec(context.Background(), `SELECT pg_advisory_xact_lock($1)`, postgres.WriteLockKey)
+	require.NoError(t, err)
+	insert(t, tx, revocation, path)
+}
+
 // insertAt stores a revocation record like Add, but with an explicit
 // recorded_at instead of the column default.
 func insertAt(t *testing.T, pool *pgxpool.Pool, revocation ucan.Invocation, path []ucan.Delegation, recordedAt time.Time) {
@@ -609,7 +610,39 @@ func insertAt(t *testing.T, pool *pgxpool.Pool, revocation ucan.Invocation, path
 	require.NoError(t, err)
 }
 
-func collectStream(stream iter.Seq2[store.StreamRecord, error]) (<-chan store.StreamRecord, <-chan error) {
+// streamN returns the first n records a stream after the after cursor yields.
+func streamN(t *testing.T, s store.RevocationStore, after store.Cursor, n int) []store.StreamRecord {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	records, done := collectStream(ctx, s.Stream(ctx, after))
+	streamed := make([]store.StreamRecord, 0, n)
+	for len(streamed) < n {
+		select {
+		case record := <-records:
+			streamed = append(streamed, record)
+		case err := <-done:
+			require.FailNow(t, "stream ended early", "err: %v", err)
+		case <-time.After(10 * time.Second):
+			require.FailNow(t, "timed out waiting for streamed records", "got %d of %d", len(streamed), n)
+		}
+	}
+	cancel()
+	for {
+		select {
+		case <-records:
+		case err := <-done:
+			require.ErrorIs(t, err, context.Canceled)
+			return streamed
+		}
+	}
+}
+
+// collectStream runs stream, sending its records on the first channel and
+// its end on the second. It stops when ctx is canceled even if nobody is
+// receiving, so that a stream does not keep its connection out of the pool
+// past a failed test.
+func collectStream(ctx context.Context, stream iter.Seq2[store.StreamRecord, error]) (<-chan store.StreamRecord, <-chan error) {
 	records := make(chan store.StreamRecord)
 	done := make(chan error, 1)
 	go func() {
@@ -618,7 +651,12 @@ func collectStream(stream iter.Seq2[store.StreamRecord, error]) (<-chan store.St
 				done <- err
 				return
 			}
-			records <- record
+			select {
+			case records <- record:
+			case <-ctx.Done():
+				done <- ctx.Err()
+				return
+			}
 		}
 		done <- nil
 	}()

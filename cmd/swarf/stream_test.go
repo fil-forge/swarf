@@ -14,7 +14,7 @@ import (
 
 func TestStreamCommand(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		require.Equal(t, "/revocations/0", request.URL.Path)
+		require.Equal(t, "/revocations/after/0", request.URL.Path)
 		require.Equal(t, "text/event-stream", request.Header.Get("Accept"))
 		_, _ = fmt.Fprint(writer, "event: ignored\ndata: ignored\n\nevent: revocation\ndata: {\"revoke\":\"one\"}\n\nevent: revocation\ndata: {\"revoke\":\"two\"}\n\n")
 	}))
@@ -23,7 +23,7 @@ func TestStreamCommand(t *testing.T) {
 	command := newStreamCommand()
 	output := bytes.NewBuffer(nil)
 	command.SetOut(output)
-	command.SetArgs([]string{"--service-url", server.URL, "--from", "0"})
+	command.SetArgs([]string{"--service-url", server.URL, "--after", "0"})
 	require.NoError(t, command.Execute())
 	require.Equal(t, "{\"revoke\":\"one\"}\n{\"revoke\":\"two\"}\n", output.String())
 }
@@ -41,7 +41,7 @@ func TestStreamCommandReportsAnErrorEvent(t *testing.T) {
 	output := bytes.NewBuffer(nil)
 	command.SetOut(output)
 	command.SetErr(bytes.NewBuffer(nil))
-	command.SetArgs([]string{"--service-url", server.URL, "--from", "0"})
+	command.SetArgs([]string{"--service-url", server.URL, "--after", "0"})
 
 	err := command.Execute()
 	require.ErrorContains(t, err, "getting revocation: boom")
@@ -51,10 +51,46 @@ func TestStreamCommandReportsAnErrorEvent(t *testing.T) {
 		"records read before the error should still reach the output")
 }
 
-func TestStreamCommandRejectsInvalidFrom(t *testing.T) {
+func TestStreamCommandRejectsInvalidAfter(t *testing.T) {
+	for _, after := range []string{"", "later", "-1", "7-bafy", "2026-07-17T09:00:00Z", "18446744073709551616"} {
+		requested := false
+		server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+			requested = true
+		}))
+		command := newStreamCommand()
+		command.SetOut(bytes.NewBuffer(nil))
+		command.SetErr(bytes.NewBuffer(nil))
+		command.SetArgs([]string{"--service-url", server.URL, "--after", after})
+		require.ErrorContains(t, command.Execute(), "invalid --after", after)
+		server.Close()
+		require.False(t, requested, "an invalid --after %q reached the service", after)
+	}
+}
+
+func TestStreamCommandAfterCursor(t *testing.T) {
+	requestURL := make(chan string, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		requestURL <- request.URL.Path
+	}))
+	defer server.Close()
+
 	command := newStreamCommand()
-	command.SetArgs([]string{"--from", "not-a-timestamp"})
-	require.Error(t, command.Execute())
+	command.SetArgs([]string{"--service-url", server.URL, "--after", "1734"})
+	require.NoError(t, command.Execute())
+	require.Equal(t, "/revocations/after/1734", requestURLValue(t, requestURL))
+}
+
+func TestStreamCommandReportsARefusedCursor(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		http.Error(writer, "cursor is ahead of the revocation stream", http.StatusConflict)
+	}))
+	defer server.Close()
+
+	command := newStreamCommand()
+	command.SetOut(bytes.NewBuffer(nil))
+	command.SetErr(bytes.NewBuffer(nil))
+	command.SetArgs([]string{"--service-url", server.URL, "--after", "1734"})
+	require.ErrorContains(t, command.Execute(), "409")
 }
 
 func TestStreamCommandCancellation(t *testing.T) {
@@ -66,7 +102,7 @@ func TestStreamCommandCancellation(t *testing.T) {
 	defer server.Close()
 
 	command := newStreamCommand()
-	command.SetArgs([]string{"--service-url", server.URL, "--from", "0"})
+	command.SetArgs([]string{"--service-url", server.URL, "--after", "0"})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)
@@ -82,7 +118,7 @@ func TestStreamCommandCancellation(t *testing.T) {
 	require.NoError(t, <-result)
 }
 
-func TestStreamCommandDefaultsFromToNow(t *testing.T) {
+func TestStreamCommandDefaultsToNow(t *testing.T) {
 	requestURL := make(chan string, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		requestURL <- request.URL.Path
@@ -92,11 +128,7 @@ func TestStreamCommandDefaultsFromToNow(t *testing.T) {
 	command := newStreamCommand()
 	command.SetArgs([]string{"--service-url", server.URL})
 	require.NoError(t, command.Execute())
-
-	from := requestURLValue(t, requestURL)
-	require.NotEqual(t, "/revocations/0", from)
-	_, err := time.Parse(time.RFC3339Nano, from[len("/revocations/"):])
-	require.NoError(t, err)
+	require.Equal(t, "/revocations/after/now", requestURLValue(t, requestURL))
 }
 
 func requestURLValue(t *testing.T, values <-chan string) string {

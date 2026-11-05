@@ -8,27 +8,31 @@ import (
 )
 
 func TestCursorRoundTrips(t *testing.T) {
-	for _, cursor := range []store.Cursor{
-		{},
-		{Seq: 7},
-		{Seq: 7, ID: "bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},
-		{Seq: 1<<64 - 1, ID: "with-hyphens"},
-	} {
+	for _, cursor := range []store.Cursor{{}, {Seq: 7}, {Seq: 1<<64 - 1}} {
 		parsed, err := store.ParseCursor(cursor.String())
 		require.NoError(t, err)
 		require.Equal(t, cursor, parsed)
 	}
 }
 
+func TestCursorString(t *testing.T) {
+	require.Equal(t, "0", store.Cursor{}.String())
+	require.Equal(t, "1734", store.Cursor{Seq: 1734}.String())
+}
+
 func TestParseCursorRejectsMalformedCursors(t *testing.T) {
-	for _, value := range []string{"", "now", "-7", "7-", "+7", "bafy", "18446744073709551616"} {
+	for _, value := range []string{
+		"", "now", "-7", "+7", " 7", "7 ", "0x7", "1_000", "7.0", "bafy", "18446744073709551616",
+		// The form a cursor took when it carried a record ID.
+		"7-bafy", "7-",
+	} {
 		_, err := store.ParseCursor(value)
 		require.Error(t, err, value)
 	}
 }
 
 func TestCursorOrder(t *testing.T) {
-	ordered := []store.Cursor{{}, {ID: "a"}, {Seq: 1}, {Seq: 1, ID: "a"}, {Seq: 1, ID: "b"}, {Seq: 2}}
+	ordered := []store.Cursor{{}, {Seq: 1}, {Seq: 2}, {Seq: 1<<64 - 1}}
 	for i := range ordered {
 		require.Zero(t, ordered[i].Compare(ordered[i]))
 		for j := i + 1; j < len(ordered); j++ {
