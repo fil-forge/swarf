@@ -78,14 +78,6 @@ func TestAHandlerPanicBecomesAServerError(t *testing.T) {
 	require.Equal(t, http.StatusInternalServerError, response.Code)
 }
 
-func TestParseFrom(t *testing.T) {
-	from, err := parseFrom("0")
-	require.NoError(t, err)
-	require.True(t, from.IsZero())
-	_, err = parseFrom("not-a-timestamp")
-	require.Error(t, err)
-}
-
 func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	id, err := identity.New("", "")
 	require.NoError(t, err)
@@ -98,17 +90,20 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	recordedAt := time.Now().UTC().Round(0)
 	source := &firehoseTestStore{
 		record: store.RevocationRecord{Revoke: witness.Link(), Cause: revocation, Path: []ucan.Delegation{witness}, RecordedAt: recordedAt},
+		cursor: store.Cursor{Seq: 42},
+		head:   store.Cursor{Seq: 42},
 	}
 	e := newEchoServer(id, server.NewHTTP(id), source)
-	request := httptest.NewRequest(http.MethodGet, "/revocations/"+recordedAt.Format(time.RFC3339Nano), nil)
+	request := httptest.NewRequest(http.MethodGet, "/revocations/after/0", nil)
 	response := httptest.NewRecorder()
 	e.ServeHTTP(response, request)
 
 	require.Equal(t, http.StatusOK, response.Code)
 	require.Equal(t, "text/event-stream", response.Header().Get(echo.HeaderContentType))
 	require.Contains(t, response.Body.String(), "event: revocation")
-	require.Equal(t, recordedAt, source.from)
-	data := strings.TrimSuffix(strings.TrimPrefix(response.Body.String(), "id: "+revocation.Link().String()+"\nevent: revocation\ndata: "), "\n\n")
+	require.Equal(t, store.Cursor{}, source.after)
+	// The event's id is the record's cursor, not its cause.
+	data := strings.TrimSuffix(strings.TrimPrefix(response.Body.String(), "id: 42\nevent: revocation\ndata: "), "\n\n")
 	var event api.FirehoseRevocation
 	require.NoError(t, event.UnmarshalDagJSON(strings.NewReader(data)))
 	require.Equal(t, witness.Link(), event.Revoke)
@@ -116,6 +111,154 @@ func TestFirehoseRouteStreamsRecords(t *testing.T) {
 	require.Equal(t, revocation.Link(), event.Cause)
 	require.True(t, event.RecordedAt.Time().Equal(recordedAt))
 	require.NotContains(t, response.Body.String(), `"revocation"`)
+}
+
+func TestFirehoseHeadRoute(t *testing.T) {
+	id, err := identity.New("", "")
+	require.NoError(t, err)
+
+	t.Run("responds with the store's head", func(t *testing.T) {
+		revocations := memory.New()
+		e := newEchoServer(id, server.NewHTTP(id), revocations)
+		head := func() string {
+			t.Helper()
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/head", nil))
+			require.Equal(t, http.StatusOK, response.Code)
+			require.True(t, strings.HasPrefix(response.Header().Get(echo.HeaderContentType), "text/plain"))
+			require.Equal(t, "no-store", response.Header().Get(echo.HeaderCacheControl))
+			return response.Body.String()
+		}
+
+		require.Equal(t, "0", head(), "an empty store's head is the zero cursor")
+		batch := make([]store.Revocation, 3)
+		for i := range batch {
+			revocation, path := firehoseRevocation(t)
+			batch[i] = store.Revocation{Cause: revocation, Path: path}
+		}
+		require.NoError(t, revocations.AddBatch(t.Context(), batch))
+		want, err := revocations.Head(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, store.Cursor{Seq: 3}, want)
+		require.Equal(t, want.String(), head())
+	})
+
+	t.Run("reports a store failure", func(t *testing.T) {
+		source := &firehoseTestStore{headErr: errors.New("connection refused")}
+		e := newEchoServer(id, server.NewHTTP(id), source)
+		response := httptest.NewRecorder()
+		e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/head", nil))
+		require.Equal(t, http.StatusInternalServerError, response.Code)
+	})
+}
+
+// Resuming from a time is how revocations get missed, so there is no route
+// that streams from one.
+func TestFirehoseHasNoTimeQuery(t *testing.T) {
+	id, err := identity.New("", "")
+	require.NoError(t, err)
+	e := newEchoServer(id, server.NewHTTP(id), &firehoseTestStore{})
+	for _, path := range []string{"/revocations/0", "/revocations/2026-07-17T09:00:00Z"} {
+		response := httptest.NewRecorder()
+		e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, path, nil))
+		require.Equal(t, http.StatusNotFound, response.Code, path)
+	}
+}
+
+func TestFirehoseAfterRoute(t *testing.T) {
+	id, err := identity.New("", "")
+	require.NoError(t, err)
+
+	t.Run("resumes after the cursor", func(t *testing.T) {
+		source := &firehoseTestStore{err: context.Canceled, head: store.Cursor{Seq: 9}}
+		e := newEchoServer(id, server.NewHTTP(id), source)
+		response := httptest.NewRecorder()
+		e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/after/7", nil))
+
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Equal(t, "text/event-stream", response.Header().Get(echo.HeaderContentType))
+		require.Equal(t, store.Cursor{Seq: 7}, source.after)
+		require.Empty(t, response.Body.String())
+	})
+
+	t.Run("starts now at the store's head and sends it first", func(t *testing.T) {
+		source := &firehoseTestStore{err: context.Canceled, head: store.Cursor{Seq: 9}}
+		e := newEchoServer(id, server.NewHTTP(id), source)
+		response := httptest.NewRecorder()
+		e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/after/now", nil))
+
+		require.Equal(t, http.StatusOK, response.Code)
+		require.Equal(t, store.Cursor{Seq: 9}, source.after)
+		// An event with only an id, so a client reconnecting before the first
+		// record resumes from this head.
+		require.Equal(t, "id: 9\n\n", response.Body.String())
+	})
+
+	t.Run("a reconnect resumes after its last event", func(t *testing.T) {
+		for _, path := range []string{"/revocations/after/7", "/revocations/after/now"} {
+			source := &firehoseTestStore{err: context.Canceled, head: store.Cursor{Seq: 9}}
+			e := newEchoServer(id, server.NewHTTP(id), source)
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.Header.Set("Last-Event-ID", "8")
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, request)
+
+			require.Equal(t, http.StatusOK, response.Code, path)
+			require.Equal(t, store.Cursor{Seq: 8}, source.after, path)
+			require.Empty(t, response.Body.String(), path)
+		}
+	})
+
+	t.Run("ignores a Last-Event-ID that is not a cursor", func(t *testing.T) {
+		for _, lastEventID := range []string{"bafy", "8-bafz"} {
+			source := &firehoseTestStore{err: context.Canceled, head: store.Cursor{Seq: 9}}
+			e := newEchoServer(id, server.NewHTTP(id), source)
+			request := httptest.NewRequest(http.MethodGet, "/revocations/after/7", nil)
+			request.Header.Set("Last-Event-ID", lastEventID)
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, request)
+
+			require.Equal(t, http.StatusOK, response.Code, lastEventID)
+			require.Equal(t, store.Cursor{Seq: 7}, source.after, lastEventID)
+		}
+	})
+
+	// The store changed since the stream began, so neither the head nor
+	// :cursor, from the same stream, is a safe place to start.
+	t.Run("refuses a Last-Event-ID ahead of the head", func(t *testing.T) {
+		for _, path := range []string{"/revocations/after/7", "/revocations/after/now"} {
+			source := &firehoseTestStore{head: store.Cursor{Seq: 9}}
+			e := newEchoServer(id, server.NewHTTP(id), source)
+			request := httptest.NewRequest(http.MethodGet, path, nil)
+			request.Header.Set("Last-Event-ID", "10")
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, request)
+
+			require.Equal(t, http.StatusConflict, response.Code, path)
+		}
+	})
+
+	// Streaming after a cursor ahead of the head would skip every record up
+	// to it.
+	t.Run("refuses a cursor ahead of the head", func(t *testing.T) {
+		for _, cursor := range []string{"10", "18446744073709551615"} {
+			source := &firehoseTestStore{head: store.Cursor{Seq: 9}}
+			e := newEchoServer(id, server.NewHTTP(id), source)
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/after/"+cursor, nil))
+			require.Equal(t, http.StatusConflict, response.Code, cursor)
+		}
+	})
+
+	t.Run("rejects a malformed cursor", func(t *testing.T) {
+		for _, cursor := range []string{"bafy", "7-bafy", "7-", "-7", "+7", "later", "18446744073709551616"} {
+			source := &firehoseTestStore{}
+			e := newEchoServer(id, server.NewHTTP(id), source)
+			response := httptest.NewRecorder()
+			e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/after/"+cursor, nil))
+			require.Equal(t, http.StatusBadRequest, response.Code, cursor)
+		}
+	})
 }
 
 // A store failure mid-stream has to reach whatever reports errors. The
@@ -131,7 +274,7 @@ func TestFirehoseRouteReportsAStoreFailure(t *testing.T) {
 	logged := observeRequests(e)
 
 	response := httptest.NewRecorder()
-	e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/0", nil))
+	e.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/revocations/after/0", nil))
 
 	require.ErrorContains(t, logged().Error, "getting revocations: connection refused",
 		"a store failure was invisible to the request logger")
@@ -150,7 +293,7 @@ func TestFirehoseRouteDoesNotReportACanceledRequest(t *testing.T) {
 	e := newEchoServer(id, server.NewHTTP(id), source)
 	logged := observeRequests(e)
 
-	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/revocations/0", nil))
+	e.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/revocations/after/0", nil))
 
 	require.NoError(t, logged().Error)
 }
@@ -512,12 +655,32 @@ func TestValidateRevocationPath(t *testing.T) {
 	require.Error(t, validateRevocationPath(t.Context(), []ucan.Delegation{expired}, resolver))
 }
 
+// firehoseRevocation returns a revocation of a delegation of its own, issued
+// by a fresh issuer.
+func firehoseRevocation(t *testing.T) (ucan.Invocation, []ucan.Delegation) {
+	t.Helper()
+	issuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	command, err := command.Parse("/test/revoke")
+	require.NoError(t, err)
+	revoked, err := delegation.Delegate(issuer, issuer.DID(), did.Undef, command)
+	require.NoError(t, err)
+	revocation, err := invocation.Invoke(issuer, did.Undef, command, nil)
+	require.NoError(t, err)
+	return revocation, []ucan.Delegation{revoked}
+}
+
 type firehoseTestStore struct {
 	record store.RevocationRecord
+	cursor store.Cursor
+	head   store.Cursor
+	// headErr, when set, is what Head returns.
+	headErr error
 	// err, when set, is yielded instead of record, as a store failing
 	// mid-stream does.
-	err  error
-	from time.Time
+	err error
+	// after is what the last Stream call asked for.
+	after store.Cursor
 }
 
 func (s *firehoseTestStore) Add(context.Context, ucan.Invocation, []ucan.Delegation) error {
@@ -532,13 +695,17 @@ func (s *firehoseTestStore) Get(context.Context, cid.Cid) (store.RevocationRecor
 	return s.record, nil
 }
 
-func (s *firehoseTestStore) Stream(_ context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
-	s.from = from
-	return func(yield func(store.RevocationRecord, error) bool) {
+func (s *firehoseTestStore) Head(context.Context) (store.Cursor, error) {
+	return s.head, s.headErr
+}
+
+func (s *firehoseTestStore) Stream(_ context.Context, after store.Cursor) iter.Seq2[store.StreamRecord, error] {
+	s.after = after
+	return func(yield func(store.StreamRecord, error) bool) {
 		if s.err != nil {
-			yield(store.RevocationRecord{}, s.err)
+			yield(store.StreamRecord{}, s.err)
 			return
 		}
-		yield(s.record, nil)
+		yield(store.StreamRecord{RevocationRecord: s.record, Cursor: s.cursor}, nil)
 	}
 }

@@ -30,9 +30,8 @@ func TestScannerReadsEvents(t *testing.T) {
 			want:   []event{{name: "revocation", data: "one\ntwo"}},
 		},
 		{
-			// The service writes an id line before every revocation.
 			name:   "other fields and comments are ignored",
-			stream: ": keep-alive\nid: bafy\nretry: 1000\nevent: revocation\ndata: {}\n\n",
+			stream: ": keep-alive\nretry: 1000\nevent: revocation\ndata: {}\n\n",
 			want:   []event{{name: "revocation", data: "{}"}},
 		},
 		{
@@ -68,6 +67,71 @@ func TestScannerReadsEvents(t *testing.T) {
 			}
 			require.NoError(t, scanner.Err())
 			require.Equal(t, test.want, got)
+		})
+	}
+}
+
+// The last event ID follows the event stream format: an id field sets it when
+// its event is dispatched, it carries over events that name none, and an
+// event without data, which Scan does not report, still sets it.
+func TestScannerReportsTheLastEventID(t *testing.T) {
+	type idEvent struct {
+		id   string
+		data string
+	}
+	for _, test := range []struct {
+		name   string
+		stream string
+		want   []idEvent
+		// last is the last event ID once the stream ends.
+		last string
+	}{
+		{
+			name:   "an event's id",
+			stream: "id: 1-a\nevent: revocation\ndata: one\n\nid: 2-b\nevent: revocation\ndata: two\n\n",
+			want:   []idEvent{{id: "1-a", data: "one"}, {id: "2-b", data: "two"}},
+			last:   "2-b",
+		},
+		{
+			name:   "carried over an event that names none",
+			stream: "id: 1-a\ndata: one\n\ndata: two\n\n",
+			want:   []idEvent{{id: "1-a", data: "one"}, {id: "1-a", data: "two"}},
+			last:   "1-a",
+		},
+		{
+			name:   "set by an event without data",
+			stream: "id: 7\n\ndata: one\n\nid: 8\n\n",
+			want:   []idEvent{{id: "7", data: "one"}},
+			last:   "8",
+		},
+		{
+			name:   "not set by an unterminated event",
+			stream: "id: 1-a\ndata: one\n\nid: 2-b\ndata: two\n",
+			want:   []idEvent{{id: "1-a", data: "one"}},
+			last:   "1-a",
+		},
+		{
+			name:   "cleared by an empty id",
+			stream: "id: 1-a\ndata: one\n\nid:\ndata: two\n\n",
+			want:   []idEvent{{id: "1-a", data: "one"}, {id: "", data: "two"}},
+			last:   "",
+		},
+		{
+			name:   "an id holding NUL is ignored",
+			stream: "id: 1-a\ndata: one\n\nid: 2\x00b\ndata: two\n\n",
+			want:   []idEvent{{id: "1-a", data: "one"}, {id: "1-a", data: "two"}},
+			last:   "1-a",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			scanner := sse.NewScanner(strings.NewReader(test.stream))
+			var got []idEvent
+			for scanner.Scan() {
+				got = append(got, idEvent{id: scanner.ID(), data: scanner.Data()})
+			}
+			require.NoError(t, scanner.Err())
+			require.Equal(t, test.want, got)
+			require.Equal(t, test.last, scanner.ID())
 		})
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"math"
 	"time"
 
 	"github.com/fil-forge/swarf/pkg/store"
@@ -19,10 +20,23 @@ import (
 
 const streamPollInterval = time.Second
 
-// streamSettleWindow bounds how long an insert may take between its
-// recorded_at (NOW() at transaction start) and its row becoming visible.
-// History older than this window is settled: no new rows can appear there.
-const streamSettleWindow = 10 * time.Second
+// writeLockKey is the key of the transaction-scoped advisory lock that
+// serializes revocation writes. seq comes from an identity column, which hands
+// out numbers when a row is inserted, not when it commits, so two writers
+// running at once could commit in the opposite order to their numbers, and a
+// stream that had already passed the later number would never yield the
+// earlier one. A writer that takes this lock before inserting gets its numbers
+// only after the previous writer has committed or rolled back, so seq order is
+// commit order. Every writer must take it; AddBatch is the only one.
+const writeLockKey int64 = 0x7377617266726576 // "swarfrev" in ASCII
+
+// writeIdleTimeout ends a write's database session if the write goes idle
+// inside its transaction for this long. A write holds the write lock across
+// round trips to Swarf, so a Swarf host that dies or loses its network
+// mid-write would otherwise keep the lock, and block every other write, until
+// Postgres noticed the dead connection, which can take hours. A write is idle
+// only between its statements, for a round trip.
+const writeIdleTimeout = "30s"
 
 // Store persists revocation records in PostgreSQL.
 type Store struct {
@@ -42,7 +56,8 @@ func (s *Store) Add(ctx context.Context, revocation ucan.Invocation, path []ucan
 }
 
 // AddBatch stores revocations and their witness paths with one INSERT
-// statement. A revocation repeated in the batch is stored once.
+// statement, in a transaction that holds the write lock (see writeLockKey). A
+// revocation repeated in the batch is stored once.
 func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -89,7 +104,18 @@ func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) er
 		pathEnds = append(pathEnds, int32(len(witnesses)))
 	}
 
-	_, err := s.pool.Exec(
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning revocation write: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := tx.Exec(ctx, `SET LOCAL idle_in_transaction_session_timeout = '`+writeIdleTimeout+`'`); err != nil {
+		return fmt.Errorf("bounding the revocation write's idle time: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, writeLockKey); err != nil {
+		return fmt.Errorf("taking the revocation write lock: %w", err)
+	}
+	_, err = tx.Exec(
 		ctx,
 		`INSERT INTO revocation (id, cause, revoked_delegation, path_witness)
 		 SELECT r.id, r.cause, r.revoked_delegation, ($4::bytea[])[r.path_start:r.path_end]
@@ -106,6 +132,11 @@ func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) er
 	if err != nil {
 		return fmt.Errorf("storing revocations: %w", err)
 	}
+	// Readers see the commit before the lock is released, so no row can
+	// appear behind one a stream has already yielded.
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing revocations: %w", err)
+	}
 	return nil
 }
 
@@ -116,7 +147,7 @@ func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecor
 		`SELECT cause, revoked_delegation, path_witness, recorded_at
 		 FROM revocation
 		 WHERE revoked_delegation = $1
-		 ORDER BY recorded_at DESC, id DESC
+		 ORDER BY seq DESC
 		 LIMIT 1`,
 		revoked.String(),
 	)
@@ -138,59 +169,51 @@ func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecor
 	return record, nil
 }
 
-// Stream returns matching revocation records and remains open until ctx is canceled.
-func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
+// Head returns the cursor of the highest seq stored, or the zero cursor when
+// the table is empty. A write in progress when Head is read holds the write
+// lock, so every number it takes is higher than any committed row's, and its
+// rows are after the head.
+func (s *Store) Head(ctx context.Context) (store.Cursor, error) {
+	var head int64
+	if err := s.pool.QueryRow(ctx, `SELECT coalesce(max(seq), 0) FROM revocation`).Scan(&head); err != nil {
+		return store.Cursor{}, fmt.Errorf("reading the revocation stream head: %w", err)
+	}
+	return store.Cursor{Seq: uint64(head)}, nil
+}
+
+// Stream yields the revocation records after the after cursor, in seq order,
+// and remains open until ctx is canceled, polling for new rows. A record's
+// cursor is its seq.
+//
+// seq order is commit order (see writeLockKey), so once a row is visible no
+// row with a lower seq can become visible later, and each poll resumes
+// strictly after the last row yielded. Numbers lost to a rolled-back or
+// conflicting insert leave gaps that are never filled.
+func (s *Store) Stream(ctx context.Context, after store.Cursor) iter.Seq2[store.StreamRecord, error] {
+	return func(yield func(store.StreamRecord, error) bool) {
 		ticker := time.NewTicker(streamPollInterval)
 		defer ticker.Stop()
 
-		// cursor is the low-water mark of each poll. It starts at from and
-		// only advances through settled history, because rows can become
-		// visible out of recorded_at order: ids are CIDs (not monotonic) and
-		// recorded_at is the insert transaction's start time, so a concurrent
-		// insert can commit a row at or before timestamps already streamed.
-		// Rows re-read from the unsettled window are deduped by seen, keyed
-		// by cause link with recorded_at kept for pruning.
-		cursor := from
-		seen := map[cid.Cid]time.Time{}
 		for {
 			if err := ctx.Err(); err != nil {
-				yield(store.RevocationRecord{}, err)
+				yield(store.StreamRecord{}, err)
 				return
 			}
 
-			// The horizon is read before the rows so it never overtakes them.
-			var dbNow time.Time
-			if err := s.pool.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("reading database clock: %w", err))
-				return
-			}
-			for rec, err := range s.recordsFrom(ctx, cursor) {
+			for rec, err := range s.recordsAfter(ctx, after) {
 				if err != nil {
-					yield(store.RevocationRecord{}, err)
+					yield(store.StreamRecord{}, err)
 					return
-				}
-				link := rec.Cause.Link()
-				if _, ok := seen[link]; ok {
-					continue
 				}
 				if !yield(rec, nil) {
 					return
 				}
-				seen[link] = rec.RecordedAt
-			}
-			if horizon := dbNow.Add(-streamSettleWindow); horizon.After(cursor) {
-				cursor = horizon
-				for link, recordedAt := range seen {
-					if recordedAt.Before(cursor) {
-						delete(seen, link)
-					}
-				}
+				after = rec.Cursor
 			}
 
 			select {
 			case <-ctx.Done():
-				yield(store.RevocationRecord{}, ctx.Err())
+				yield(store.StreamRecord{}, ctx.Err())
 				return
 			case <-ticker.C:
 			}
@@ -198,46 +221,47 @@ func (s *Store) Stream(ctx context.Context, from time.Time) iter.Seq2[store.Revo
 	}
 }
 
-func (s *Store) recordsFrom(ctx context.Context, cursor time.Time) iter.Seq2[store.RevocationRecord, error] {
-	return func(yield func(store.RevocationRecord, error) bool) {
-		// The query is inclusive at the cursor: each poll re-reads the
-		// unsettled window and Stream skips rows it already yielded. The
-		// zero cursor predates every record, so an unbounded stream matches
-		// everything.
+func (s *Store) recordsAfter(ctx context.Context, after store.Cursor) iter.Seq2[store.StreamRecord, error] {
+	return func(yield func(store.StreamRecord, error) bool) {
+		if after.Seq > math.MaxInt64 {
+			// seq is a BIGINT, so no row is after this cursor.
+			return
+		}
 		rows, err := s.pool.Query(
 			ctx,
-			`SELECT cause, revoked_delegation, path_witness, recorded_at
+			`SELECT seq, cause, revoked_delegation, path_witness, recorded_at
 			 FROM revocation
-			 WHERE recorded_at >= $1
-			 ORDER BY recorded_at, id`,
-			cursor,
+			 WHERE seq > $1
+			 ORDER BY seq`,
+			int64(after.Seq),
 		)
 		if err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("querying revocations: %w", err))
+			yield(store.StreamRecord{}, fmt.Errorf("querying revocations: %w", err))
 			return
 		}
 		defer rows.Close()
 
 		for rows.Next() {
+			var seq int64
 			var causeBytes []byte
 			var revoke string
 			var pathWitness [][]byte
 			var recordedAt time.Time
-			if err := rows.Scan(&causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("scanning revocation: %w", err))
+			if err := rows.Scan(&seq, &causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
+				yield(store.StreamRecord{}, fmt.Errorf("scanning revocation: %w", err))
 				return
 			}
 			record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
 			if err != nil {
-				yield(store.RevocationRecord{}, fmt.Errorf("decoding revocation: %w", err))
+				yield(store.StreamRecord{}, fmt.Errorf("decoding revocation: %w", err))
 				return
 			}
-			if !yield(record, nil) {
+			if !yield(store.StreamRecord{RevocationRecord: record, Cursor: store.Cursor{Seq: uint64(seq)}}, nil) {
 				return
 			}
 		}
 		if err := rows.Err(); err != nil {
-			yield(store.RevocationRecord{}, fmt.Errorf("iterating revocations: %w", err))
+			yield(store.StreamRecord{}, fmt.Errorf("iterating revocations: %w", err))
 		}
 	}
 }

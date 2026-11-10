@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -202,7 +203,7 @@ func TestGetAndStream(t *testing.T) {
 		case "/revocation/" + revocation.Link().String():
 			writer.Header().Set("Content-Type", "application/vnd.ipld.dag-json")
 			_, _ = writer.Write(lookupPayload.Bytes())
-		case "/revocations/0":
+		case "/revocations/after/0":
 			writer.Header().Set("Content-Type", "text/event-stream")
 			_, _ = fmt.Fprintf(writer, "event: revocation\ndata: %s\n\n", streamPayload.String())
 		default:
@@ -224,8 +225,9 @@ func TestGetAndStream(t *testing.T) {
 	// The stream reconnects when a connection ends, so stop after the
 	// expected record instead of draining the iterator.
 	var streamed int
-	for record, err := range client.Stream(context.Background(), time.Time{}) {
+	for event, err := range client.StreamAfter(context.Background(), "0") {
 		require.NoError(t, err)
+		record := event.Revocation
 		require.Equal(t, revocation.Link(), record.Revoke)
 		require.Equal(t, []cid.Cid{revocation.Link()}, record.Path)
 		require.Equal(t, revocation.Link(), record.Cause)
@@ -236,32 +238,75 @@ func TestGetAndStream(t *testing.T) {
 	require.Equal(t, 1, streamed)
 }
 
-func TestStreamReconnectDedupes(t *testing.T) {
-	first := time.Now().UTC().Truncate(time.Second)
-	boundary := first.Add(time.Second)
-	last := boundary.Add(time.Second)
-	recordA := firehoseRecord(t, first)
-	recordB := firehoseRecord(t, boundary)
-	recordC := firehoseRecord(t, boundary)
-	recordD := firehoseRecord(t, last)
+func TestHead(t *testing.T) {
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	newClient := func(t *testing.T, handler http.HandlerFunc) *Client {
+		t.Helper()
+		server := httptest.NewServer(handler)
+		t.Cleanup(server.Close)
+		serviceURL, err := url.Parse(server.URL)
+		require.NoError(t, err)
+		client, err := New(service.DID(), *serviceURL)
+		require.NoError(t, err)
+		return client
+	}
 
+	for _, body := range []string{"42", "42\n"} {
+		var path string
+		client := newClient(t, func(writer http.ResponseWriter, request *http.Request) {
+			path = request.URL.Path
+			writer.Header().Set("Content-Type", "text/plain")
+			_, _ = io.WriteString(writer, body)
+		})
+		head, err := client.Head(context.Background())
+		require.NoError(t, err, "%q", body)
+		require.Equal(t, Cursor("42"), head, "%q", body)
+		require.Equal(t, "/revocations/head", path)
+	}
+
+	t.Run("reports an unexpected status", func(t *testing.T) {
+		client := newClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+			http.Error(writer, "unavailable", http.StatusServiceUnavailable)
+		})
+		_, err := client.Head(context.Background())
+		require.ErrorContains(t, err, "503 Service Unavailable")
+	})
+
+	t.Run("rejects a body that is not a cursor", func(t *testing.T) {
+		for _, body := range []string{"", "now", "<html></html>", strings.Repeat("1", maxHeadBytes+1)} {
+			client := newClient(t, func(writer http.ResponseWriter, _ *http.Request) {
+				_, _ = io.WriteString(writer, body)
+			})
+			_, err := client.Head(context.Background())
+			require.Error(t, err, "%d bytes", len(body))
+		}
+	})
+}
+
+// A reconnect asks for the same URL, resuming after the last event the
+// service sent, not after the cursor the call started from.
+func TestStreamReconnectResumesAfterLastEvent(t *testing.T) {
+	recordA := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
+	recordB := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
+	recordC := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
+
+	type request struct{ path, lastEventID string }
 	var mu sync.Mutex
-	var requests []string
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+	var requests []request
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
 		mu.Lock()
-		requests = append(requests, request.URL.Path)
+		requests = append(requests, request{r.URL.Path, r.Header.Get("Last-Event-ID")})
 		connection := len(requests)
 		mu.Unlock()
 		writer.Header().Set("Content-Type", "text/event-stream")
 		switch connection {
 		case 1:
-			_, _ = io.WriteString(writer, sseEvent(t, recordA)+sseEvent(t, recordB))
+			_, _ = io.WriteString(writer, sseEventWithID(t, "6", recordA)+sseEventWithID(t, "7", recordB))
 		case 2:
-			// The from cursor is inclusive: the record recorded at exactly
-			// the resume timestamp is re-delivered alongside new ones.
-			_, _ = io.WriteString(writer, sseEvent(t, recordB)+sseEvent(t, recordC)+sseEvent(t, recordD))
+			_, _ = io.WriteString(writer, sseEventWithID(t, "8", recordC))
 		default:
-			<-request.Context().Done()
+			<-r.Context().Done()
 		}
 	}))
 	defer server.Close()
@@ -274,26 +319,167 @@ func TestStreamReconnectDedupes(t *testing.T) {
 	require.NoError(t, err)
 
 	var received []cid.Cid
-	for record, err := range client.Stream(context.Background(), time.Time{}) {
+	for event, err := range client.StreamAfter(context.Background(), "5") {
 		require.NoError(t, err)
-		received = append(received, record.Cause)
-		if len(received) == 4 {
+		received = append(received, event.Revocation.Cause)
+		if len(received) == 3 {
 			break
 		}
 	}
-	require.Equal(t, []cid.Cid{recordA.Cause, recordB.Cause, recordC.Cause, recordD.Cause}, received)
+	require.Equal(t, []cid.Cid{recordA.Cause, recordB.Cause, recordC.Cause}, received)
 
 	mu.Lock()
 	defer mu.Unlock()
 	require.GreaterOrEqual(t, len(requests), 2)
-	require.Equal(t, "/revocations/0", requests[0])
-	require.Equal(t, "/revocations/"+boundary.Format(time.RFC3339Nano), requests[1])
+	require.Equal(t, request{path: "/revocations/after/5"}, requests[0])
+	require.Equal(t, request{path: "/revocations/after/5", lastEventID: "7"}, requests[1])
 }
 
-func TestStreamReconnectMidBatchDedupes(t *testing.T) {
-	// Revocations stored by one batch write share recorded_at. The stream
-	// drops after delivering part of such a batch and resumes at its
-	// timestamp, where the server sends the whole batch again.
+func TestStreamAfter(t *testing.T) {
+	recordA := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
+	recordB := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
+
+	type request struct{ path, lastEventID string }
+	var mu sync.Mutex
+	var requests []request
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests = append(requests, request{r.URL.Path, r.Header.Get("Last-Event-ID")})
+		connection := len(requests)
+		mu.Unlock()
+		writer.Header().Set("Content-Type", "text/event-stream")
+		switch connection {
+		case 1:
+			// The service resolves Now and sends it as an event with only an
+			// id, then the connection drops before any record.
+			_, _ = io.WriteString(writer, "id: 9\n\n")
+		case 2:
+			_, _ = io.WriteString(writer, sseEventWithID(t, "10", recordA))
+		case 3:
+			_, _ = io.WriteString(writer, sseEventWithID(t, "11", recordB))
+		default:
+			<-r.Context().Done()
+		}
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	type delivered struct {
+		cause  cid.Cid
+		cursor Cursor
+	}
+	var received []delivered
+	for event, err := range client.StreamAfter(context.Background(), Now) {
+		require.NoError(t, err)
+		received = append(received, delivered{event.Revocation.Cause, event.Cursor})
+		if len(received) == 2 {
+			break
+		}
+	}
+	require.Equal(t, []delivered{{recordA.Cause, "10"}, {recordB.Cause, "11"}}, received)
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []request{
+		{path: "/revocations/after/now"},
+		// The reconnect resumes from the head the service sent, not a later
+		// one.
+		{path: "/revocations/after/now", lastEventID: "9"},
+		{path: "/revocations/after/now", lastEventID: "10"},
+	}, requests[:3])
+
+	t.Run("resumes after a stored cursor", func(t *testing.T) {
+		var path string
+		server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
+			path = r.URL.Path
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, sseEventWithID(t, "11", recordB))
+		}))
+		defer server.Close()
+		serviceURL, err := url.Parse(server.URL)
+		require.NoError(t, err)
+		client, err := New(service.DID(), *serviceURL)
+		require.NoError(t, err)
+
+		for event, err := range client.StreamAfter(context.Background(), "10") {
+			require.NoError(t, err)
+			require.Equal(t, recordB.Cause, event.Revocation.Cause)
+			require.Equal(t, Cursor("11"), event.Cursor)
+			break
+		}
+		require.Equal(t, "/revocations/after/10", path)
+	})
+
+	t.Run("requires a cursor", func(t *testing.T) {
+		for _, err := range client.StreamAfter(context.Background(), "") {
+			require.ErrorContains(t, err, "cursor is required")
+		}
+	})
+}
+
+// A reconnect whose cursor the service refuses ends the stream with an error
+// rather than retrying forever; a reconnect that fails any other way, a
+// client error from a proxy included, is retried.
+func TestStreamEndsWhenAReconnectIsRefused(t *testing.T) {
+	record := firehoseRecord(t, time.Now().UTC().Truncate(time.Second))
+	var mu sync.Mutex
+	var connections int
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		connections++
+		connection := connections
+		mu.Unlock()
+		switch connection {
+		case 1:
+			writer.Header().Set("Content-Type", "text/event-stream")
+			_, _ = io.WriteString(writer, sseEventWithID(t, "1", record))
+		case 2:
+			http.Error(writer, "unavailable", http.StatusServiceUnavailable)
+		case 3:
+			http.Error(writer, "no route", http.StatusNotFound)
+		default:
+			http.Error(writer, "cursor is ahead of the revocation stream", http.StatusConflict)
+		}
+	}))
+	defer server.Close()
+
+	service, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	serviceURL, err := url.Parse(server.URL)
+	require.NoError(t, err)
+	client, err := New(service.DID(), *serviceURL)
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	var delivered int
+	var errs []error
+	for _, err := range client.StreamAfter(ctx, "0") {
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		delivered++
+	}
+	require.Equal(t, 1, delivered)
+	require.Len(t, errs, 1)
+	require.ErrorIs(t, errs[0], ErrCursorRefused)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, 4, connections)
+}
+
+func TestStreamReconnectMidBatchResumesAfterLastEvent(t *testing.T) {
+	// Revocations stored by one batch write share recorded_at, but each has a
+	// cursor of its own. The stream drops after delivering part of such a
+	// batch, and the reconnect resumes after the last event's cursor, so each
+	// record arrives once.
 	recordedAt := time.Now().UTC().Truncate(time.Second)
 	batch := make([]api.FirehoseRevocation, 5)
 	for i := range batch {
@@ -301,21 +487,27 @@ func TestStreamReconnectMidBatchDedupes(t *testing.T) {
 	}
 
 	var mu sync.Mutex
-	connections := 0
+	var lastEventIDs []string
 	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
 		mu.Lock()
-		connections++
-		connection := connections
+		lastEventIDs = append(lastEventIDs, request.Header.Get("Last-Event-ID"))
+		connection := len(lastEventIDs)
 		mu.Unlock()
 		writer.Header().Set("Content-Type", "text/event-stream")
 		switch connection {
 		case 1:
-			for _, record := range batch[:3] {
-				_, _ = io.WriteString(writer, sseEvent(t, record))
+			for i, record := range batch[:3] {
+				_, _ = io.WriteString(writer, sseEventWithID(t, strconv.Itoa(i+1), record))
 			}
 		case 2:
-			for _, record := range batch {
-				_, _ = io.WriteString(writer, sseEvent(t, record))
+			// As Swarf does, send only the records after Last-Event-ID.
+			after, err := strconv.Atoi(request.Header.Get("Last-Event-ID"))
+			if err != nil {
+				http.Error(writer, err.Error(), http.StatusBadRequest)
+				return
+			}
+			for i, record := range batch[after:] {
+				_, _ = io.WriteString(writer, sseEventWithID(t, strconv.Itoa(after+i+1), record))
 			}
 		default:
 			<-request.Context().Done()
@@ -330,12 +522,10 @@ func TestStreamReconnectMidBatchDedupes(t *testing.T) {
 	client, err := New(service.DID(), *serviceURL)
 	require.NoError(t, err)
 
-	// A record re-delivered on reconnect would take one of the five places
-	// the remaining records of the batch need.
 	var received []cid.Cid
-	for record, err := range client.Stream(context.Background(), time.Time{}) {
+	for event, err := range client.StreamAfter(context.Background(), "0") {
 		require.NoError(t, err)
-		received = append(received, record.Cause)
+		received = append(received, event.Revocation.Cause)
 		if len(received) == len(batch) {
 			break
 		}
@@ -345,6 +535,9 @@ func TestStreamReconnectMidBatchDedupes(t *testing.T) {
 		expected[i] = record.Cause
 	}
 	require.Equal(t, expected, received)
+	mu.Lock()
+	defer mu.Unlock()
+	require.Equal(t, []string{"", "3"}, lastEventIDs[:2])
 }
 
 func TestStreamReconnectCanceled(t *testing.T) {
@@ -365,12 +558,12 @@ func TestStreamReconnectCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var errs []error
-	for streamed, err := range client.Stream(ctx, time.Time{}) {
+	for streamed, err := range client.StreamAfter(ctx, "0") {
 		if err != nil {
 			errs = append(errs, err)
 			continue
 		}
-		require.Equal(t, record.Cause, streamed.Cause)
+		require.Equal(t, record.Cause, streamed.Revocation.Cause)
 		// Cancel while the client waits to reconnect.
 		cancel()
 	}
@@ -401,12 +594,17 @@ func sseEvent(t *testing.T, record api.FirehoseRevocation) string {
 	return fmt.Sprintf("event: revocation\ndata: %s\n\n", payload.String())
 }
 
+func sseEventWithID(t *testing.T, id string, record api.FirehoseRevocation) string {
+	t.Helper()
+	return "id: " + id + "\n" + sseEvent(t, record)
+}
+
 // TestStreamLargeEvent covers the two halves of the 64 KiB scanner cap.
 //
 // A FirehoseRevocation carries a CID per delegation in the chain, so a long
 // path pushes one SSE event past the default bufio.Scanner token limit. Before
 // sse.Scanner raised the buffer, Scan stopped, ErrTooLong was discarded,
-// streamConn returned nil, and Stream reconnected at the same cursor --
+// streamConn returned nil, and the stream reconnected at the same cursor --
 // forever, never yielding and never erroring. A hang, not a failure.
 func TestStreamLargeEvent(t *testing.T) {
 	issuer, err := identity.New("", "")
@@ -447,9 +645,9 @@ func TestStreamLargeEvent(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		var streamed int
-		for record, err := range client.Stream(ctx, time.Time{}) {
+		for event, err := range client.StreamAfter(ctx, "0") {
 			require.NoError(t, err)
-			require.Len(t, record.Path, len(path))
+			require.Len(t, event.Revocation.Path, len(path))
 			streamed++
 			break
 		}
@@ -473,7 +671,7 @@ func TestStreamLargeEvent(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		var got error
-		for _, err := range client.Stream(ctx, time.Time{}) {
+		for _, err := range client.StreamAfter(ctx, "0") {
 			got = err
 			break
 		}
@@ -504,7 +702,7 @@ func TestStreamLargeEvent(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		var got error
-		for _, err := range client.Stream(ctx, time.Time{}) {
+		for _, err := range client.StreamAfter(ctx, "0") {
 			got = err
 			break
 		}

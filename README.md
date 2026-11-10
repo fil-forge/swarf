@@ -55,10 +55,10 @@ Stream revocation DAG-JSON records as they arrive with:
 swarf stream
 ```
 
-By default, it starts from the current time. Pass `--from 0` to stream all
-records or `--from <RFC3339 timestamp>` to stream records recorded on or after
-that time. Press Ctrl+C to stop streaming. Override the service endpoint with
-`--service-url`.
+By default, it starts at the head of the stream, so it prints only the records
+that arrive from then on. Pass `--after <cursor>` to start after a
+[cursor](#cursors), or `--after 0` to stream every record. Press Ctrl+C to
+stop streaming. Override the service endpoint with `--service-url`.
 
 ## API
 
@@ -105,22 +105,106 @@ when no revocation exists. For example:
 }
 ```
 
-### `GET /revocations/:from`
+### `GET /revocations/after/:cursor`
 
-A Server-Sent Events stream of compact DAG-JSON records. Each event has `revoke`
-(the revoked delegation CID), `path` (the witness delegation CIDs), `cause` (the
-revocation invocation CID), and `recorded_at` (the time the record was recorded). Use `0`
-to stream all stored records, or provide an RFC3339/RFC3339Nano timestamp cursor
-to stream records recorded on or after it. The cursor is inclusive so consumers
-resuming from the `recorded_at` of the last event they received do not miss
-records that share it; deduplicate by the event `id` (the `cause` CID). For
-example:
+A Server-Sent Events stream of compact DAG-JSON records, starting after a
+[cursor](#cursors). Each event has `revoke` (the revoked delegation CID),
+`path` (the witness delegation CIDs), `cause` (the revocation invocation CID),
+and `recorded_at` (the time the record was recorded), and its `id` is the
+record's cursor. Use `0` to stream every stored record. For example:
 
 ```js
-id: bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm
+id: 1734
 event: revocation
 data: {"revoke":{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"},"path":[{"/":"bafyreiehytyi4q3t2amvf2abdlt5xnnqtaqkknf6yxhre4klpjnejlnsc4"}],"cause":{"/":"bafyreif5fzax7oygfafacvxq2ndhtkshz2av5m42hqeixea7giirdxe5dm"},"recorded_at":"2026-07-17T09:00:00Z"}
 ```
+
+Records reach the stream in the order Swarf stored them, which is not always
+`recorded_at` order, so `recorded_at` is not a position in the stream.
+
+Pass `now` instead of a cursor to start at the head of the stream as Swarf's
+database sees it when the request arrives, rather than at a time on the
+client's clock. A stream started at `now` first sends an event with only an
+`id`, the cursor `now` stands for. It carries no data, so it dispatches
+nothing, but it sets an SSE client's last event ID, so a client that
+reconnects before the first record resumes from there.
+
+Swarf answers `409` for a cursor ahead of the stream's head, which it cannot
+have issued: one from another database, such as one restored from an older
+backup, or from before an in-memory store restarted. Streaming after it would
+skip every record up to it. A consumer that gets one has to start over: after
+`now`, which skips every record since the last one it applied, or after a
+cursor it stored from [`/revocations/head`](#get-revocationshead) earlier, or
+after `0`, deduplicating by `cause` the records it receives again.
+
+### `GET /revocations/head`
+
+Responds with the cursor at the head of the stream as plain text: the cursor
+of the last record stored, or `0` when there is none. A stream after it yields
+every record stored from then on. The response is never cached.
+
+A consumer that starts after `now` has no cursor of its own to store until its
+first record arrives, and revocations are rare. If it restarts before then, it
+starts after `now` again and misses every record that arrived while it was
+down. A new consumer avoids that by fetching the head, storing it, and
+streaming after it.
+
+### Cursors
+
+A cursor is a decimal number, sent as each event's `id`. Swarf numbers each
+record as it stores it, and records reach the stream in that order. Swarf
+stores one write at a time, so a write takes its numbers only after the one
+before it has finished, and no record can appear behind one already streamed.
+A consumer that stores the cursor of the last record it applied, and resumes
+after it, misses nothing. The numbers can have gaps, so treat a cursor as a
+position to pass back, not a count.
+
+`/revocations/after/` honors the standard
+[`Last-Event-ID`](https://html.spec.whatwg.org/multipage/server-sent-events.html#the-last-event-id-header)
+request header, which an SSE client such as `EventSource` sends when it
+reconnects. The stream resumes after that event, in place of the cursor or
+`now` in the URL. A `Last-Event-ID` that is not a cursor is ignored, and the
+stream starts where the URL says. One ahead of the head shows that the
+stream's database changed since the stream began, and Swarf answers `409`,
+since neither the URL's position nor the head is a safe place to start.
+
+Delivery is at least once: a consumer that stores its cursor less often than
+it applies records, or resumes from an older one, receives some records again.
+Deduplicate by `cause`, the CID of the revocation invocation, which is unique
+to a record. Records repeat when a consumer restarts, so what it deduplicates
+against has to survive its restarts too.
+
+### Moving the database
+
+A cursor is the `seq` column of the `revocation` table, so cursors move with
+the data. A `pg_dump`, taken once the old server has stopped taking writes, and
+restored keeps every row's `seq` and the position of the identity sequence that
+numbers new rows, so stored cursors keep working, and so does a stream left
+open across the move. Upgrading in place with `pg_upgrade`, or failing over to
+a physical replica that is caught up, keeps them too.
+
+Logical replication copies every row's `seq`, but not the sequence's position.
+Once the old server takes no more writes and replication has caught up, and
+before the new server takes writes, set the sequence past the highest `seq`:
+
+```sql
+SELECT setval(pg_get_serial_sequence('revocation', 'seq'), coalesce(max(seq), 0) + 1, false)
+FROM revocation;
+```
+
+Otherwise the new server hands out numbers from the start again. A write that
+draws a number a copied record holds fails, and one that draws a free number
+lands behind records consumers have already streamed, so they never receive
+it.
+
+Restoring a backup older than the last write loses the records written after
+it, and consumers can hold cursors past the restored head. Swarf refuses those
+with `409` until new records pass them, then accepts them and skips the
+records in between. After such a restore, have every consumer start over as
+after a `409`.
+
+Restarting Swarf with in-memory storage voids every position in the same way,
+besides losing every record.
 
 ## Client library
 
@@ -140,16 +224,26 @@ err = client.Publish(ctx, revoker, revoked, swarfclient.WithWitnessPath(path...)
 
 record, err := client.Get(ctx, delegationCID)
 
-for event, err := range client.Stream(ctx, time.Time{}) {
-    // event.Revoke, event.Path, and event.Cause are CIDs; event.RecordedAt is a time.
+// Before following the stream for the first time, store its head.
+head, err := client.Head(ctx)
+
+// Resume after a stored cursor, or start at the head of the stream with
+// swarfclient.Now.
+for event, err := range client.StreamAfter(ctx, head) {
+    // event.Revocation.Revoke, .Path, and .Cause are CIDs, and .RecordedAt
+    // is a time. Store event.Cursor once the revocation is applied, and pass
+    // it to StreamAfter to resume.
 }
 ```
 
 `Publish` self-signs the revocation invocation with the passed revoker, which
 must be the issuer of the revoked delegation or appear as an issuer in the
 witness path provided with `WithWitnessPath`. `Get` returns a full
-`store.RevocationRecord`; `Stream` returns compact `api.FirehoseRevocation`
-values.
+`store.RevocationRecord`. `StreamAfter` returns compact
+`api.FirehoseRevocation` values as `Event`s with their cursors, and reconnects
+when the stream is interrupted, resuming after the last event received. A
+`409` ends the stream with an error wrapping `ErrCursorRefused`. `Head`
+returns the head of the stream, a cursor to pass to `StreamAfter`.
 
 ## Container images
 
