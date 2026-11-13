@@ -20,6 +20,13 @@ import (
 
 const streamPollInterval = time.Second
 
+// streamPageSize is how many rows a stream reads with one query. A stream
+// yields records only after the query that read them has finished, so a
+// consumer that reads slowly, or replays the whole table, never keeps a
+// statement open on revocation. An open statement holds a lock that stops a
+// migration from altering the table.
+const streamPageSize = 1000
+
 // writeLockKey is the key of the transaction-scoped advisory lock that
 // serializes revocation writes. seq comes from an identity column, which hands
 // out numbers when a row is inserted, not when it commits, so two writers
@@ -187,8 +194,9 @@ func (s *Store) Head(ctx context.Context) (store.Cursor, error) {
 //
 // seq order is commit order (see writeLockKey), so once a row is visible no
 // row with a lower seq can become visible later, and each poll resumes
-// strictly after the last row yielded. Numbers lost to a rolled-back or
-// conflicting insert leave gaps that are never filled.
+// strictly after the last row yielded. The same holds between the pages a
+// stream reads one query at a time (see streamPageSize). Numbers lost to a
+// rolled-back or conflicting insert leave gaps that are never filled.
 func (s *Store) Stream(ctx context.Context, after store.Cursor) iter.Seq2[store.StreamRecord, error] {
 	return func(yield func(store.StreamRecord, error) bool) {
 		ticker := time.NewTicker(streamPollInterval)
@@ -200,15 +208,20 @@ func (s *Store) Stream(ctx context.Context, after store.Cursor) iter.Seq2[store.
 				return
 			}
 
-			for rec, err := range s.recordsAfter(ctx, after) {
-				if err != nil {
-					yield(store.StreamRecord{}, err)
-					return
-				}
+			page, err := s.recordsAfter(ctx, after)
+			if err != nil {
+				yield(store.StreamRecord{}, err)
+				return
+			}
+			for _, rec := range page {
 				if !yield(rec, nil) {
 					return
 				}
 				after = rec.Cursor
+			}
+			if len(page) == streamPageSize {
+				// More rows may follow at once; read them before waiting.
+				continue
 			}
 
 			select {
@@ -221,49 +234,50 @@ func (s *Store) Stream(ctx context.Context, after store.Cursor) iter.Seq2[store.
 	}
 }
 
-func (s *Store) recordsAfter(ctx context.Context, after store.Cursor) iter.Seq2[store.StreamRecord, error] {
-	return func(yield func(store.StreamRecord, error) bool) {
-		if after.Seq > math.MaxInt64 {
-			// seq is a BIGINT, so no row is after this cursor.
-			return
-		}
-		rows, err := s.pool.Query(
-			ctx,
-			`SELECT seq, cause, revoked_delegation, path_witness, recorded_at
-			 FROM revocation
-			 WHERE seq > $1
-			 ORDER BY seq`,
-			int64(after.Seq),
-		)
-		if err != nil {
-			yield(store.StreamRecord{}, fmt.Errorf("querying revocations: %w", err))
-			return
-		}
-		defer rows.Close()
-
-		for rows.Next() {
-			var seq int64
-			var causeBytes []byte
-			var revoke string
-			var pathWitness [][]byte
-			var recordedAt time.Time
-			if err := rows.Scan(&seq, &causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
-				yield(store.StreamRecord{}, fmt.Errorf("scanning revocation: %w", err))
-				return
-			}
-			record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
-			if err != nil {
-				yield(store.StreamRecord{}, fmt.Errorf("decoding revocation: %w", err))
-				return
-			}
-			if !yield(store.StreamRecord{RevocationRecord: record, Cursor: store.Cursor{Seq: uint64(seq)}}, nil) {
-				return
-			}
-		}
-		if err := rows.Err(); err != nil {
-			yield(store.StreamRecord{}, fmt.Errorf("iterating revocations: %w", err))
-		}
+// recordsAfter returns up to streamPageSize records after the after cursor,
+// in seq order. It reads the whole page and closes its query before
+// returning, so the caller can take as long as it likes over each record
+// without holding a statement, and its lock on revocation, open.
+func (s *Store) recordsAfter(ctx context.Context, after store.Cursor) ([]store.StreamRecord, error) {
+	if after.Seq > math.MaxInt64 {
+		// seq is a BIGINT, so no row is after this cursor.
+		return nil, nil
 	}
+	rows, err := s.pool.Query(
+		ctx,
+		`SELECT seq, cause, revoked_delegation, path_witness, recorded_at
+		 FROM revocation
+		 WHERE seq > $1
+		 ORDER BY seq
+		 LIMIT $2`,
+		int64(after.Seq),
+		streamPageSize,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("querying revocations: %w", err)
+	}
+	defer rows.Close()
+
+	var page []store.StreamRecord
+	for rows.Next() {
+		var seq int64
+		var causeBytes []byte
+		var revoke string
+		var pathWitness [][]byte
+		var recordedAt time.Time
+		if err := rows.Scan(&seq, &causeBytes, &revoke, &pathWitness, &recordedAt); err != nil {
+			return nil, fmt.Errorf("scanning revocation: %w", err)
+		}
+		record, err := decodeRecord(causeBytes, revoke, pathWitness, recordedAt)
+		if err != nil {
+			return nil, fmt.Errorf("decoding revocation: %w", err)
+		}
+		page = append(page, store.StreamRecord{RevocationRecord: record, Cursor: store.Cursor{Seq: uint64(seq)}})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterating revocations: %w", err)
+	}
+	return page, nil
 }
 
 func decodeRecord(causeBytes []byte, revoke string, pathWitness [][]byte, recordedAt time.Time) (store.RevocationRecord, error) {
