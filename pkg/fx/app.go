@@ -74,12 +74,12 @@ func AppModule(cfg *config.Config) fx.Option {
 // rewrites a large table outlasts fx's default of 15 seconds.
 //
 // Until the hooks finish, /health does not answer. fil-forge/infra-central
-// gives swarf a 10-minute start window: the ALB health check ignores the
-// first 600 seconds, and the container health check fails the task after a
-// 300-second start period plus ten checks 30 seconds apart. Eight minutes is
+// gives swarf a 12.5-minute start window: the ALB health check ignores the
+// first 750 seconds, and the container health check fails the task after a
+// 300-second start period plus ten checks 45 seconds apart. Ten minutes is
 // 80% of that, so a start that cannot finish fails with its own error,
 // logged, before ECS kills the process.
-const startTimeout = 8 * time.Minute
+const startTimeout = 10 * time.Minute
 
 func newLogger(cfg *config.Config) (*zap.Logger, error) {
 	zcfg := zap.NewProductionConfig()
