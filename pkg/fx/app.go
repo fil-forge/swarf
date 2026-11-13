@@ -71,9 +71,15 @@ func AppModule(cfg *config.Config) fx.Option {
 
 // startTimeout is how long the OnStart hooks have, together, to finish. The
 // Postgres store's hook runs the schema migrations, and a migration that
-// rewrites a large table takes minutes; fx's default of 15 seconds cancels
-// it, and the start fails every time.
-const startTimeout = 10 * time.Minute
+// rewrites a large table outlasts fx's default of 15 seconds.
+//
+// Until the hooks finish, /health does not answer. ECS replaces the task
+// about 150 seconds after it starts: both the ALB and the container health
+// checks ignore the first 90 seconds (health_check_start_period in
+// fil-forge/infra-central) and then fail the task after three checks 30
+// seconds apart. Two minutes is 80% of that, so a start that cannot finish
+// fails with its own error, logged, before ECS kills the process.
+const startTimeout = 2 * time.Minute
 
 func newLogger(cfg *config.Config) (*zap.Logger, error) {
 	zcfg := zap.NewProductionConfig()

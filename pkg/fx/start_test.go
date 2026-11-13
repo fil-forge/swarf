@@ -8,7 +8,7 @@ import (
 	"go.uber.org/fx"
 )
 
-// The app gives its OnStart hooks minutes, not fx's default 15 seconds, so a
+// The app gives its OnStart hooks longer than fx's default 15 seconds, so a
 // slow schema migration finishes instead of being canceled.
 func TestAppStartTimeoutLeavesTimeForMigrations(t *testing.T) {
 	cfg := &config.Config{}
