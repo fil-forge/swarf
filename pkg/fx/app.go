@@ -53,6 +53,7 @@ import (
 
 func AppModule(cfg *config.Config) fx.Option {
 	opts := []fx.Option{
+		fx.StartTimeout(startTimeout),
 		fx.Supply(cfg),
 		fx.Provide(newLogger, newIdentity, newUCANServer, newEchoServer),
 		fx.Invoke(registerServerLifecycle),
@@ -67,6 +68,12 @@ func AppModule(cfg *config.Config) fx.Option {
 	}
 	return fx.Options(opts...)
 }
+
+// startTimeout is how long the OnStart hooks have, together, to finish. The
+// Postgres store's hook runs the schema migrations, and a migration that
+// rewrites a large table takes minutes; fx's default of 15 seconds cancels
+// it, and the start fails every time.
+const startTimeout = 10 * time.Minute
 
 func newLogger(cfg *config.Config) (*zap.Logger, error) {
 	zcfg := zap.NewProductionConfig()
@@ -83,7 +90,7 @@ func newIdentity(cfg *config.Config) (identity.Identity, error) {
 	return identity.NewFromPEMFileWithDID(cfg.Identity.KeyFile, cfg.Identity.ServiceID)
 }
 
-func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStore, error) {
+func newPostgresStore(cfg *config.Config, lc fx.Lifecycle, logger *zap.Logger) (store.RevocationStore, error) {
 	if cfg.Storage.Postgres.DSN == "" {
 		return nil, errors.New("storage.postgres.dsn is required when storage.type is postgres")
 	}
@@ -107,7 +114,7 @@ func newPostgresStore(cfg *config.Config, lc fx.Lifecycle) (store.RevocationStor
 				return fmt.Errorf("pinging postgres: %w", err)
 			}
 			if !cfg.Storage.Postgres.SkipMigrations {
-				if err := migrations.Up(ctx, pool, zap.NewNop()); err != nil {
+				if err := migrations.Up(ctx, pool, logger); err != nil {
 					return fmt.Errorf("running postgres migrations: %w", err)
 				}
 			}
