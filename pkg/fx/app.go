@@ -73,13 +73,13 @@ func AppModule(cfg *config.Config) fx.Option {
 // Postgres store's hook runs the schema migrations, and a migration that
 // rewrites a large table outlasts fx's default of 15 seconds.
 //
-// Until the hooks finish, /health does not answer. ECS replaces the task
-// about 150 seconds after it starts: both the ALB and the container health
-// checks ignore the first 90 seconds (health_check_start_period in
-// fil-forge/infra-central) and then fail the task after three checks 30
-// seconds apart. Two minutes is 80% of that, so a start that cannot finish
-// fails with its own error, logged, before ECS kills the process.
-const startTimeout = 2 * time.Minute
+// Until the hooks finish, /health does not answer. fil-forge/infra-central
+// gives swarf a 10-minute start window: the ALB health check ignores the
+// first 600 seconds, and the container health check fails the task after a
+// 300-second start period plus ten checks 30 seconds apart. Eight minutes is
+// 80% of that, so a start that cannot finish fails with its own error,
+// logged, before ECS kills the process.
+const startTimeout = 8 * time.Minute
 
 func newLogger(cfg *config.Config) (*zap.Logger, error) {
 	zcfg := zap.NewProductionConfig()
