@@ -530,6 +530,58 @@ func TestPostgresRevocationStoreStreamAfterCursorMidBatch(t *testing.T) {
 	require.ErrorIs(t, <-resumedDone, context.Canceled)
 }
 
+// A stream reads a page of rows at a time; the records of the next page
+// follow the last of the previous one, in seq order, with none missing.
+func TestPostgresRevocationStoreStreamPages(t *testing.T) {
+	s, pool := newTestStore(t)
+	revocations := revocationsSharingPath(t, postgres.StreamPageSize+2, 1)
+	require.NoError(t, s.AddBatch(context.Background(), revocations))
+
+	var stored []cid.Cid
+	rows, err := pool.Query(context.Background(), `SELECT id FROM revocation ORDER BY seq`)
+	require.NoError(t, err)
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		stored = append(stored, cid.MustParse(id))
+	}
+	require.NoError(t, rows.Err())
+
+	var streamed []cid.Cid
+	for _, record := range streamN(t, s, store.Cursor{}, len(revocations)) {
+		streamed = append(streamed, record.Cause.Link())
+	}
+	require.Equal(t, stored, streamed)
+}
+
+// A consumer that stops reading mid-stream leaves no statement open on
+// revocation, so a migration can still take the exclusive lock it needs to
+// alter the table. The rows are large enough that a single query's result
+// would not fit in the connection's buffers, and its statement would stay
+// open until the consumer read further.
+func TestPostgresRevocationStoreStalledStreamHoldsNoLock(t *testing.T) {
+	s, pool := newTestStore(t)
+	revocations := revocationsSharingPath(t, postgres.StreamPageSize+1, 64)
+	require.NoError(t, s.AddBatch(context.Background(), revocations))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	records, done := collectStream(ctx, s.Stream(ctx, store.Cursor{}))
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	<-records
+
+	err := pgx.BeginFunc(context.Background(), pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(context.Background(), `SET LOCAL lock_timeout = '2s'`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(context.Background(), `LOCK TABLE revocation IN ACCESS EXCLUSIVE MODE`)
+		return err
+	})
+	require.NoError(t, err)
+}
+
 func newTestStore(t *testing.T, configure ...func(*pgxpool.Config)) (*postgres.Store, *pgxpool.Pool) {
 	t.Helper()
 	pool := newTestPool(t, configure...)
@@ -724,6 +776,25 @@ func revocationWithPathLength(t *testing.T, length int) store.Revocation {
 		path = append(more, path...)
 	}
 	return store.Revocation{Cause: revocation, Path: path}
+}
+
+// revocationsSharingPath returns count revocations that share one path of
+// pathLength delegations, which is cheaper than a path each when count is
+// large. The store does not validate the chain.
+func revocationsSharingPath(t *testing.T, count, pathLength int) []store.Revocation {
+	t.Helper()
+	shared := revocationWithPathLength(t, pathLength)
+	issuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cmd, err := command.Parse("/test/revoke")
+	require.NoError(t, err)
+	revocations := make([]store.Revocation, count)
+	for i := range revocations {
+		cause, err := invocation.Invoke(issuer, did.Undef, cmd, nil)
+		require.NoError(t, err)
+		revocations[i] = store.Revocation{Cause: cause, Path: shared.Path}
+	}
+	return revocations
 }
 
 func revokedLink(revocation store.Revocation) cid.Cid {
