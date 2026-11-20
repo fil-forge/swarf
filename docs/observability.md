@@ -22,3 +22,15 @@ do.
   `terraform/envs/grafana/`; its `docs/observability.md` ("Adding an alert or
   panel") says how to add them. Open a companion PR there, or say in this PR
   that one is needed.
+
+## Schema migrations
+
+Swarf applies pending Postgres migrations on start, before `/health` answers.
+It logs `applying postgres migration` when each one starts, `applied postgres
+migration` with its `duration` when it finishes, and `postgres migration
+failed` at error level when it does not. A migration runs on connections of
+its own with `lock_timeout`, `statement_timeout`,
+`idle_in_transaction_session_timeout` and `client_connection_check_interval`
+set (`migrations.DefaultLimits`), and a canceled start sends Postgres a cancel
+request, so a failed or killed start leaves no backend holding or waiting for a
+table lock.
