@@ -61,6 +61,19 @@ func TestEchoPublicRoutes(t *testing.T) {
 	response = httptest.NewRecorder()
 	e.ServeHTTP(response, request)
 	require.Equal(t, http.StatusOK, response.Code)
+	require.Contains(t, response.Body.String(), id.DID().String())
+	require.Equal(t, "max-age=300", response.Header().Get("Cache-Control"))
+	require.NotEmpty(t, response.Header().Get("Last-Modified"))
+	etag := response.Header().Get("ETag")
+	require.NotEmpty(t, etag)
+
+	// A client that already holds the document gets a 304.
+	request = httptest.NewRequest(http.MethodGet, "/.well-known/did.json", nil)
+	request.Header.Set("If-None-Match", etag)
+	response = httptest.NewRecorder()
+	e.ServeHTTP(response, request)
+	require.Equal(t, http.StatusNotModified, response.Code)
+	require.Empty(t, response.Body.Bytes())
 }
 
 // A handler panic must not escape to net/http, which drops the connection
