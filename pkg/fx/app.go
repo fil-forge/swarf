@@ -16,6 +16,7 @@ import (
 
 	jsg "github.com/alanshaw/dag-json-gen"
 	ucancmd "github.com/fil-forge/libforge/commands/ucan"
+	"github.com/fil-forge/libforge/diddoc"
 	"github.com/fil-forge/libforge/identity"
 	"github.com/fil-forge/swarf/pkg/api"
 	"github.com/fil-forge/swarf/pkg/build"
@@ -141,11 +142,6 @@ func newUCANServer(id identity.Identity, cfg *config.Config, revocations store.R
 	return srv, nil
 }
 
-// webDIDCacheTTL is how long a resolved did:web document is reused. Revocation
-// paths name the same few did:web issuers again and again, and each
-// resolution is otherwise an HTTP request; a failed resolution is not cached.
-const webDIDCacheTTL = time.Hour
-
 func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (resolver.ByMethod, error) {
 	webOptions := []web.Option{}
 	if insecure {
@@ -172,7 +168,7 @@ func newDIDResolver(id identity.Identity, insecure bool, plcDirectory string) (r
 	}
 	return resolver.ByMethod{
 		"key": key.Resolver,
-		"web": resolver.Tiered{resolver.WellKnown{id.DID(): document}, resolver.NewCached(webResolver, webDIDCacheTTL)},
+		"web": resolver.Tiered{resolver.WellKnown{id.DID(): document}, webResolver},
 		"plc": resolver.NewCached(plcResolver, time.Hour*3),
 	}, nil
 }
@@ -441,14 +437,25 @@ func serverInfoHandler(id identity.Identity) echo.HandlerFunc {
 	}
 }
 
+// didDocumentHandler serves the service identity's DID document for did:web
+// resolution. Responses carry Cache-Control, ETag and Last-Modified headers,
+// and conditional requests get a 304 when the document has not changed.
 func didDocumentHandler(id identity.Identity) echo.HandlerFunc {
-	return func(c echo.Context) error {
-		document, err := id.DIDDocument()
-		if err != nil {
+	handler, err := newDIDDocumentHandler(id)
+	if err != nil {
+		return func(c echo.Context) error {
 			return echo.NewHTTPError(http.StatusInternalServerError, "building DID document")
 		}
-		return c.JSON(http.StatusOK, document)
 	}
+	return echo.WrapHandler(handler)
+}
+
+func newDIDDocumentHandler(id identity.Identity) (http.Handler, error) {
+	document, err := id.DIDDocument()
+	if err != nil {
+		return nil, err
+	}
+	return diddoc.NewHandler(document)
 }
 
 // firehoseHeadHandler responds with the cursor at the head of the stream, so
