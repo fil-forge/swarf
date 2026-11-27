@@ -187,12 +187,6 @@ should not be.
 The record at the head of the stream is kept until a later one is stored, so
 the head never moves back and stored cursors stay valid.
 
-A revocation stored by a release from before eviction has no expiry recorded
-and is kept for good, whatever its delegation says. That includes one an
-instance still on the old release stores while a deploy rolls out. To clear
-them, empty the `revocation` table once every instance runs the new release,
-then have every consumer start over as after a `409`.
-
 ### Moving the database
 
 A cursor is the `seq` column of the `revocation` table, so cursors move with
