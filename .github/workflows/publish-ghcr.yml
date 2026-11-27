@@ -71,8 +71,8 @@ jobs:
           cache-from: type=gha,scope=${{ matrix.target }}
           cache-to: type=gha,scope=${{ matrix.target }},mode=max
 
-      # The dev stage of Forge Central pins the prod-target image, so only that
-      # matrix leg asks for a deploy.
+      # Forge Central's staging environment pins the prod-target image, so only
+      # that matrix leg asks for a deploy.
       - name: Resolve the source pull request
         if: matrix.target == 'prod'
         id: source
@@ -94,7 +94,7 @@ jobs:
           owner: fil-forge
           repositories: infra-central
 
-      - name: Request a digest bump in the Forge Central "dev" environment
+      - name: Request a digest bump in the Forge Central "staging" environment
         if: matrix.target == 'prod'
         env:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
