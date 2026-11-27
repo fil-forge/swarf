@@ -1,7 +1,9 @@
 -- +goose Up
 -- +goose StatementBegin
 -- Rows stored before this migration keep a NULL expires_at, so they are never
--- evicted, whether or not the delegation they revoke expires.
+-- evicted, whether or not the delegation they revoke expires. So do rows an
+-- instance still running the release before this one stores after the
+-- migration has run, as it does during a rolling deploy.
 ALTER TABLE revocation ADD COLUMN expires_at TIMESTAMPTZ;
 
 COMMENT ON COLUMN revocation.expires_at IS 'When the revoked delegation expires, after which the row can be evicted. NULL when the delegation never expires';

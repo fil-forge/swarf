@@ -939,3 +939,24 @@ func revocationExpiring(t *testing.T, option delegation.Option) store.Revocation
 	require.NoError(t, err)
 	return store.Revocation{Cause: cause, Path: []ucan.Delegation{revoked}}
 }
+
+// An expiry too far off for a timestamptz to hold is stored as no expiry: the
+// revocation is kept, and the write is not refused.
+func TestPostgresRevocationStoreKeepsAFarFutureExpiry(t *testing.T) {
+	s, pool := newTestStore(t)
+	ctx := context.Background()
+	never := revocationExpiring(t, delegation.WithExpiration(ucan.UnixTimestamp(1<<53-1)))
+	beside := revocationExpiring(t, delegation.WithExpiration(ucan.UnixTimestamp(time.Now().Add(time.Hour).Unix())))
+	last := revocationExpiring(t, delegation.WithNoExpiration())
+
+	require.NoError(t, s.AddBatch(ctx, []store.Revocation{never, beside, last}))
+
+	var stored *time.Time
+	require.NoError(t, pool.QueryRow(ctx, `SELECT expires_at FROM revocation WHERE id = $1`, never.Cause.Link().String()).Scan(&stored))
+	require.Nil(t, stored)
+	evicted, err := s.EvictExpired(ctx, time.Now().AddDate(1000, 0, 0))
+	require.NoError(t, err)
+	require.EqualValues(t, 1, evicted, "only the revocation that expires in an hour goes")
+	_, err = s.Get(ctx, never.Path[0].Link())
+	require.NoError(t, err)
+}

@@ -674,9 +674,20 @@ const evictionGrace = time.Hour
 // evictionInterval after, until it stops.
 func registerEviction(lc fx.Lifecycle, revocations store.RevocationStore, logger *zap.Logger) {
 	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
 	lc.Append(fx.StartStopHook(
-		func() { go runEviction(ctx, revocations, logger, evictionInterval) },
-		cancel,
+		func() {
+			go func() {
+				defer close(done)
+				runEviction(ctx, revocations, logger, evictionInterval)
+			}()
+		},
+		// The stop waits for the loop, so no eviction is still running when
+		// the store's pool closes. Canceling ctx ends one in progress.
+		func() {
+			cancel()
+			<-done
+		},
 	))
 }
 

@@ -2,6 +2,13 @@ package store_test
 
 import (
 	"testing"
+	"time"
+
+	"github.com/fil-forge/ucantone/did"
+	"github.com/fil-forge/ucantone/multikey/ed25519"
+	"github.com/fil-forge/ucantone/ucan"
+	"github.com/fil-forge/ucantone/ucan/command"
+	"github.com/fil-forge/ucantone/ucan/delegation"
 
 	"github.com/fil-forge/swarf/pkg/store"
 	"github.com/stretchr/testify/require"
@@ -39,5 +46,35 @@ func TestCursorOrder(t *testing.T) {
 			require.Negative(t, ordered[i].Compare(ordered[j]), "%v before %v", ordered[i], ordered[j])
 			require.Positive(t, ordered[j].Compare(ordered[i]), "%v after %v", ordered[j], ordered[i])
 		}
+	}
+}
+
+func TestExpiration(t *testing.T) {
+	issuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cmd, err := command.Parse("/test/revoke")
+	require.NoError(t, err)
+	path := func(option delegation.Option) []ucan.Delegation {
+		revoked, err := delegation.Delegate(issuer, issuer.DID(), did.Undef, cmd, option)
+		require.NoError(t, err)
+		return []ucan.Delegation{revoked}
+	}
+
+	require.Nil(t, store.Expiration(nil))
+	require.Nil(t, store.Expiration(path(delegation.WithNoExpiration())))
+
+	in := time.Now().Add(time.Hour).Truncate(time.Second)
+	got := store.Expiration(path(delegation.WithExpiration(ucan.UnixTimestamp(in.Unix()))))
+	require.NotNil(t, got)
+	require.True(t, in.Equal(*got))
+
+	// The last second of the year 9999 is kept, and anything after it counts
+	// as never expiring.
+	last := time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
+	got = store.Expiration(path(delegation.WithExpiration(ucan.UnixTimestamp(last.Unix()))))
+	require.NotNil(t, got)
+	require.True(t, last.Equal(*got))
+	for _, exp := range []ucan.UnixTimestamp{ucan.UnixTimestamp(last.Unix() + 1), 1<<53 - 1, 1<<63 - 1} {
+		require.Nil(t, store.Expiration(path(delegation.WithExpiration(exp))), exp)
 	}
 }

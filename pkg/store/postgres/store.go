@@ -200,9 +200,10 @@ func (s *Store) EvictExpired(ctx context.Context, before time.Time) (int64, erro
 }
 
 // Head returns the cursor of the highest seq stored, or the zero cursor when
-// the table is empty. [Store.EvictExpired] never deletes the row that holds it. A write in progress when Head is read holds the write
-// lock, so every number it takes is higher than any committed row's, and its
-// rows are after the head.
+// the table is empty. [Store.EvictExpired] never deletes the row that holds
+// it. A write in progress when Head is read holds the write lock, so every
+// number it takes is higher than any committed row's, and its rows are after
+// the head.
 func (s *Store) Head(ctx context.Context) (store.Cursor, error) {
 	var head int64
 	if err := s.pool.QueryRow(ctx, `SELECT coalesce(max(seq), 0) FROM revocation`).Scan(&head); err != nil {
