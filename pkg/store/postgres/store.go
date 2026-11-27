@@ -81,6 +81,7 @@ func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) er
 	revoked := make([]string, 0, len(revocations))
 	pathStarts := make([]int32, 0, len(revocations))
 	pathEnds := make([]int32, 0, len(revocations))
+	expires := make([]*time.Time, 0, len(revocations))
 	var witnesses [][]byte
 	added := make(map[cid.Cid]struct{}, len(revocations))
 	for i, revocation := range revocations {
@@ -109,6 +110,7 @@ func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) er
 			witnesses = append(witnesses, witness)
 		}
 		pathEnds = append(pathEnds, int32(len(witnesses)))
+		expires = append(expires, store.Expiration(revocation.Path))
 	}
 
 	tx, err := s.pool.Begin(ctx)
@@ -124,10 +126,10 @@ func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) er
 	}
 	_, err = tx.Exec(
 		ctx,
-		`INSERT INTO revocation (id, cause, revoked_delegation, path_witness)
-		 SELECT r.id, r.cause, r.revoked_delegation, ($4::bytea[])[r.path_start:r.path_end]
-		 FROM unnest($1::text[], $2::bytea[], $3::text[], $5::int[], $6::int[])
-		   AS r(id, cause, revoked_delegation, path_start, path_end)
+		`INSERT INTO revocation (id, cause, revoked_delegation, path_witness, expires_at)
+		 SELECT r.id, r.cause, r.revoked_delegation, ($4::bytea[])[r.path_start:r.path_end], r.expires_at
+		 FROM unnest($1::text[], $2::bytea[], $3::text[], $5::int[], $6::int[], $7::timestamptz[])
+		   AS r(id, cause, revoked_delegation, path_start, path_end, expires_at)
 		 ON CONFLICT (id) DO NOTHING`,
 		ids,
 		causes,
@@ -135,6 +137,7 @@ func (s *Store) AddBatch(ctx context.Context, revocations []store.Revocation) er
 		witnesses,
 		pathStarts,
 		pathEnds,
+		expires,
 	)
 	if err != nil {
 		return fmt.Errorf("storing revocations: %w", err)
@@ -176,8 +179,28 @@ func (s *Store) Get(ctx context.Context, revoked cid.Cid) (store.RevocationRecor
 	return record, nil
 }
 
+// EvictExpired deletes the rows whose revoked delegation expired before the
+// given time, except the row with the highest seq. Head reads the highest seq
+// stored, so deleting that row would move the head back, behind cursors
+// consumers already hold, and the service would refuse them. A delete leaves
+// the highest row it can see, and writes only add higher ones, so the highest
+// row stored always survives; it goes once a later row has been written.
+func (s *Store) EvictExpired(ctx context.Context, before time.Time) (int64, error) {
+	tag, err := s.pool.Exec(
+		ctx,
+		`DELETE FROM revocation
+		 WHERE expires_at < $1
+		   AND seq < (SELECT max(seq) FROM revocation)`,
+		before,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("evicting expired revocations: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // Head returns the cursor of the highest seq stored, or the zero cursor when
-// the table is empty. A write in progress when Head is read holds the write
+// the table is empty. [Store.EvictExpired] never deletes the row that holds it. A write in progress when Head is read holds the write
 // lock, so every number it takes is higher than any committed row's, and its
 // rows are after the head.
 func (s *Store) Head(ctx context.Context) (store.Cursor, error) {

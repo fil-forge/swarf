@@ -708,6 +708,10 @@ func (s *firehoseTestStore) Get(context.Context, cid.Cid) (store.RevocationRecor
 	return s.record, nil
 }
 
+func (s *firehoseTestStore) EvictExpired(context.Context, time.Time) (int64, error) {
+	return 0, nil
+}
+
 func (s *firehoseTestStore) Head(context.Context) (store.Cursor, error) {
 	return s.head, s.headErr
 }

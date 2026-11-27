@@ -104,4 +104,28 @@ type RevocationStore interface {
 	// it, so a stream started after the cursor of the last record another
 	// stream yielded misses nothing.
 	Stream(ctx context.Context, after Cursor) iter.Seq2[StreamRecord, error]
+	// EvictExpired removes the records whose revoked delegation expired before
+	// the given time, and returns how many it removed. A delegation that has
+	// expired is refused whether or not it was revoked, so its record no
+	// longer changes any decision. A record of a delegation that never expires
+	// is never removed.
+	//
+	// Removing records never moves the head back, so every cursor the store
+	// has issued stays at or before it. A stream after a cursor older than a
+	// removed record skips it.
+	EvictExpired(ctx context.Context, before time.Time) (int64, error)
+}
+
+// Expiration returns when the delegation the path ends with, the revoked one,
+// expires, or nil when it never does.
+func Expiration(path []ucan.Delegation) *time.Time {
+	if len(path) == 0 {
+		return nil
+	}
+	exp := path[len(path)-1].Expiration()
+	if exp == nil {
+		return nil
+	}
+	t := time.Unix(int64(*exp), 0).UTC()
+	return &t
 }

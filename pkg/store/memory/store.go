@@ -174,6 +174,25 @@ func (s *Store) Stream(ctx context.Context, after store.Cursor) iter.Seq2[store.
 	}
 }
 
+// EvictExpired removes the records whose revoked delegation expired before
+// the given time. The head is the last sequence number given out, which
+// removing records does not change.
+func (s *Store) EvictExpired(ctx context.Context, before time.Time) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var evicted int64
+	for revoked, entry := range s.records {
+		if exp := store.Expiration(entry.record.Path); exp != nil && exp.Before(before) {
+			delete(s.records, revoked)
+			evicted++
+		}
+	}
+	return evicted, nil
+}
+
 // recordsAfterLocked returns the records after the after cursor, in cursor
 // order, and the cursor the next scan starts after: the later of after and the
 // last record added.

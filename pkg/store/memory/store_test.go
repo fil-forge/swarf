@@ -314,3 +314,49 @@ func revocationBatch(t *testing.T, size int) []store.Revocation {
 	}
 	return batch
 }
+
+func TestMemoryRevocationStoreEvictExpired(t *testing.T) {
+	s := memory.New()
+	ctx := context.Background()
+	now := time.Now()
+	expired := revocationExpiring(t, delegation.WithExpiration(ucan.UnixTimestamp(now.Add(-time.Hour).Unix())))
+	live := revocationExpiring(t, delegation.WithExpiration(ucan.UnixTimestamp(now.Add(time.Hour).Unix())))
+	forever := revocationExpiring(t, delegation.WithNoExpiration())
+	// The expired record is stored last, so it holds the head.
+	require.NoError(t, s.AddBatch(ctx, []store.Revocation{live, forever, expired}))
+	head, err := s.Head(ctx)
+	require.NoError(t, err)
+
+	evicted, err := s.EvictExpired(ctx, now)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, evicted)
+
+	_, err = s.Get(ctx, expired.Path[0].Link())
+	require.ErrorIs(t, err, store.ErrNotFound)
+	for _, kept := range []store.Revocation{live, forever} {
+		_, err = s.Get(ctx, kept.Path[0].Link())
+		require.NoError(t, err)
+	}
+	after, err := s.Head(ctx)
+	require.NoError(t, err)
+	require.Equal(t, head, after, "evicting the last record leaves the head where it was")
+
+	evicted, err = s.EvictExpired(ctx, now)
+	require.NoError(t, err)
+	require.Zero(t, evicted)
+}
+
+// revocationExpiring returns a revocation of a delegation issued with option,
+// which sets when it expires.
+func revocationExpiring(t *testing.T, option delegation.Option) store.Revocation {
+	t.Helper()
+	issuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cmd, err := command.Parse("/test/revoke")
+	require.NoError(t, err)
+	revoked, err := delegation.Delegate(issuer, issuer.DID(), did.Undef, cmd, option)
+	require.NoError(t, err)
+	cause, err := invocation.Invoke(issuer, did.Undef, cmd, nil)
+	require.NoError(t, err)
+	return store.Revocation{Cause: cause, Path: []ucan.Delegation{revoked}}
+}

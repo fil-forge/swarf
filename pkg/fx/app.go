@@ -57,7 +57,7 @@ func AppModule(cfg *config.Config) fx.Option {
 		fx.StartTimeout(startTimeout),
 		fx.Supply(cfg),
 		fx.Provide(newLogger, newIdentity, newUCANServer, newEchoServer),
-		fx.Invoke(registerServerLifecycle),
+		fx.Invoke(registerServerLifecycle, registerEviction),
 	}
 	switch cfg.Storage.Type {
 	case config.StorageTypeMemory:
@@ -659,6 +659,64 @@ func writeFirehoseError(response *echo.Response, err error) {
 	}
 	_, _ = fmt.Fprintf(response, "event: error\ndata: %s\n\n", data)
 	response.Flush()
+}
+
+// evictionInterval is how often expired revocations are evicted.
+const evictionInterval = time.Hour
+
+// evictionGrace is how long a revocation is kept after the delegation it
+// revokes has expired, so that a validator whose clock runs behind still finds
+// the revocation for as long as it would accept the delegation.
+const evictionGrace = time.Hour
+
+// registerEviction evicts expired revocations (see
+// [store.RevocationStore.EvictExpired]) when the service starts and every
+// evictionInterval after, until it stops.
+func registerEviction(lc fx.Lifecycle, revocations store.RevocationStore, logger *zap.Logger) {
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	lc.Append(fx.Hook{
+		OnStart: func(context.Context) error {
+			go func() {
+				defer close(done)
+				runEviction(ctx, revocations, logger, evictionInterval)
+			}()
+			return nil
+		},
+		OnStop: func(stopCtx context.Context) error {
+			cancel()
+			select {
+			case <-done:
+			case <-stopCtx.Done():
+			}
+			return nil
+		},
+	})
+}
+
+// runEviction evicts expired revocations once, then every interval, until ctx
+// is canceled. A failed eviction is logged and tried again at the next
+// interval: the records it left are of expired delegations, so they cost
+// space and nothing else.
+func runEviction(ctx context.Context, revocations store.RevocationStore, logger *zap.Logger, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		evicted, err := revocations.EvictExpired(ctx, time.Now().Add(-evictionGrace))
+		switch {
+		case ctx.Err() != nil:
+			return
+		case err != nil:
+			logger.Error("evicting expired revocations failed", zap.Error(err))
+		case evicted > 0:
+			logger.Info("evicted expired revocations", zap.Int64("count", evicted))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 func registerServerLifecycle(lc fx.Lifecycle, e *echo.Echo, cfg *config.Config) {
