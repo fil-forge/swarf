@@ -674,24 +674,10 @@ const evictionGrace = time.Hour
 // evictionInterval after, until it stops.
 func registerEviction(lc fx.Lifecycle, revocations store.RevocationStore, logger *zap.Logger) {
 	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	lc.Append(fx.Hook{
-		OnStart: func(context.Context) error {
-			go func() {
-				defer close(done)
-				runEviction(ctx, revocations, logger, evictionInterval)
-			}()
-			return nil
-		},
-		OnStop: func(stopCtx context.Context) error {
-			cancel()
-			select {
-			case <-done:
-			case <-stopCtx.Done():
-			}
-			return nil
-		},
-	})
+	lc.Append(fx.StartStopHook(
+		func() { go runEviction(ctx, revocations, logger, evictionInterval) },
+		cancel,
+	))
 }
 
 // runEviction evicts expired revocations once, then every interval, until ctx
