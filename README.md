@@ -174,6 +174,19 @@ Deduplicate by `cause`, the CID of the revocation invocation, which is unique
 to a record. Records repeat when a consumer restarts, so what it deduplicates
 against has to survive its restarts too.
 
+### Eviction
+
+A delegation that has expired is refused whether or not it was revoked, so
+Swarf removes a revocation once the delegation it revokes has been expired for
+an hour. It checks when it starts and every hour after. From then on
+`GET /revocation/:cid` answers `404` for that delegation, and a stream that
+starts before the record skips it. A revocation of a delegation that never
+expires is kept for good, so give a delegation an expiry if its revocation
+should not be.
+
+The record at the head of the stream is kept until a later one is stored, so
+the head never moves back and stored cursors stay valid.
+
 ### Moving the database
 
 A cursor is the `seq` column of the `revocation` table, so cursors move with

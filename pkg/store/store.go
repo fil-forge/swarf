@@ -104,4 +104,34 @@ type RevocationStore interface {
 	// it, so a stream started after the cursor of the last record another
 	// stream yielded misses nothing.
 	Stream(ctx context.Context, after Cursor) iter.Seq2[StreamRecord, error]
+	// EvictExpired removes the records whose revoked delegation expired before
+	// the given time, and returns how many it removed. A delegation that has
+	// expired is refused whether or not it was revoked, so its record no
+	// longer changes any decision. A record of a delegation that never expires
+	// is never removed.
+	//
+	// Removing records never moves the head back, so every cursor the store
+	// has issued stays at or before it. A stream after a cursor older than a
+	// removed record skips it.
+	EvictExpired(ctx context.Context, before time.Time) (int64, error)
+}
+
+// maxExpiration is the latest expiry a record keeps. Postgres holds a
+// timestamp as a 64-bit count of microseconds, so an expiry far enough off
+// wraps to a different date on the way in, one that may be in the past.
+var maxExpiration = time.Date(9999, time.December, 31, 23, 59, 59, 0, time.UTC)
+
+// Expiration returns when the delegation the path ends with, the revoked one,
+// expires, or nil when it never does. An expiry after the year 9999 counts as
+// never: issuers write values such as 2^53-1 to mean it.
+func Expiration(path []ucan.Delegation) *time.Time {
+	if len(path) == 0 {
+		return nil
+	}
+	exp := path[len(path)-1].Expiration()
+	if exp == nil || int64(*exp) > maxExpiration.Unix() {
+		return nil
+	}
+	t := time.Unix(int64(*exp), 0).UTC()
+	return &t
 }

@@ -863,3 +863,100 @@ func (s *statementTracer) count(keyword string) int {
 	}
 	return n
 }
+
+func TestPostgresRevocationStoreEvictExpired(t *testing.T) {
+	s, pool := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	expired := revocationExpiring(t, delegation.WithExpiration(ucan.UnixTimestamp(now.Add(-time.Hour).Unix())))
+	live := revocationExpiring(t, delegation.WithExpiration(ucan.UnixTimestamp(now.Add(time.Hour).Unix())))
+	forever := revocationExpiring(t, delegation.WithNoExpiration())
+	// A row from before expires_at existed, of a delegation long expired.
+	oldCause, oldPath := revocationPath(t)
+	insert(t, pool, oldCause, oldPath)
+	require.NoError(t, s.AddBatch(ctx, []store.Revocation{expired, live, forever}))
+
+	evicted, err := s.EvictExpired(ctx, now)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, evicted)
+
+	_, err = s.Get(ctx, expired.Path[0].Link())
+	require.ErrorIs(t, err, store.ErrNotFound)
+	for _, kept := range [][]ucan.Delegation{live.Path, forever.Path, oldPath} {
+		_, err = s.Get(ctx, kept[0].Link())
+		require.NoError(t, err)
+	}
+
+	evicted, err = s.EvictExpired(ctx, now)
+	require.NoError(t, err)
+	require.Zero(t, evicted)
+}
+
+// Evicting the row at the head would move the head back, and the service
+// refuses a cursor ahead of the head, so that row stays until a later one is
+// stored.
+func TestPostgresRevocationStoreEvictExpiredKeepsTheHead(t *testing.T) {
+	s, _ := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now()
+	past := delegation.WithExpiration(ucan.UnixTimestamp(now.Add(-time.Hour).Unix()))
+	first, last := revocationExpiring(t, past), revocationExpiring(t, past)
+	require.NoError(t, s.AddBatch(ctx, []store.Revocation{first, last}))
+	head, err := s.Head(ctx)
+	require.NoError(t, err)
+
+	evicted, err := s.EvictExpired(ctx, now)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, evicted)
+	_, err = s.Get(ctx, first.Path[0].Link())
+	require.ErrorIs(t, err, store.ErrNotFound)
+	_, err = s.Get(ctx, last.Path[0].Link())
+	require.NoError(t, err, "the row at the head is kept")
+	after, err := s.Head(ctx)
+	require.NoError(t, err)
+	require.Equal(t, head, after)
+
+	next := revocationExpiring(t, delegation.WithNoExpiration())
+	require.NoError(t, s.AddBatch(ctx, []store.Revocation{next}))
+	evicted, err = s.EvictExpired(ctx, now)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, evicted, "a later row releases the old head")
+	streamed := streamN(t, s, head, 1)
+	require.Equal(t, next.Cause.Link(), streamed[0].Cause.Link())
+}
+
+// revocationExpiring returns a revocation of a delegation issued with option,
+// which sets when it expires.
+func revocationExpiring(t *testing.T, option delegation.Option) store.Revocation {
+	t.Helper()
+	issuer, err := ed25519.GenerateIssuer()
+	require.NoError(t, err)
+	cmd, err := command.Parse("/test/revoke")
+	require.NoError(t, err)
+	revoked, err := delegation.Delegate(issuer, issuer.DID(), did.Undef, cmd, option)
+	require.NoError(t, err)
+	cause, err := invocation.Invoke(issuer, did.Undef, cmd, nil)
+	require.NoError(t, err)
+	return store.Revocation{Cause: cause, Path: []ucan.Delegation{revoked}}
+}
+
+// An expiry too far off for a timestamptz to hold is stored as no expiry: the
+// revocation is kept, and the write is not refused.
+func TestPostgresRevocationStoreKeepsAFarFutureExpiry(t *testing.T) {
+	s, pool := newTestStore(t)
+	ctx := context.Background()
+	never := revocationExpiring(t, delegation.WithExpiration(ucan.UnixTimestamp(1<<53-1)))
+	beside := revocationExpiring(t, delegation.WithExpiration(ucan.UnixTimestamp(time.Now().Add(time.Hour).Unix())))
+	last := revocationExpiring(t, delegation.WithNoExpiration())
+
+	require.NoError(t, s.AddBatch(ctx, []store.Revocation{never, beside, last}))
+
+	var stored *time.Time
+	require.NoError(t, pool.QueryRow(ctx, `SELECT expires_at FROM revocation WHERE id = $1`, never.Cause.Link().String()).Scan(&stored))
+	require.Nil(t, stored)
+	evicted, err := s.EvictExpired(ctx, time.Now().AddDate(1000, 0, 0))
+	require.NoError(t, err)
+	require.EqualValues(t, 1, evicted, "only the revocation that expires in an hour goes")
+	_, err = s.Get(ctx, never.Path[0].Link())
+	require.NoError(t, err)
+}
